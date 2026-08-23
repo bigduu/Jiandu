@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemorySearchRequest",
+  "description": "Ranked full-text query over authorized scopes.",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ScopeSelector"
+      },
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "types": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemoryType"
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "statuses": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemoryStatus"
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Tag"
+      },
+      "maxItems": 32,
+      "uniqueItems": true
+    },
+    "updatedAfter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limit": {
+      "$ref": "#/$defs/PageLimit"
+    },
+    "cursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PageCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "query",
+    "scopes",
+    "limit"
+  ],
+  "$defs": {
+    "ScopeSelector": {
+      "description": "Model-visible scope selector.\n\nPrincipal identity is intentionally absent: the authenticated principal is\nalways taken from [`crate::TrustedRequestContext`]. Project and Session IDs\nare opaque host-resolved identities, never paths.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "projectId": {
+              "$ref": "#/$defs/ProjectId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "project"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "projectId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "$ref": "#/$defs/SessionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "session"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "sessionId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "instance_global"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ProjectId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^prj_[A-Za-z0-9_-]+$"
+    },
+    "SessionId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^ses_[A-Za-z0-9_-]+$"
+    },
+    "MemoryType": {
+      "description": "Closed memory categories for the v1alpha1 record schema.",
+      "type": "string",
+      "enum": [
+        "preference",
+        "decision",
+        "project",
+        "fact",
+        "feedback",
+        "reference"
+      ]
+    },
+    "MemoryStatus": {
+      "description": "Retrieval lifecycle of a non-forgotten memory.",
+      "type": "string",
+      "enum": [
+        "active",
+        "stale",
+        "superseded",
+        "contradicted",
+        "archived"
+      ]
+    },
+    "Tag": {
+      "description": "Canonical lower-case tag.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "Timestamp": {
+      "description": "Canonical RFC 3339 timestamp in UTC using the `Z` designator.",
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 35,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{0,8}[1-9])?Z$"
+    },
+    "PageLimit": {
+      "description": "Bounded page size shared by search and list operations.",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "PageCursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  }
+}

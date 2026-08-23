@@ -1,0 +1,44 @@
+{
+  "schema": "jiandu.dev/memory/v1alpha1",
+  "id": "mem_01K3IDENTITY",
+  "revision": 7,
+  "etag": "W/\"mem_01K3IDENTITY:7:abc123\"",
+  "scope": {
+    "kind": "project",
+    "projectId": "prj_01K3PROJECT"
+  },
+  "type": "decision",
+  "status": "active",
+  "title": "Use opaque project identity",
+  "summary": "Workspace paths are metadata, not Project identity.",
+  "body": "Workspace paths remain mutable metadata and never become identity.\n",
+  "tags": [
+    "architecture",
+    "identity"
+  ],
+  "createdAt": "2026-08-23T10:00:00Z",
+  "updatedAt": "2026-08-23T10:05:00Z",
+  "provenance": {
+    "createdBy": "host",
+    "agentId": "bamboo",
+    "sessionId": "ses_01K3SESSION",
+    "branchId": "br_01K3BRANCH",
+    "messageIds": [
+      "msg_41",
+      "msg_42"
+    ],
+    "sourceUri": "https://example.invalid/decisions/identity",
+    "contentDigest": "sha256:0123456789abcdef",
+    "extraction": {
+      "method": "explicit",
+      "extractorVersion": "1.0.0"
+    },
+    "confidence": 0.98
+  },
+  "relations": [
+    {
+      "kind": "supports",
+      "targetMemoryId": "mem_01K3ARCHITECTURE"
+    }
+  ]
+}

@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture and contract definition. Implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture plus the initial agent-neutral `v1alpha1` Rust contracts. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -62,19 +62,28 @@ MCP does not force a client to inject context. Jiandu returns memory records; th
 - [Bamboo integration and migration](docs/integrations/bamboo.md)
 - [Delivery roadmap](docs/roadmap.md)
 
-## Planned Rust layout
+## Rust layout
 
 The exact crate split will be introduced only when each boundary is needed. The intended dependency direction is:
 
 ```text
-jiandu-core       agent-neutral domain types and contracts
-jiandu-store      canonical filesystem persistence and migrations
-jiandu-index      rebuildable lexical/search indexes
-jiandu-mcp        MCP protocol adapter
-jiandu            daemon and administrative CLI
+crates/jiandu-core/                  agent-neutral domain types and contracts
+  fixtures/v1alpha1/                 canonical valid and invalid conformance data
+  schemas/v1alpha1/                  checked JSON Schemas generated from Rust types
+  src/                               ordinary structs, enums, newtypes, and validation
 ```
 
-No core crate may depend on Bamboo or on a specific model provider.
+Future store, index, MCP adapter, daemon, and CLI crates are introduced only when
+their boundary is needed. `jiandu-core` has no storage, transport, Bamboo,
+prompt, LLM, or filesystem-path identity dependency.
+
+Run the contract gates from the repository root:
+
+```shell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```
 
 ## License
 

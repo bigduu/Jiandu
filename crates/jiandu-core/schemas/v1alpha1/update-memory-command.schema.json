@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UpdateMemoryCommand",
+  "description": "Optimistic, idempotent patch of exactly one record.",
+  "type": "object",
+  "properties": {
+    "memoryId": {
+      "$ref": "#/$defs/MemoryId"
+    },
+    "expectedRevision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "patch": {
+      "$ref": "#/$defs/MemoryPatch"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "idempotencyKey": {
+      "$ref": "#/$defs/IdempotencyKey"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "memoryId",
+    "expectedRevision",
+    "patch",
+    "reason",
+    "idempotencyKey"
+  ],
+  "$defs": {
+    "MemoryId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^mem_[A-Za-z0-9_-]+$"
+    },
+    "Revision": {
+      "description": "Positive, monotonically increasing per-record revision.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1
+    },
+    "MemoryPatch": {
+      "description": "Explicit set of mutable record fields in `v1alpha1`.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "body": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 65536,
+          "x-jiandu-maxUtf8Bytes": 65536
+        },
+        "tags": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TagPatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelationPatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TagPatch": {
+      "description": "Add/remove update for a record's canonical tags.",
+      "type": "object",
+      "properties": {
+        "add": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Tag"
+          },
+          "maxItems": 32,
+          "uniqueItems": true
+        },
+        "remove": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Tag"
+          },
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "Tag": {
+      "description": "Canonical lower-case tag.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "MemoryStatus": {
+      "description": "Retrieval lifecycle of a non-forgotten memory.",
+      "type": "string",
+      "enum": [
+        "active",
+        "stale",
+        "superseded",
+        "contradicted",
+        "archived"
+      ]
+    },
+    "RelationPatch": {
+      "description": "Add/remove update for typed relations.",
+      "type": "object",
+      "properties": {
+        "add": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryRelation"
+          },
+          "maxItems": 128,
+          "uniqueItems": true
+        },
+        "remove": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryRelation"
+          },
+          "maxItems": 128,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "MemoryRelation": {
+      "description": "One directed relation to another memory.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/RelationKind"
+        },
+        "targetMemoryId": {
+          "$ref": "#/$defs/MemoryId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "targetMemoryId"
+      ]
+    },
+    "RelationKind": {
+      "description": "Typed relation between two opaque memory records.",
+      "type": "string",
+      "enum": [
+        "supersedes",
+        "supports",
+        "contradicts",
+        "derived_from",
+        "related_to"
+      ]
+    },
+    "IdempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    }
+  }
+}

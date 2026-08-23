@@ -66,7 +66,10 @@ Supported scope kinds in `v1alpha1`:
 }
 ```
 
-The `score` field is present only in ranked query results and is meaningful only within that response.
+The `summary` field is optional and reflects canonical record metadata; the
+contract layer does not synthesize a body excerpt when it is absent. The
+`score` field is required in every ranked query hit and is forbidden in
+deterministic list summaries.
 
 ### Result envelope
 
@@ -149,6 +152,30 @@ Apply an explicit patch to one record.
 
 Input includes `memoryId`, `expectedRevision`, a field-level patch, a reason, and `idempotencyKey`. The first version supports replacement of title/body, tag add/remove, status transition, and relation add/remove. Scope moves require a later, dedicated operation.
 
+The patch has this shape; omitted fields are unchanged, and an empty patch is invalid:
+
+```json
+{
+  "memoryId": "mem_01...",
+  "expectedRevision": 7,
+  "patch": {
+    "title": "Updated title",
+    "body": "Updated Markdown body.",
+    "status": "stale",
+    "tags": { "add": ["reviewed"], "remove": ["draft"] },
+    "relations": {
+      "add": [{ "kind": "supersedes", "targetMemoryId": "mem_02..." }],
+      "remove": []
+    }
+  },
+  "reason": "Source changed",
+  "idempotencyKey": "evt_01..."
+}
+```
+
+The same tag or relation cannot appear in both `add` and `remove`; duplicate
+values and self-relations are invalid. `expectedRevision` is a positive integer.
+
 A stale revision returns `REVISION_CONFLICT` and current revision metadata without exposing an inaccessible record body.
 
 ### `memory_forget`
@@ -211,11 +238,77 @@ Initial codes:
 | `RATE_LIMITED` | Client or principal quota is exceeded. |
 | `INTERNAL` | An unexpected failure occurred; details remain in secret-safe logs. |
 
+The `retryable` bit is derived from the code rather than chosen by an adapter.
+`REVISION_CONFLICT`, `STORE_UNAVAILABLE`, `INDEX_DEGRADED`, `RATE_LIMITED`, and
+`INTERNAL` are retryable after the caller performs the action implied by the
+code (for example, re-read before retrying a revision conflict). Other initial
+codes are not retryable without changing identity, authorization, or input.
+
+## Committed validation bounds
+
+The Rust `Validate` implementation is authoritative for cross-field and UTF-8
+byte invariants. Generated JSON Schemas carry all directly expressible bounds.
+
+| Value | `v1alpha1` bound |
+| --- | --- |
+| Prefixed opaque IDs | 4 or 5–128 ASCII bytes including the declared prefix; suffix uses letters, digits, `_`, or `-` |
+| Agent IDs and idempotency keys | 1–128 ASCII bytes using letters, digits, `.`, `_`, `:`, or `-` |
+| Opaque page cursor | 1–1,024 base64url-shaped ASCII bytes; clients must not parse it |
+| ETag | 1–256 visible ASCII bytes |
+| Title | 1–200 Unicode scalar values, trimmed, no control characters |
+| Summary | 1–1,000 Unicode scalar values, trimmed, no control characters |
+| Markdown body | 1–65,536 UTF-8 bytes, non-whitespace, no NUL |
+| Mutation reason | 1–1,000 Unicode scalar values, trimmed, no control characters |
+| Search query | 1–4,096 Unicode scalar values, trimmed, no control characters |
+| Tags | At most 32 unique lower-case ASCII tags; each tag is 1–64 bytes |
+| Relations | At most 128 unique typed targets; no self-relation |
+| Provenance message IDs | At most 128 unique IDs; list and range are mutually exclusive |
+| Scope selectors | 1–16 unique authorized selectors |
+| Type, status, or tag filters | At most 32 unique values per filter |
+| Page limit | 1–100 |
+| Confidence and search score | Finite number from 0 through 1 inclusive |
+| Timestamp | Canonical RFC 3339 UTC with `Z`, optional 1–9 fractional digits |
+| Content digest | `[a-z0-9_]+:[A-Fa-f0-9]+`, at most 256 ASCII bytes |
+| Source URI | Absolute scheme plus non-empty visible ASCII remainder, at most 2,048 bytes |
+
+Because standard JSON Schema `maxLength` counts characters rather than UTF-8
+bytes, body schemas also carry the extension `x-jiandu-maxUtf8Bytes: 65536`;
+the Rust validator enforces the byte limit authoritatively.
+
+`active` may transition to `stale`, `superseded`, `contradicted`, or `archived`.
+`stale` may return to `active` or move to any of the latter three states.
+`superseded` may only move to `archived`; `contradicted` may move to `active`,
+`stale`, or `archived`; `archived` is terminal. A no-op transition is valid.
+
+## JSON and frontmatter naming
+
+Public API JSON uses `camelCase`. The canonical Markdown header is a separate,
+strict snake_case DTO (`project_id`, `created_at`, `target_memory_id`, and so
+on). This makes the on-disk representation explicit without leaking a storage
+format into API identity or command types. ETag and body are API/document
+metadata outside the YAML header: ETag is derived by storage, while body is the
+Markdown after the closing delimiter.
+
 ## Compatibility rules
 
 - New optional response fields may be added within `v1alpha1`.
+- Input objects, scope variants, provenance objects, patches, and canonical
+  frontmatter reject unknown fields. Clients must not send speculative fields.
+- Response records, result envelopes, diagnostics, and error payloads may ignore
+  newly added optional fields, but their nested closed types remain strict.
+  Ranked and unranked summary projections are closed so the ranking-only `score`
+  field cannot cross the search/list boundary.
 - Existing fields cannot change meaning without an API-version change.
-- Unknown enum values must be surfaced safely rather than coerced.
+- All current enums are closed: API/schema version, scope kind, memory type,
+  lifecycle status, relation kind, creation actor, extraction method, list sort,
+  validation code, and domain error code. Unknown values fail explicitly; adding
+  or renaming a value requires a contract revision rather than coercion.
 - Cursors are opaque and short-lived; clients must not parse them.
-- Tool schemas and conformance fixtures are generated from the same Rust domain definitions.
+- Tool schemas are generated from the Rust domain definitions; conformance
+  fixtures are decoded and validated against those types and generated schemas.
 - Store migrations cannot silently widen a client's authorization or scope.
+
+The checked schemas live under `crates/jiandu-core/schemas/v1alpha1`, while
+canonical valid and invalid JSON/Markdown fixtures live under
+`crates/jiandu-core/fixtures/v1alpha1`. CI regenerates schemas in memory and
+fails on any semantic difference from the checked files.
