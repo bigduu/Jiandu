@@ -37,6 +37,16 @@ fn timestamp(value: &str) -> Timestamp {
     Timestamp::new(value).expect("test timestamp is valid")
 }
 
+#[cfg(windows)]
+fn raw_windows_path(root: &Path, components: &[&std::ffi::OsStr]) -> PathBuf {
+    let mut raw = root.as_os_str().to_os_string();
+    for component in components {
+        raw.push(std::path::MAIN_SEPARATOR_STR);
+        raw.push(component);
+    }
+    PathBuf::from(raw)
+}
+
 fn frontmatter(
     id: &str,
     scope: MemoryScope,
@@ -575,8 +585,19 @@ fn paths_reject_traversal_absolute_inputs_and_symlinked_store_roots() {
             .code(),
         StoreErrorCode::UnsafePath
     );
+    #[cfg(windows)]
+    let parent_traversal = raw_windows_path(
+        &root,
+        &[
+            std::ffi::OsStr::new("missing"),
+            std::ffi::OsStr::new(".."),
+            std::ffi::OsStr::new("store"),
+        ],
+    );
+    #[cfg(not(windows))]
+    let parent_traversal = root.join("missing").join("..").join("store");
     assert_eq!(
-        CanonicalStore::initialize(root.join("missing").join("..").join("store"), owner())
+        CanonicalStore::initialize(parent_traversal, owner())
             .expect_err("parent traversal in data directory is rejected")
             .code(),
         StoreErrorCode::InvalidDataDirectory
@@ -593,8 +614,12 @@ fn paths_reject_traversal_absolute_inputs_and_symlinked_store_roots() {
     );
     let outside_before = tree_snapshot(&outside_root);
     let outside_name = outside_root.file_name().expect("outside directory name");
+    #[cfg(windows)]
+    let sibling_traversal = raw_windows_path(&root, &[std::ffi::OsStr::new(".."), outside_name]);
+    #[cfg(not(windows))]
+    let sibling_traversal = root.join("..").join(outside_name);
     assert_eq!(
-        CanonicalStore::initialize(root.join("..").join(outside_name), owner())
+        CanonicalStore::initialize(sibling_traversal, owner())
             .expect_err("parent traversal cannot claim a sibling directory")
             .code(),
         StoreErrorCode::InvalidDataDirectory
