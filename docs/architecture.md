@@ -158,7 +158,7 @@ Shutdown stops accepting new mutations, drains bounded in-flight work, flushes d
 - Secrets are rejected or redacted according to operator policy; Jiandu is not a credential vault.
 - Mutations and administrative reads produce secret-safe audit entries.
 - Destructive operations are narrow. Public `memory_forget` targets exactly one record; bulk purge is administrative.
-- File permissions, symlink handling, traversal checks, and data-directory ownership are validated before access.
+- File permissions, hard-link counts, symlink handling, traversal checks, and data-directory ownership are validated on opened handles. Store I/O remains beneath one fixed root-directory capability rather than re-resolving ambient paths.
 
 ## Failure policy
 

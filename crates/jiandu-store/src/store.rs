@@ -10,10 +10,11 @@ use jiandu_core::{
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -127,7 +128,7 @@ pub struct QuarantineReceipt {
 
 /// Exclusively owned handle to one supported canonical store.
 pub struct CanonicalStore {
-    data_dir: PathBuf,
+    root: layout::StoreDirectory,
     metadata: StoreMetadata,
     _lock: crate::lock::StoreLock,
 }
@@ -148,28 +149,29 @@ impl CanonicalStore {
         data_dir: impl AsRef<Path>,
         owner: crate::LockOwner,
     ) -> Result<Self, StoreError> {
-        let data_dir = layout::normalize_data_dir(data_dir.as_ref(), true)?;
-        let metadata_path = layout::safe_join(&data_dir, Path::new(layout::STORE_METADATA_FILE))?;
-        if layout::file_exists(&data_dir, &metadata_path)? {
+        let root = layout::StoreDirectory::open(data_dir.as_ref(), true)?;
+        if root.regular_file_exists(Path::new(layout::STORE_METADATA_FILE))? {
             return Err(StoreError::AlreadyInitialized);
         }
-        layout::validate_initialization_state(&data_dir)?;
+        layout::validate_initialization_state(&root)?;
 
-        let mut lock = crate::lock::StoreLock::acquire(&data_dir, true)?;
+        let mut lock = crate::lock::StoreLock::acquire(&root, true)?;
         lock.validate_initialization_marker()?;
-        layout::harden_data_directory(&data_dir)?;
+        root.harden_root()?;
         lock.harden_permissions()?;
-        lock.publish_owner(&owner)?;
-        if layout::file_exists(&data_dir, &metadata_path)? {
+        lock.publish_owner(&root, &owner)?;
+        if root.regular_file_exists(Path::new(layout::STORE_METADATA_FILE))? {
             return Err(StoreError::AlreadyInitialized);
         }
-        layout::validate_initialization_state(&data_dir)?;
+        layout::validate_initialization_state(&root)?;
 
-        let metadata = prepare_initial_metadata(&data_dir)?;
-        layout::create_layout(&data_dir)?;
-        commit_initial_metadata(&data_dir)?;
+        let metadata = prepare_initial_metadata(&root)?;
+        layout::create_layout(&root)?;
+        commit_initial_metadata(&root)?;
+        root.validate_ambient_identity()?;
+        lock.validate_ownership(&root)?;
         Ok(Self {
-            data_dir,
+            root,
             metadata,
             _lock: lock,
         })
@@ -180,24 +182,24 @@ impl CanonicalStore {
     /// The format is inspected before opening or updating `LOCK`, so a future
     /// store format fails closed without mutating any entry in the directory.
     pub fn open(data_dir: impl AsRef<Path>, owner: crate::LockOwner) -> Result<Self, StoreError> {
-        let data_dir = layout::normalize_data_dir(data_dir.as_ref(), false)?;
-        layout::validate_private_data_directory(&data_dir)?;
-        let (metadata, original_metadata_bytes) = read_store_metadata(&data_dir)?;
-        layout::validate_layout(&data_dir)?;
-        let lock_path = layout::safe_join(&data_dir, Path::new(layout::STORE_LOCK_FILE))?;
-        if !layout::file_exists(&data_dir, &lock_path)? {
+        let root = layout::StoreDirectory::open(data_dir.as_ref(), false)?;
+        root.validate_private_root()?;
+        let (metadata, original_metadata_bytes) = read_store_metadata(&root)?;
+        layout::validate_layout(&root)?;
+        if !root.regular_file_exists(Path::new(layout::STORE_LOCK_FILE))? {
             return Err(StoreError::InvalidLayout);
         }
-        layout::ensure_private_file(&data_dir, &lock_path)?;
+        let _lock_file = root.validate_private_file(Path::new(layout::STORE_LOCK_FILE))?;
 
-        let mut lock = crate::lock::StoreLock::acquire(&data_dir, false)?;
-        let (locked_metadata, locked_metadata_bytes) = read_store_metadata(&data_dir)?;
+        let mut lock = crate::lock::StoreLock::acquire(&root, false)?;
+        let (locked_metadata, locked_metadata_bytes) = read_store_metadata(&root)?;
         if locked_metadata != metadata || locked_metadata_bytes != original_metadata_bytes {
             return Err(StoreError::InvalidStoreMetadata);
         }
-        lock.publish_owner(&owner)?;
+        root.validate_ambient_identity()?;
+        lock.publish_owner(&root, &owner)?;
         Ok(Self {
-            data_dir,
+            root,
             metadata,
             _lock: lock,
         })
@@ -222,19 +224,20 @@ impl CanonicalStore {
         id: &MemoryId,
         authorized: &AuthorizedScopes,
     ) -> Result<StoreRead<MemoryRecord>, StoreError> {
+        self.validate_ownership()?;
         let mut candidate = None;
         for scope in authorized.all_scopes() {
-            let path = layout::record_path(&self.data_dir, &scope, id)?;
-            if layout::file_exists(&self.data_dir, &path)? {
+            let relative = layout::record_relative_path(&scope, id);
+            if let Some(file) = self.root.try_open_regular(&relative, false)? {
                 if candidate.is_some() {
                     return Err(StoreError::DuplicateMemoryId { id: id.clone() });
                 }
-                candidate = Some((scope, path));
+                candidate = Some((scope, file));
             }
         }
-        let (scope, path) = candidate.ok_or(StoreError::NotFound)?;
-        let record = self.read_record_at(
-            &path,
+        let (scope, file) = candidate.ok_or(StoreError::NotFound)?;
+        let record = Self::read_record_file(
+            file,
             &scope,
             Some(id),
             &layout::record_storage_key(id),
@@ -252,6 +255,7 @@ impl CanonicalStore {
         request: &MemoryListRequest,
         authorized: &AuthorizedScopes,
     ) -> Result<StoreRead<MemoryListResult>, StoreError> {
+        self.validate_ownership()?;
         request.validate().map_err(|_| StoreError::InvalidRequest)?;
         let selected_scopes = authorized.resolve_requested(&request.scopes);
         let fingerprint =
@@ -326,12 +330,19 @@ impl CanonicalStore {
         scope: &MemoryScope,
         id: &MemoryId,
     ) -> Result<QuarantineReceipt, StoreError> {
-        let path = layout::record_path(&self.data_dir, scope, id)?;
-        if !layout::file_exists(&self.data_dir, &path)? {
-            return Err(StoreError::NotFound);
-        }
-        match self.read_record_at(
-            &path,
+        self.validate_ownership()?;
+        let relative = layout::record_relative_path(scope, id);
+        let source_directory_path = relative.parent().ok_or(StoreError::UnsafePath)?;
+        let source_name = relative.file_name().ok_or(StoreError::UnsafePath)?;
+        let source_directory = self.root.open_directory(source_directory_path)?;
+        let file = layout::StoreDirectory::try_open_regular_in(&source_directory, source_name)?
+            .ok_or(StoreError::NotFound)?;
+        let source_identity = layout::FileIdentity::from_file(&file)?;
+        let read_file = file
+            .try_clone()
+            .map_err(|source| StoreError::io("clone invalid record handle", source))?;
+        match Self::read_record_file(
+            read_file,
             scope,
             Some(id),
             &layout::record_storage_key(id),
@@ -343,29 +354,69 @@ impl CanonicalStore {
         }
 
         let quarantine_token = Uuid::new_v4().simple().to_string();
-        let destination = layout::safe_join(
-            &self.data_dir,
-            &PathBuf::from(layout::QUARANTINE_DIR).join(format!(
-                "{}.{}.md",
-                layout::record_storage_key(id),
-                quarantine_token
-            )),
-        )?;
-        layout::ensure_regular_file_or_missing(&self.data_dir, &destination)?;
-        if layout::file_exists(&self.data_dir, &destination)? {
+        let destination_name =
+            format!("{}.{}.md", layout::record_storage_key(id), quarantine_token);
+        let quarantine_directory = self
+            .root
+            .open_directory(Path::new(layout::QUARANTINE_DIR))?;
+        if layout::StoreDirectory::try_open_regular_in(
+            &quarantine_directory,
+            OsStr::new(&destination_name),
+        )?
+        .is_some()
+        {
             return Err(StoreError::InvalidLayout);
         }
-        let source_directory = path.parent().ok_or(StoreError::UnsafePath)?.to_path_buf();
-        fs::rename(&path, &destination)
-            .map_err(|source| StoreError::io("quarantine invalid record", source))?;
-        sync_directory(
-            &layout::safe_join(&self.data_dir, Path::new(layout::QUARANTINE_DIR))?,
+        layout::StoreDirectory::rename_between(
+            &source_directory,
+            source_name,
+            &quarantine_directory,
+            OsStr::new(&destination_name),
+        )
+        .map_err(|error| match error {
+            StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                StoreError::UnsafePath
+            }
+            other => other,
+        })?;
+        let moved = layout::StoreDirectory::try_open_regular_in(
+            &quarantine_directory,
+            OsStr::new(&destination_name),
+        );
+        let moved_matches = match moved.as_ref() {
+            Ok(Some(moved)) => layout::FileIdentity::from_file(moved)? == source_identity,
+            Ok(None) | Err(_) => false,
+        };
+        if !moved_matches {
+            // The source name changed after validation. Recover the moved
+            // replacement when possible, but never treat it as the verified
+            // invalid inode.
+            if layout::StoreDirectory::try_open_regular_in(&source_directory, source_name)?
+                .is_none()
+            {
+                let _ = layout::StoreDirectory::rename_between(
+                    &quarantine_directory,
+                    OsStr::new(&destination_name),
+                    &source_directory,
+                    source_name,
+                );
+            }
+            return Err(StoreError::UnsafePath);
+        }
+        // Keep the verified source handle alive until identity has been
+        // checked at the destination.
+        drop(file);
+        layout::StoreDirectory::sync_open_directory(
+            &quarantine_directory,
             "sync quarantine directory",
         )?;
         // Persist the destination entry before the source removal. A crash
         // between directory fsyncs can then leave a duplicate, not lose the
         // only copy of an invalid operator-managed record.
-        sync_directory(&source_directory, "sync source shard directory")?;
+        layout::StoreDirectory::sync_open_directory(
+            &source_directory,
+            "sync source shard directory",
+        )?;
         Ok(QuarantineReceipt {
             memory_id: id.clone(),
             quarantine_token,
@@ -373,14 +424,19 @@ impl CanonicalStore {
     }
 
     fn scan_scope(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>, StoreError> {
-        let scope_dir = layout::scope_directory(&self.data_dir, scope)?;
-        if !layout::directory_exists(&self.data_dir, &scope_dir)? {
+        let scope_relative = layout::scope_relative_directory(scope);
+        let Some(scope_directory) = self.root.try_open_directory(&scope_relative)? else {
             return Ok(Vec::new());
-        }
-        layout::ensure_directory(&self.data_dir, &scope_dir)?;
+        };
+        #[cfg(all(test, unix))]
+        layout::run_test_hook(
+            layout::TestHookPoint::DirectoryEntries,
+            scope_relative.file_name().ok_or(StoreError::UnsafePath)?,
+        );
 
         let mut records = Vec::new();
-        let shard_entries = fs::read_dir(&scope_dir)
+        let shard_entries = scope_directory
+            .entries()
             .map_err(|source| StoreError::io("list scope shards", source))?;
         for shard_entry in shard_entries {
             let shard_entry =
@@ -392,39 +448,39 @@ impl CanonicalStore {
             if !valid_shard_name(&shard) {
                 return Err(StoreError::InvalidLayout);
             }
-            let shard_path = shard_entry.path();
-            layout::ensure_directory(&self.data_dir, &shard_path)?;
-            let record_entries = fs::read_dir(&shard_path)
+            let shard_directory =
+                layout::StoreDirectory::open_child_directory(&scope_directory, OsStr::new(&shard))?;
+            let record_entries = shard_directory
+                .entries()
                 .map_err(|source| StoreError::io("list shard records", source))?;
             for record_entry in record_entries {
                 let record_entry = record_entry
                     .map_err(|source| StoreError::io("read shard record entry", source))?;
-                let storage_key = layout::validate_record_entry_name(&record_entry.file_name())?;
+                let file_name = record_entry.file_name();
+                let storage_key = layout::validate_record_entry_name(&file_name)?;
                 if !storage_key.starts_with(&shard) {
                     return Err(StoreError::InvalidRecord {
                         id: None,
                         reason: InvalidRecordReason::ShardMismatch,
                     });
                 }
-                let record =
-                    self.read_record_at(&record_entry.path(), scope, None, &storage_key, &shard)?;
+                let file =
+                    layout::StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
+                        .ok_or(StoreError::InvalidLayout)?;
+                let record = Self::read_record_file(file, scope, None, &storage_key, &shard)?;
                 records.push(record);
             }
         }
         Ok(records)
     }
 
-    fn read_record_at(
-        &self,
-        path: &Path,
+    fn read_record_file(
+        file: File,
         expected_scope: &MemoryScope,
         expected_id: Option<&MemoryId>,
         expected_storage_key: &str,
         expected_shard: &str,
     ) -> Result<MemoryRecord, StoreError> {
-        layout::ensure_regular_file(&self.data_dir, path)?;
-        let file =
-            File::open(path).map_err(|source| StoreError::io("open memory record", source))?;
         if file
             .metadata()
             .map_err(|source| StoreError::io("inspect memory record", source))?
@@ -463,87 +519,78 @@ impl CanonicalStore {
         }
         Ok(record)
     }
+
+    fn validate_ownership(&self) -> Result<(), StoreError> {
+        self.root.validate_ambient_identity()?;
+        self._lock.validate_ownership(&self.root)
+    }
 }
 
-fn prepare_initial_metadata(root: &Path) -> Result<StoreMetadata, StoreError> {
-    let path = layout::safe_join(root, Path::new(layout::STORE_METADATA_INIT_FILE))?;
-    if layout::file_exists(root, &path)? {
-        return match read_initial_store_metadata(root, &path) {
+fn prepare_initial_metadata(root: &layout::StoreDirectory) -> Result<StoreMetadata, StoreError> {
+    let path = Path::new(layout::STORE_METADATA_INIT_FILE);
+    if let Some(file) = root.try_open_regular(path, false)? {
+        return match read_store_metadata_file(file) {
             Ok((metadata, _)) => {
-                layout::set_private_file_permissions(&path)?;
+                let file = root.open_existing_regular(path, true)?;
+                layout::StoreDirectory::set_private_file(&file)?;
                 Ok(metadata)
             }
             Err(StoreError::InvalidStoreMetadata) => {
-                fs::remove_file(&path)
-                    .map_err(|source| StoreError::io("roll back partial store metadata", source))?;
-                sync_directory(root, "sync metadata rollback")?;
-                create_initial_metadata(root, &path)
+                root.remove_regular_file(path)?;
+                root.sync_root("sync metadata rollback")?;
+                create_initial_metadata(root, path)
             }
             Err(error) => Err(error),
         };
     }
-    create_initial_metadata(root, &path)
+    create_initial_metadata(root, path)
 }
 
-fn create_initial_metadata(root: &Path, path: &Path) -> Result<StoreMetadata, StoreError> {
-    layout::ensure_regular_file_or_missing(root, path)?;
+fn create_initial_metadata(
+    root: &layout::StoreDirectory,
+    path: &Path,
+) -> Result<StoreMetadata, StoreError> {
     let metadata = StoreMetadata::new()?;
     let bytes = metadata.canonical_bytes()?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                StoreError::InvalidStoreMetadata
-            } else {
-                StoreError::io("create initial store metadata", source)
-            }
-        })?;
-    layout::set_private_file_permissions(path)?;
+    let mut file = root.create_new_regular(path)?;
+    layout::StoreDirectory::set_private_file(&file)?;
     file.write_all(&bytes)
         .map_err(|source| StoreError::io("write initial store metadata", source))?;
     file.sync_all()
         .map_err(|source| StoreError::io("sync initial store metadata", source))?;
-    sync_directory(root, "sync initial metadata directory")?;
+    root.sync_root("sync initial metadata directory")?;
     Ok(metadata)
 }
 
-fn commit_initial_metadata(root: &Path) -> Result<(), StoreError> {
-    let initial = layout::safe_join(root, Path::new(layout::STORE_METADATA_INIT_FILE))?;
-    layout::ensure_private_file(root, &initial)?;
-    let committed = layout::safe_join(root, Path::new(layout::STORE_METADATA_FILE))?;
-    layout::ensure_regular_file_or_missing(root, &committed)?;
-    if layout::file_exists(root, &committed)? {
+fn commit_initial_metadata(root: &layout::StoreDirectory) -> Result<(), StoreError> {
+    let initial = Path::new(layout::STORE_METADATA_INIT_FILE);
+    let initial_file = root.validate_private_file(initial)?;
+    let initial_identity = layout::FileIdentity::from_file(&initial_file)?;
+    let committed = Path::new(layout::STORE_METADATA_FILE);
+    if root.regular_file_exists(committed)? {
         return Err(StoreError::AlreadyInitialized);
     }
-    fs::rename(&initial, &committed)
-        .map_err(|source| StoreError::io("commit store metadata", source))?;
-    sync_directory(root, "sync committed store metadata")
-}
-
-fn read_store_metadata(root: &Path) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
-    let path = layout::safe_join(root, Path::new(layout::STORE_METADATA_FILE))?;
-    if !layout::file_exists(root, &path)? {
-        return Err(StoreError::NotInitialized);
+    root.rename(initial, committed)?;
+    if !root.file_identity_matches(committed, initial_identity)? {
+        if !root.regular_file_exists(initial)? {
+            let _ = root.rename(committed, initial);
+        }
+        return Err(StoreError::UnsafePath);
     }
-    layout::ensure_private_file(root, &path)?;
-    read_store_metadata_file(&path)
+    root.sync_root("sync committed store metadata")
 }
 
-fn read_initial_store_metadata(
-    root: &Path,
-    path: &Path,
+fn read_store_metadata(
+    root: &layout::StoreDirectory,
 ) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
-    if !layout::file_exists(root, path)? {
-        return Err(StoreError::NotInitialized);
-    }
-    layout::ensure_regular_file(root, path)?;
-    read_store_metadata_file(path)
+    let file = root
+        .try_open_regular(Path::new(layout::STORE_METADATA_FILE), false)?
+        .ok_or(StoreError::NotInitialized)?;
+    layout::StoreDirectory::validate_private_open_file(&file)?;
+    read_store_metadata_file(file)
 }
 
-fn read_store_metadata_file(path: &Path) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
-    let file = File::open(path).map_err(|source| StoreError::io("open store metadata", source))?;
+fn read_store_metadata_file(file: File) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
     if file
         .metadata()
         .map_err(|source| StoreError::io("inspect store metadata", source))?
@@ -647,10 +694,4 @@ fn summary_from_record(record: &MemoryRecord) -> MemorySummary {
         tags: record.tags.clone(),
         updated_at: record.updated_at.clone(),
     }
-}
-
-fn sync_directory(path: &Path, operation: &'static str) -> Result<(), StoreError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| StoreError::io(operation, source))
 }

@@ -6,11 +6,16 @@ clients and model-visible requests use opaque IDs and typed scopes only.
 
 ## Store ownership and metadata
 
-One process exclusively owns a data directory through an advisory lock on the
-single persistent `LOCK` inode. The file contains only a canonical instance
-UUID, process ID, and start timestamp for secret-safe diagnostics. Releasing a
-store drops the held file descriptor lock but deliberately does not unlink
-`LOCK`; deleting it could let two Unix processes lock different inodes.
+One process exclusively owns a data directory through the single persistent
+`LOCK` inode plus the opened root-directory handle. On Unix, an advisory lock
+on that directory inode keeps a replaced `LOCK` name from creating a second
+cooperative owner in the same directory. On Windows, root and `LOCK` handles
+deny delete sharing, so those names cannot be replaced while owned. `LOCK`
+contains only a canonical instance UUID, process ID, and start timestamp for
+secret-safe diagnostics. It must be a no-follow opened regular file with
+exactly one hard link. Releasing a store drops the held handles and advisory
+locks but deliberately does not unlink `LOCK`; deleting it could let two
+processes lock different inodes.
 
 On Unix, initialization makes the data-directory boundary and fixed private
 directories mode `0700` and the `LOCK`/metadata control files mode `0600`.
@@ -53,6 +58,16 @@ the existing lock inode, rechecks `store.json` under the lock, and only then
 updates lock-owner diagnostics. Opening and ordinary reads do not change
 canonical record bytes or modification times.
 
+The configured data directory is opened one component at a time. User-owned
+intermediate links and the final symlink are rejected before creation; only
+root-owned links reached through a root-owned, non-writable system-directory
+chain may be resolved for platform aliases such as macOS `/var`. The store then
+retains that opened root capability. Metadata, layout checks, record opens,
+directory enumeration, rename, and directory fsync operate relative to opened
+directory handles with final-component no-follow semantics. A later rename or
+replacement of the configured root invalidates the handle instead of
+redirecting reads into the replacement tree.
+
 ## Canonical private layout
 
 ```text
@@ -91,7 +106,10 @@ another principal or an ungranted Project/Session is not opened and cannot leak
 through an error.
 
 All internal joins reject absolute paths, parent components, non-UTF-8 names,
-and symlinks. Public store methods never return a path.
+symlinks, non-regular record entries, and hard-linked canonical files. Regular
+files are opened nonblocking before their actual descriptor type and identity
+are validated, so a raced FIFO cannot stall a reader. Public store methods
+never return a path.
 
 ## Canonical Markdown grammar
 
@@ -151,10 +169,12 @@ is versioned and binds:
 - filters, update watermark, sort order, and page limit; and
 - the deterministic next offset.
 
-The token also carries an integrity digest over those cursor components, so an
-accidentally or manually edited offset is rejected instead of being interpreted
-as another page. Authorization is still re-evaluated on every request; the
-digest is not a substitute for host grants.
+The token also carries an unkeyed corruption checksum over those cursor
+components, so an accidentally edited offset is rejected instead of being
+interpreted as another page. It is not an authenticity mechanism: a client can
+recompute it. Authorization is re-evaluated on every request, so cursor contents
+cannot expand host grants. A keyed cursor MAC can be introduced later if an
+adapter needs tamper resistance in addition to authorization.
 
 Malformed or differently bound cursors fail closed. A cursor whose store UUID
 or revision changed is stale. With unchanged canonical bytes and metadata, a
@@ -169,10 +189,12 @@ mismatch, duplicate ID, unsafe path, and layout failure.
 
 `quarantine_invalid` is a separate operator-facing primitive. It first proves
 that the exact canonical candidate is invalid, then renames it into the existing
-private quarantine directory using a random opaque token. A valid record is
-refused, and the receipt contains only the memory ID and token, never a path or
-body. Authorization of this administrative action belongs at the future CLI or
-transport boundary.
+private quarantine directory using a random opaque token. The source descriptor
+remains open across the capability-relative rename, and the destination file
+identity must match the invalid inode that was validated; a raced replacement
+fails closed. A valid record is refused, and the receipt contains only the
+memory ID and token, never a path or body. Authorization of this administrative
+action belongs at the future CLI or transport boundary.
 
 ## Compatibility and non-goals
 

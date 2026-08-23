@@ -1,8 +1,9 @@
 //! Exclusive owning lock and secret-safe owner metadata.
 
+use crate::layout::{FileIdentity, STORE_LOCK_FILE, StoreDirectory};
 use jiandu_core::Timestamp;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use uuid::Uuid;
@@ -56,19 +57,36 @@ pub type LockOwnerDiagnostics = LockOwner;
 
 #[derive(Debug)]
 pub(crate) struct StoreLock {
+    // A directory-inode lock keeps a replacement `LOCK` filename from
+    // creating a second cooperative owner in the same fixed root.
+    _root_file: File,
     file: File,
+    identity: FileIdentity,
 }
 
 impl StoreLock {
-    pub(crate) fn acquire(root: &Path, create: bool) -> Result<Self, crate::StoreError> {
-        let path = crate::layout::safe_join(root, Path::new(crate::layout::STORE_LOCK_FILE))?;
-        crate::layout::ensure_regular_file_or_missing(root, &path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(create);
-        let mut file = options
-            .open(&path)
-            .map_err(|source| crate::StoreError::io("open store lock", source))?;
-        crate::layout::ensure_regular_file(root, &path)?;
+    pub(crate) fn acquire(root: &StoreDirectory, create: bool) -> Result<Self, crate::StoreError> {
+        let root_file = root.root_lock_file()?;
+        #[cfg(unix)]
+        match fs2::FileExt::try_lock_exclusive(&root_file) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(crate::StoreError::StoreLocked {
+                    owner: owner_diagnostics(root),
+                });
+            }
+            Err(source) => return Err(crate::StoreError::io("acquire store root lock", source)),
+        }
+
+        let mut file = if create {
+            root.open_or_create_lock()?
+        } else {
+            root.open_existing_lock().map_err(|error| match error {
+                crate::StoreError::NotFound => crate::StoreError::InvalidLayout,
+                other => other,
+            })?
+        };
+        let identity = FileIdentity::from_file(&file)?;
 
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => {}
@@ -79,7 +97,30 @@ impl StoreLock {
             Err(source) => return Err(crate::StoreError::io("acquire store lock", source)),
         }
 
-        Ok(Self { file })
+        let lock = Self {
+            _root_file: root_file,
+            file,
+            identity,
+        };
+        lock.validate_ownership(root)?;
+        Ok(lock)
+    }
+
+    pub(crate) fn validate_ownership(
+        &self,
+        root: &StoreDirectory,
+    ) -> Result<(), crate::StoreError> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|source| crate::StoreError::io("inspect held store lock", source))?;
+        if !metadata.is_file() || !StoreDirectory::has_single_link(&self.file)? {
+            return Err(crate::StoreError::UnsafePath);
+        }
+        if !root.file_identity_matches(Path::new(STORE_LOCK_FILE), self.identity)? {
+            return Err(crate::StoreError::UnsafePath);
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_initialization_marker(&mut self) -> Result<(), crate::StoreError> {
@@ -87,7 +128,7 @@ impl StoreLock {
             .file
             .metadata()
             .map_err(|source| crate::StoreError::io("inspect initialization lock", source))?;
-        if metadata.len() > 4_096 {
+        if metadata.len() > 4_096 || !StoreDirectory::has_single_link(&self.file)? {
             return Err(crate::StoreError::InvalidDataDirectory);
         }
         self.file
@@ -115,19 +156,15 @@ impl StoreLock {
     }
 
     pub(crate) fn harden_permissions(&self) -> Result<(), crate::StoreError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            self.file
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|source| {
-                    crate::StoreError::io("set private store lock permissions", source)
-                })?;
-        }
-        Ok(())
+        StoreDirectory::set_private_file(&self.file)
     }
 
-    pub(crate) fn publish_owner(&mut self, owner: &LockOwner) -> Result<(), crate::StoreError> {
+    pub(crate) fn publish_owner(
+        &mut self,
+        root: &StoreDirectory,
+        owner: &LockOwner,
+    ) -> Result<(), crate::StoreError> {
+        self.validate_ownership(root)?;
         let owner = LockOwner::new(
             owner.instance_id.clone(),
             owner.process_id,
@@ -146,12 +183,21 @@ impl StoreLock {
         self.file
             .sync_all()
             .map_err(|source| crate::StoreError::io("sync store lock owner", source))?;
-        Ok(())
+        self.validate_ownership(root)
     }
 }
 
+#[cfg(unix)]
+fn owner_diagnostics(root: &StoreDirectory) -> Option<LockOwnerDiagnostics> {
+    let mut file = root
+        .open_existing_regular(Path::new(STORE_LOCK_FILE), false)
+        .ok()?;
+    read_owner(&mut file)
+}
+
 fn read_owner(file: &mut File) -> Option<LockOwnerDiagnostics> {
-    if file.metadata().ok()?.len() > 4_096 {
+    let metadata = file.metadata().ok()?;
+    if metadata.len() > 4_096 || !StoreDirectory::has_single_link(file).ok()? {
         return None;
     }
     file.seek(SeekFrom::Start(0)).ok()?;

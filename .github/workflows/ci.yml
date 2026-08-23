@@ -29,3 +29,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests and schema drift checks
         run: cargo test --workspace --all-features --locked
+
+  store-windows-runtime:
+    name: canonical store Windows runtime
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run canonical store tests
+        run: cargo test -p jiandu-store --all-features --locked

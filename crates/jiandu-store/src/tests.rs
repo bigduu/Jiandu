@@ -585,6 +585,321 @@ fn paths_reject_traversal_absolute_inputs_and_symlinked_store_roots() {
 
 #[cfg(unix)]
 #[test]
+fn initialization_rejects_intermediate_symlinks_without_touching_the_target() {
+    use std::os::unix::fs::symlink;
+
+    let parent = TempDir::new().expect("temporary parent");
+    let outside = TempDir::new().expect("outside directory");
+    fs::write(
+        outside.path().join("operator.txt"),
+        b"outside remains unchanged\n",
+    )
+    .expect("write outside marker");
+    let before = tree_snapshot(outside.path());
+    let linked_parent = parent.path().join("linked-parent");
+    symlink(outside.path(), &linked_parent).expect("create intermediate directory symlink");
+
+    let error = CanonicalStore::initialize(linked_parent.join("new-store"), owner())
+        .expect_err("an intermediate data-directory symlink is rejected");
+    assert_eq!(error.code(), StoreErrorCode::InvalidDataDirectory);
+    assert_eq!(tree_snapshot(outside.path()), before);
+    assert!(!outside.path().join("new-store").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn initialization_rejects_a_hard_linked_lock_without_mutating_the_external_inode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = TempDir::new().expect("temporary store directory");
+    let outside = TempDir::new().expect("outside directory");
+    let external_lock = outside.path().join("external-lock");
+    fs::write(&external_lock, b"").expect("create external lock inode");
+    fs::set_permissions(&external_lock, fs::Permissions::from_mode(0o640))
+        .expect("set distinctive external mode");
+    fs::hard_link(&external_lock, directory.path().join("LOCK"))
+        .expect("install hard-linked initialization marker");
+    let before = fs::metadata(&external_lock).expect("external metadata");
+
+    let error = CanonicalStore::initialize(directory.path(), owner())
+        .expect_err("a multi-link LOCK inode is rejected");
+    assert_eq!(error.code(), StoreErrorCode::UnsafePath);
+    assert_eq!(fs::read(&external_lock).expect("external bytes"), b"");
+    let after = fs::metadata(&external_lock).expect("external metadata after rejection");
+    assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+    assert_eq!(
+        after.modified().expect("external mtime"),
+        before.modified().expect("original mtime")
+    );
+    assert_eq!(after.len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_check_open_race_rejects_a_symlink_without_touching_its_target() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory = TempDir::new().expect("temporary store directory");
+    drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize store"));
+    let outside = TempDir::new().expect("outside directory");
+    let outside_file = outside.path().join("outside-lock");
+    fs::write(&outside_file, b"outside lock bytes\n").expect("write outside lock");
+    fs::set_permissions(&outside_file, fs::Permissions::from_mode(0o640))
+        .expect("set outside permissions");
+    let before = fs::read(&outside_file).expect("outside bytes before race");
+    let lock_path = directory.path().join("LOCK");
+    let saved_lock = directory.path().join("LOCK.saved");
+    let hook_lock_path = lock_path.clone();
+    let hook_saved_lock = saved_lock.clone();
+    let hook_outside = outside_file.clone();
+    layout::install_test_hook(layout::TestHookPoint::RegularOpen, "LOCK", move || {
+        fs::rename(&hook_lock_path, &hook_saved_lock).expect("move checked lock inode");
+        symlink(&hook_outside, &hook_lock_path).expect("replace LOCK with symlink");
+    });
+
+    let error = CanonicalStore::open(directory.path(), owner())
+        .expect_err("no-follow LOCK open rejects the replacement");
+    assert_eq!(error.code(), StoreErrorCode::UnsafePath);
+    assert_eq!(
+        fs::read(&outside_file).expect("outside bytes after race"),
+        before
+    );
+    assert_eq!(
+        fs::metadata(&outside_file)
+            .expect("outside metadata")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o640
+    );
+    assert!(saved_lock.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_lock_cannot_create_a_second_owner_in_the_same_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = TempDir::new().expect("temporary store directory");
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
+    fs::rename(
+        directory.path().join("LOCK"),
+        directory.path().join("LOCK.original"),
+    )
+    .expect("move held lock name");
+    fs::write(directory.path().join("LOCK"), b"").expect("create replacement lock");
+    fs::set_permissions(
+        directory.path().join("LOCK"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("set replacement lock mode");
+
+    let second = CanonicalStore::open(directory.path(), owner())
+        .expect_err("the held root inode lock blocks a replacement LOCK owner");
+    assert_eq!(second.code(), StoreErrorCode::StoreLocked);
+    let first = store
+        .get(
+            &memory_id("mem_absent"),
+            &AuthorizedScopes::new(principal_id("prn_reader")),
+        )
+        .expect_err("the original owner fails closed after LOCK replacement");
+    assert_eq!(first.code(), StoreErrorCode::UnsafePath);
+}
+
+#[cfg(unix)]
+#[test]
+fn root_replacement_invalidates_the_held_store_and_cannot_be_followed_as_a_link() {
+    use std::os::unix::fs::symlink;
+
+    let parent = TempDir::new().expect("temporary parent");
+    let root = parent.path().join("store");
+    let moved = parent.path().join("store.moved");
+    let store = CanonicalStore::initialize(&root, owner()).expect("initialize store");
+    fs::rename(&root, &moved).expect("move the opened root inode");
+    symlink(&moved, &root).expect("replace configured root with symlink");
+
+    let existing = store
+        .get(
+            &memory_id("mem_absent"),
+            &AuthorizedScopes::new(principal_id("prn_reader")),
+        )
+        .expect_err("existing handle notices ambient root replacement");
+    assert_eq!(existing.code(), StoreErrorCode::UnsafePath);
+    let second = CanonicalStore::open(&root, owner())
+        .expect_err("a second owner cannot follow the replacement root link");
+    assert_eq!(second.code(), StoreErrorCode::InvalidDataDirectory);
+}
+
+#[cfg(unix)]
+#[test]
+fn record_open_race_never_follows_a_symlink_or_blocks_on_a_fifo() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TempDir::new().expect("temporary store directory");
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_record_race"),
+    };
+    let header = frontmatter(
+        "mem_record_race",
+        scope.clone(),
+        "2026-08-23T10:00:00Z",
+        "2026-08-23T10:00:00Z",
+    );
+    let record_path = write_record(directory.path(), &header, "inside body");
+    let outside = TempDir::new().expect("outside directory");
+    let outside_file = outside.path().join("outside.md");
+    fs::write(&outside_file, b"outside must never be read\n").expect("write outside file");
+    let outside_before = fs::read(&outside_file).expect("outside bytes before race");
+    let saved = record_path.with_extension("saved");
+    let hook_record = record_path.clone();
+    let hook_saved = saved.clone();
+    let hook_outside = outside_file.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        layout::record_file_name(&header.id),
+        move || {
+            fs::rename(&hook_record, &hook_saved).expect("move checked record");
+            symlink(&hook_outside, &hook_record).expect("replace record with symlink");
+        },
+    );
+    let authorized = AuthorizedScopes::new(principal_id("prn_reader"))
+        .with_project(project_id("prj_record_race"));
+    let error = store
+        .get(&header.id, &authorized)
+        .expect_err("record no-follow open rejects a raced symlink");
+    assert_eq!(error.code(), StoreErrorCode::UnsafePath);
+    assert_eq!(
+        fs::read(&outside_file).expect("outside bytes after race"),
+        outside_before
+    );
+
+    fs::remove_file(&record_path).expect("remove raced symlink");
+    fs::rename(&saved, &record_path).expect("restore record for FIFO race");
+    let fifo_record = record_path.clone();
+    let fifo_saved = saved.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        layout::record_file_name(&header.id),
+        move || {
+            fs::rename(&fifo_record, &fifo_saved).expect("move checked record for FIFO race");
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo_record)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo failed");
+        },
+    );
+    let error = store
+        .get(&header.id, &authorized)
+        .expect_err("nonblocking open rejects a raced FIFO");
+    assert_eq!(error.code(), StoreErrorCode::InvalidLayout);
+}
+
+#[cfg(unix)]
+#[test]
+fn list_scope_read_dir_race_stays_on_the_opened_directory_inode() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TempDir::new().expect("temporary store directory");
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_scope_race"),
+    };
+    let header = frontmatter(
+        "mem_scope_race",
+        scope.clone(),
+        "2026-08-23T10:00:00Z",
+        "2026-08-23T10:00:00Z",
+    );
+    write_record(directory.path(), &header, "inside body");
+    let scope_path = layout::scope_directory(directory.path(), &scope).expect("scope path");
+    let scope_name = scope_path
+        .file_name()
+        .expect("scope storage key")
+        .to_os_string();
+    let moved_scope = scope_path.with_extension("moved");
+    let outside = TempDir::new().expect("outside directory");
+    fs::write(
+        outside.path().join("sentinel"),
+        b"outside remains unchanged\n",
+    )
+    .expect("write outside sentinel");
+    let outside_before = tree_snapshot(outside.path());
+    let hook_scope = scope_path.clone();
+    let hook_moved = moved_scope.clone();
+    let hook_outside = outside.path().to_path_buf();
+    layout::install_test_hook(
+        layout::TestHookPoint::DirectoryEntries,
+        scope_name,
+        move || {
+            fs::rename(&hook_scope, &hook_moved).expect("move checked scope directory");
+            symlink(&hook_outside, &hook_scope).expect("replace scope with outside symlink");
+        },
+    );
+    let authorized = AuthorizedScopes::new(principal_id("prn_reader"))
+        .with_project(project_id("prj_scope_race"));
+    let request = list_request(
+        vec![ScopeSelector::Project {
+            project_id: project_id("prj_scope_race"),
+        }],
+        10,
+    );
+    let page = store
+        .list(&request, &authorized)
+        .expect("read_dir stays on the opened original scope directory");
+    assert_eq!(page.result.memories.len(), 1);
+    assert_eq!(page.result.memories[0].id, header.id);
+    assert_eq!(tree_snapshot(outside.path()), outside_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn quarantine_move_is_bound_to_the_invalid_inode_that_was_validated() {
+    let directory = TempDir::new().expect("temporary store directory");
+    let mut store =
+        CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
+    let scope = MemoryScope::Session {
+        session_id: session_id("ses_quarantine_race"),
+    };
+    let id = memory_id("mem_quarantine_race");
+    let original = include_bytes!("../fixtures/v1alpha1/invalid/malformed-frontmatter.md");
+    let replacement = include_bytes!("../fixtures/v1alpha1/invalid/truncated.md");
+    let record_path = write_raw_record(directory.path(), &scope, &id, original);
+    let saved = record_path.with_extension("validated");
+    let hook_record = record_path.clone();
+    let hook_saved = saved.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::Rename,
+        layout::record_file_name(&id),
+        move || {
+            fs::rename(&hook_record, &hook_saved).expect("move validated source inode");
+            fs::write(&hook_record, replacement).expect("install replacement source inode");
+        },
+    );
+
+    let error = store
+        .quarantine_invalid(&scope, &id)
+        .expect_err("a replacement inode is not accepted as the validated source");
+    assert_eq!(error.code(), StoreErrorCode::UnsafePath);
+    assert_eq!(
+        fs::read(&record_path).expect("replacement restored"),
+        replacement
+    );
+    assert_eq!(
+        fs::read(&saved).expect("validated inode retained"),
+        original
+    );
+    assert_eq!(
+        fs::read_dir(directory.path().join("quarantine"))
+            .expect("quarantine directory")
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn exact_read_rejects_a_symlinked_record_without_following_it() {
     use std::os::unix::fs::symlink;
 
