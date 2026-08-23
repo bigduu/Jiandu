@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ErrorEnvelope",
+  "description": "Failed operation result with the same correlation metadata as success.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "$ref": "#/$defs/ApiVersion"
+    },
+    "correlationId": {
+      "$ref": "#/$defs/CorrelationId"
+    },
+    "storeRevision": {
+      "$ref": "#/$defs/StoreRevision"
+    },
+    "error": {
+      "$ref": "#/$defs/DomainError"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "correlationId",
+    "storeRevision",
+    "error"
+  ],
+  "$defs": {
+    "ApiVersion": {
+      "description": "Closed API version carried on every public response envelope.",
+      "type": "string",
+      "enum": [
+        "jiandu.dev/v1alpha1"
+      ]
+    },
+    "CorrelationId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^req_[A-Za-z0-9_-]+$"
+    },
+    "StoreRevision": {
+      "description": "Monotonic revision of the canonical store; zero represents an empty store.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "DomainError": {
+      "description": "Safe public error payload. Secret diagnostic context belongs in host logs.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DomainErrorCode"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "DomainErrorCode": {
+      "description": "Stable machine-readable failure categories for `v1alpha1`.",
+      "type": "string",
+      "enum": [
+        "INVALID_ARGUMENT",
+        "UNAUTHENTICATED",
+        "FORBIDDEN",
+        "NOT_FOUND",
+        "REVISION_CONFLICT",
+        "IDEMPOTENCY_CONFLICT",
+        "STORE_UNAVAILABLE",
+        "INDEX_DEGRADED",
+        "RATE_LIMITED",
+        "INTERNAL"
+      ]
+    }
+  }
+}

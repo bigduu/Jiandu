@@ -23,6 +23,7 @@ tags:
 created_at: 2026-08-23T10:00:00Z
 updated_at: 2026-08-23T10:05:00Z
 provenance:
+  created_by: host
   agent_id: bamboo
   session_id: ses_01K3...
   branch_id: br_01K3...

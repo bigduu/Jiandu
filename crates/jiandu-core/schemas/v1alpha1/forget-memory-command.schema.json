@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ForgetMemoryCommand",
+  "description": "Optimistic, idempotent forgetting of exactly one record.",
+  "type": "object",
+  "properties": {
+    "memoryId": {
+      "$ref": "#/$defs/MemoryId"
+    },
+    "expectedRevision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "idempotencyKey": {
+      "$ref": "#/$defs/IdempotencyKey"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "memoryId",
+    "expectedRevision",
+    "reason",
+    "idempotencyKey"
+  ],
+  "$defs": {
+    "MemoryId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^mem_[A-Za-z0-9_-]+$"
+    },
+    "Revision": {
+      "description": "Positive, monotonically increasing per-record revision.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1
+    },
+    "IdempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    }
+  }
+}

@@ -1,0 +1,448 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryFrontmatterV1Alpha1",
+  "description": "Header of one canonical `v1alpha1` Markdown memory document.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "$ref": "#/$defs/MemorySchema"
+    },
+    "id": {
+      "$ref": "#/$defs/MemoryId"
+    },
+    "revision": {
+      "$ref": "#/$defs/Revision"
+    },
+    "scope": {
+      "$ref": "#/$defs/FrontmatterScope"
+    },
+    "type": {
+      "$ref": "#/$defs/MemoryType"
+    },
+    "status": {
+      "$ref": "#/$defs/MemoryStatus"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Tag"
+      },
+      "maxItems": 32
+    },
+    "created_at": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "updated_at": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "provenance": {
+      "$ref": "#/$defs/FrontmatterProvenance"
+    },
+    "relations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/FrontmatterRelation"
+      },
+      "maxItems": 128
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "revision",
+    "scope",
+    "type",
+    "status",
+    "title",
+    "tags",
+    "created_at",
+    "updated_at",
+    "provenance",
+    "relations"
+  ],
+  "$defs": {
+    "MemorySchema": {
+      "description": "Closed memory schema identifiers understood by this crate.",
+      "type": "string",
+      "enum": [
+        "jiandu.dev/memory/v1alpha1"
+      ]
+    },
+    "MemoryId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^mem_[A-Za-z0-9_-]+$"
+    },
+    "Revision": {
+      "description": "Positive, monotonically increasing per-record revision.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1
+    },
+    "FrontmatterScope": {
+      "description": "Resolved authoritative scope serialized in canonical frontmatter.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "principal_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "project_id": {
+              "$ref": "#/$defs/ProjectId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "project"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "project_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "$ref": "#/$defs/SessionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "session"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "instance_global"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^prn_[A-Za-z0-9_-]+$"
+    },
+    "ProjectId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^prj_[A-Za-z0-9_-]+$"
+    },
+    "SessionId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^ses_[A-Za-z0-9_-]+$"
+    },
+    "MemoryType": {
+      "description": "Closed memory categories for the v1alpha1 record schema.",
+      "type": "string",
+      "enum": [
+        "preference",
+        "decision",
+        "project",
+        "fact",
+        "feedback",
+        "reference"
+      ]
+    },
+    "MemoryStatus": {
+      "description": "Retrieval lifecycle of a non-forgotten memory.",
+      "type": "string",
+      "enum": [
+        "active",
+        "stale",
+        "superseded",
+        "contradicted",
+        "archived"
+      ]
+    },
+    "Tag": {
+      "description": "Canonical lower-case tag.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "Timestamp": {
+      "description": "Canonical RFC 3339 timestamp in UTC using the `Z` designator.",
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 35,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{0,8}[1-9])?Z$"
+    },
+    "FrontmatterProvenance": {
+      "description": "Portable provenance in canonical snake_case form.",
+      "type": "object",
+      "properties": {
+        "created_by": {
+          "$ref": "#/$defs/CreationActor"
+        },
+        "agent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "branch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BranchId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "maxItems": 128
+        },
+        "message_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FrontmatterMessageRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extraction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FrontmatterExtraction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Confidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "created_by"
+      ]
+    },
+    "CreationActor": {
+      "description": "Actor responsible for creating a memory.",
+      "type": "string",
+      "enum": [
+        "model",
+        "user",
+        "host",
+        "operator",
+        "import"
+      ]
+    },
+    "AgentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "BranchId": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 128,
+      "pattern": "^br_[A-Za-z0-9_-]+$"
+    },
+    "MessageId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^msg_[A-Za-z0-9_-]+$"
+    },
+    "FrontmatterMessageRange": {
+      "description": "Snake_case form of an inclusive committed-message range.",
+      "type": "object",
+      "properties": {
+        "first_message_id": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "last_message_id": {
+          "$ref": "#/$defs/MessageId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "first_message_id",
+        "last_message_id"
+      ]
+    },
+    "SourceUri": {
+      "description": "URI identifying external provenance without making a filesystem path an identity.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 2048,
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[!-~]+$"
+    },
+    "ContentDigest": {
+      "description": "Algorithm-qualified digest such as `sha256:<hex>`.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^[a-z0-9_]+:[A-Fa-f0-9]+$"
+    },
+    "FrontmatterExtraction": {
+      "description": "Snake_case form of extraction provenance.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/ExtractionMethod"
+        },
+        "extractor_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method"
+      ]
+    },
+    "ExtractionMethod": {
+      "description": "How memory content was selected or extracted.",
+      "type": "string",
+      "enum": [
+        "explicit",
+        "host_rule",
+        "model",
+        "import"
+      ]
+    },
+    "Confidence": {
+      "type": "number",
+      "format": "double",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "FrontmatterRelation": {
+      "description": "Snake_case form of a typed memory relation.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/RelationKind"
+        },
+        "target_memory_id": {
+          "$ref": "#/$defs/MemoryId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "target_memory_id"
+      ]
+    },
+    "RelationKind": {
+      "description": "Typed relation between two opaque memory records.",
+      "type": "string",
+      "enum": [
+        "supersedes",
+        "supports",
+        "contradicts",
+        "derived_from",
+        "related_to"
+      ]
+    }
+  }
+}

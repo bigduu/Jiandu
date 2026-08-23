@@ -1,0 +1,524 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResultEnvelope",
+  "description": "Successful operation result with correlation and store-watermark metadata.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "$ref": "#/$defs/ApiVersion"
+    },
+    "correlationId": {
+      "$ref": "#/$defs/CorrelationId"
+    },
+    "storeRevision": {
+      "$ref": "#/$defs/StoreRevision"
+    },
+    "result": {
+      "$ref": "#/$defs/RememberMemoryResult"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "correlationId",
+    "storeRevision",
+    "result"
+  ],
+  "$defs": {
+    "ApiVersion": {
+      "description": "Closed API version carried on every public response envelope.",
+      "type": "string",
+      "enum": [
+        "jiandu.dev/v1alpha1"
+      ]
+    },
+    "CorrelationId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^req_[A-Za-z0-9_-]+$"
+    },
+    "StoreRevision": {
+      "description": "Monotonic revision of the canonical store; zero represents an empty store.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "RememberMemoryResult": {
+      "description": "Successful remember receipt. Replays return the same record.",
+      "type": "object",
+      "properties": {
+        "record": {
+          "$ref": "#/$defs/MemoryRecord"
+        },
+        "idempotentReplay": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "record",
+        "idempotentReplay"
+      ]
+    },
+    "MemoryRecord": {
+      "description": "Complete authoritative memory record returned by record APIs.\n\nThe body is structured data from Jiandu's perspective; it is never prompt\npolicy. Optional response fields may be added within v1alpha1, so this\nresponse type intentionally does not deny unknown fields on deserialization.",
+      "type": "object",
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/MemorySchema"
+        },
+        "id": {
+          "$ref": "#/$defs/MemoryId"
+        },
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "etag": {
+          "$ref": "#/$defs/Etag"
+        },
+        "scope": {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        "type": {
+          "$ref": "#/$defs/MemoryType"
+        },
+        "status": {
+          "$ref": "#/$defs/MemoryStatus"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "x-jiandu-maxUtf8Bytes": 65536
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Tag"
+          },
+          "maxItems": 32
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "relations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MemoryRelation"
+          },
+          "maxItems": 128
+        }
+      },
+      "required": [
+        "schema",
+        "id",
+        "revision",
+        "etag",
+        "scope",
+        "type",
+        "status",
+        "title",
+        "body",
+        "tags",
+        "createdAt",
+        "updatedAt",
+        "provenance",
+        "relations"
+      ]
+    },
+    "MemorySchema": {
+      "description": "Closed memory schema identifiers understood by this crate.",
+      "type": "string",
+      "enum": [
+        "jiandu.dev/memory/v1alpha1"
+      ]
+    },
+    "MemoryId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^mem_[A-Za-z0-9_-]+$"
+    },
+    "Revision": {
+      "description": "Positive, monotonically increasing per-record revision.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1
+    },
+    "Etag": {
+      "description": "Opaque entity tag returned by the authoritative store.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!-~]+$"
+    },
+    "MemoryScope": {
+      "description": "Authoritative scope stamped onto a resolved memory record.\n\nUnlike a request selector, a Principal record carries the trusted owner ID\nselected by policy. Project and Session membership remain authorization\ndata outside this value.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "principalId": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "principalId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "projectId": {
+              "$ref": "#/$defs/ProjectId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "project"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "projectId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "$ref": "#/$defs/SessionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "session"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "sessionId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "instance_global"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^prn_[A-Za-z0-9_-]+$"
+    },
+    "ProjectId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^prj_[A-Za-z0-9_-]+$"
+    },
+    "SessionId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^ses_[A-Za-z0-9_-]+$"
+    },
+    "MemoryType": {
+      "description": "Closed memory categories for the v1alpha1 record schema.",
+      "type": "string",
+      "enum": [
+        "preference",
+        "decision",
+        "project",
+        "fact",
+        "feedback",
+        "reference"
+      ]
+    },
+    "MemoryStatus": {
+      "description": "Retrieval lifecycle of a non-forgotten memory.",
+      "type": "string",
+      "enum": [
+        "active",
+        "stale",
+        "superseded",
+        "contradicted",
+        "archived"
+      ]
+    },
+    "Tag": {
+      "description": "Canonical lower-case tag.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "Timestamp": {
+      "description": "Canonical RFC 3339 timestamp in UTC using the `Z` designator.",
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 35,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{0,8}[1-9])?Z$"
+    },
+    "Provenance": {
+      "description": "Portable provenance that contains no host database or prompt-runtime type.",
+      "type": "object",
+      "properties": {
+        "createdBy": {
+          "$ref": "#/$defs/CreationActor"
+        },
+        "agentId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "branchId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BranchId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "messageIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "maxItems": 128
+        },
+        "messageRange": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommittedMessageRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sourceUri": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceUri"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contentDigest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extraction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExtractionProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Confidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "createdBy"
+      ]
+    },
+    "CreationActor": {
+      "description": "Actor responsible for creating a memory.",
+      "type": "string",
+      "enum": [
+        "model",
+        "user",
+        "host",
+        "operator",
+        "import"
+      ]
+    },
+    "AgentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "BranchId": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 128,
+      "pattern": "^br_[A-Za-z0-9_-]+$"
+    },
+    "MessageId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^msg_[A-Za-z0-9_-]+$"
+    },
+    "CommittedMessageRange": {
+      "description": "Inclusive range of committed host messages.",
+      "type": "object",
+      "properties": {
+        "firstMessageId": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "lastMessageId": {
+          "$ref": "#/$defs/MessageId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "firstMessageId",
+        "lastMessageId"
+      ]
+    },
+    "SourceUri": {
+      "description": "URI identifying external provenance without making a filesystem path an identity.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 2048,
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[!-~]+$"
+    },
+    "ContentDigest": {
+      "description": "Algorithm-qualified digest such as `sha256:<hex>`.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^[a-z0-9_]+:[A-Fa-f0-9]+$"
+    },
+    "ExtractionProvenance": {
+      "description": "Optional extraction provenance.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/ExtractionMethod"
+        },
+        "extractorVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method"
+      ]
+    },
+    "ExtractionMethod": {
+      "description": "How memory content was selected or extracted.",
+      "type": "string",
+      "enum": [
+        "explicit",
+        "host_rule",
+        "model",
+        "import"
+      ]
+    },
+    "Confidence": {
+      "type": "number",
+      "format": "double",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "MemoryRelation": {
+      "description": "One directed relation to another memory.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/RelationKind"
+        },
+        "targetMemoryId": {
+          "$ref": "#/$defs/MemoryId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "targetMemoryId"
+      ]
+    },
+    "RelationKind": {
+      "description": "Typed relation between two opaque memory records.",
+      "type": "string",
+      "enum": [
+        "supersedes",
+        "supports",
+        "contradicts",
+        "derived_from",
+        "related_to"
+      ]
+    }
+  }
+}
