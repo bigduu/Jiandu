@@ -560,7 +560,7 @@ fn paths_reject_traversal_absolute_inputs_and_symlinked_store_roots() {
         StoreErrorCode::UnsafePath
     );
     assert_eq!(
-        CanonicalStore::initialize(root.join("missing/../store"), owner())
+        CanonicalStore::initialize(root.join("missing").join("..").join("store"), owner())
             .expect_err("parent traversal in data directory is rejected")
             .code(),
         StoreErrorCode::InvalidDataDirectory

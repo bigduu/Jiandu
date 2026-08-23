@@ -44,7 +44,11 @@ Initialization never claims an arbitrary non-empty directory. An empty target
 receives a persistent `LOCK` ownership marker and a private
 `.store.json.init` file before the fixed empty layout is built. The metadata is
 fsynced and atomically renamed to `store.json` only after the layout directories
-and their parent entries have also been fsynced.
+and their parent entries have also crossed the platform durability boundary.
+On Unix this includes directory `fsync`. Windows capability directory handles
+cannot be upgraded to the `GENERIC_WRITE` access required by
+`FlushFileBuffers`, so file contents are flushed before rename while the
+directory step is a documented platform no-op.
 
 After an interruption, a canonical init file is completed with the same store
 ID; a truncated uncommitted init file is rolled back and recreated. Any entry
@@ -63,9 +67,9 @@ intermediate links and the final symlink are rejected before creation; only
 root-owned links reached through a root-owned, non-writable system-directory
 chain may be resolved for platform aliases such as macOS `/var`. The store then
 retains that opened root capability. Metadata, layout checks, record opens,
-directory enumeration, rename, and directory fsync operate relative to opened
-directory handles with final-component no-follow semantics. A later rename or
-replacement of the configured root invalidates the handle instead of
+directory enumeration, rename, and supported directory flushes operate relative
+to opened directory handles with final-component no-follow semantics. A later
+rename or replacement of the configured root invalidates the handle instead of
 redirecting reads into the replacement tree.
 
 ## Canonical private layout

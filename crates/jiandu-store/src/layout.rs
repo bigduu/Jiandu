@@ -156,10 +156,8 @@ impl StoreDirectory {
     }
 
     pub(crate) fn root_lock_file(&self) -> Result<File, StoreError> {
-        self.root
-            .try_clone()
-            .map(Dir::into_std_file)
-            .map_err(|source| StoreError::io("clone store root handle", source))
+        reopen_directory_file(&self.root)
+            .map_err(|source| StoreError::io("reopen store root handle", source))
     }
 
     pub(crate) fn sync_root(&self, operation: &'static str) -> Result<(), StoreError> {
@@ -890,9 +888,7 @@ fn set_private_directory_handle(directory: &Dir) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        directory
-            .try_clone()
-            .map(Dir::into_std_file)
+        reopen_directory_file(directory)
             .and_then(|file| file.set_permissions(std::fs::Permissions::from_mode(0o700)))
             .map_err(|source| StoreError::io("set private store directory permissions", source))?;
     }
@@ -920,12 +916,45 @@ fn validate_private_directory_handle(directory: &Dir, error: StoreError) -> Resu
     Ok(())
 }
 
+#[cfg(unix)]
+fn reopen_directory_file(directory: &Dir) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    // `cap_std::fs::Dir` may use Linux O_PATH descriptors. They are safe path
+    // capabilities but cannot be flocked, chmodded, or fsynced. Reopen `.`
+    // relative to the held capability so those operations remain bound to the
+    // same directory inode without consulting the ambient namespace.
+    openat(
+        directory,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn reopen_directory_file(directory: &Dir) -> io::Result<File> {
+    directory.try_clone().map(Dir::into_std_file)
+}
+
+#[cfg(not(windows))]
 fn sync_directory_handle(directory: &Dir, operation: &'static str) -> Result<(), StoreError> {
-    directory
-        .try_clone()
-        .map(Dir::into_std_file)
+    reopen_directory_file(directory)
         .and_then(|file| file.sync_all())
         .map_err(|source| StoreError::io(operation, source))
+}
+
+#[cfg(windows)]
+fn sync_directory_handle(directory: &Dir, operation: &'static str) -> Result<(), StoreError> {
+    // `std::fs::File::sync_all` maps to `FlushFileBuffers`, which requires
+    // GENERIC_WRITE. Capability directory handles intentionally carry only
+    // directory-read rights and cannot be upgraded without losing the fixed
+    // handle boundary. File contents are still flushed before every rename;
+    // Rust exposes no portable directory-fsync primitive for Windows.
+    let _ = (directory, operation);
+    Ok(())
 }
 
 fn storage_key(domain: &str, value: &str) -> String {
