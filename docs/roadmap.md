@@ -1,0 +1,88 @@
+# Delivery Roadmap
+
+Jiandu will be delivered as small vertical milestones. Each implementation issue must preserve the architecture invariants in [AGENTS.md](../AGENTS.md), include focused tests, and avoid introducing Bamboo-specific types into the core.
+
+Issue links will be added after the initial architecture commit establishes stable document URLs.
+
+## Milestone 0: Contract foundation
+
+- Define agent-neutral Rust domain types for records, scopes, provenance, revisions, queries, mutations, and errors.
+- Publish JSON Schemas and canonical serialization fixtures from the same definitions.
+- Establish API, store, and index version boundaries.
+- Add invariant and round-trip tests.
+
+Outcome: downstream work compiles against a small contract with no persistence or MCP dependency.
+
+## Milestone 1: Canonical filesystem store
+
+- Implement data-directory initialization and exclusive ownership.
+- Add canonical record serialization, validation, and scope-safe paths.
+- Implement atomic create/update/forget with expected revisions.
+- Add durable idempotency receipts, audit events, tombstones, and crash recovery.
+- Implement validate, import/export, backup metadata, and migration hooks.
+
+Outcome: one local process can safely own durable memory without a model or MCP transport.
+
+## Milestone 2: Derived retrieval
+
+- Build a deterministic lexical index from canonical records.
+- Implement structured filters, stable ranking, and cursor pagination.
+- Track store watermarks and rebuild after corruption or version changes.
+- Add retrieval conformance and scope-leakage tests.
+
+Outcome: search is useful and rebuildable without making derived data authoritative.
+
+## Milestone 3: Standalone MCP service
+
+- Expose structured read tools and resources.
+- Add mutation tools with independent capability grants.
+- Run a singleton Streamable HTTP daemon with local authentication.
+- Add readiness, diagnostics, graceful shutdown, metrics, and secret-safe logs.
+- Provide a `stdio` proxy that connects to the daemon instead of opening the store.
+
+Outcome: at least two independent MCP clients can use the same Jiandu service safely.
+
+## Milestone 4: Lineage and interoperability
+
+- Define idempotent committed-turn and branch event contracts.
+- Implement Session snapshot, copy-through-message watermarks, and copy-on-write memory semantics.
+- Add a two-client conformance harness and transport failure tests.
+- Document remote deployment requirements without enabling an insecure default.
+
+Outcome: Session branches are portable, deterministic, and independent from one host's database schema.
+
+## Milestone 5: Bamboo migration
+
+- Import and validate current Bamboo filesystem memory.
+- Run shadow reads and measure parity.
+- Add Bamboo's host-owned proactive recall/context adapter.
+- Switch mutations during a bounded single-writer cutover.
+- Integrate committed events and remove Bamboo's direct filesystem ownership.
+
+Outcome: Bamboo consumes Jiandu as a replaceable MCP-backed capability, while generic clients remain first-class.
+
+## Milestone 6: Optional smart memory
+
+Only after deterministic contracts and cross-client conformance are stable:
+
+- pluggable embeddings and semantic reranking;
+- host- or service-initiated candidate extraction;
+- explicit consolidation and contradiction workflows;
+- usage feedback and retention recommendations;
+- remote multi-tenant deployment.
+
+All model-assisted features remain optional, observable, reversible, and subordinate to canonical records and operator policy.
+
+## Project definition of done
+
+The standalone foundation is complete when:
+
+- Jiandu is the only writer for its data directory and recovers from interrupted mutations;
+- canonical records survive index deletion and rebuild;
+- read, write, and destructive grants are independently enforceable;
+- scope isolation and Project identity behavior have negative tests;
+- idempotent retry and revision conflict behavior pass conformance fixtures;
+- two independent MCP clients pass the public contract suite;
+- Bamboo completes a reversible cutover without indefinite dual-write;
+- another agent can use Jiandu without linking or understanding Bamboo;
+- backup, export, import, validation, and forget/purge behavior are documented and tested.
