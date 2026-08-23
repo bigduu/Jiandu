@@ -596,7 +596,7 @@ fn absolute_data_path(path: &Path) -> Result<PathBuf, StoreError> {
     if path.as_os_str().is_empty()
         || path
             .components()
-            .any(|component| matches!(component, Component::ParentDir))
+            .any(|component| is_dot_component(&component))
     {
         return Err(StoreError::InvalidDataDirectory);
     }
@@ -684,12 +684,15 @@ fn split_absolute_path(path: &Path) -> Result<(PathBuf, Vec<OsString>), StoreErr
             Component::Prefix(_) | Component::RootDir if !saw_normal => {
                 anchor.push(component.as_os_str());
             }
-            Component::Normal(name) => {
+            Component::Normal(name) if name != OsStr::new(".") && name != OsStr::new("..") => {
                 saw_normal = true;
                 components.push(name.to_os_string());
             }
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+            Component::Normal(_)
+            | Component::CurDir
+            | Component::ParentDir
+            | Component::Prefix(_)
+            | Component::RootDir => {
                 return Err(StoreError::InvalidDataDirectory);
             }
         }
@@ -834,7 +837,9 @@ fn validate_relative_path(relative: &Path) -> Result<(), StoreError> {
         || relative.as_os_str().is_empty()
         || relative
             .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
+            .any(|component| {
+                !matches!(component, Component::Normal(name) if name != OsStr::new(".") && name != OsStr::new(".."))
+            })
     {
         return Err(StoreError::UnsafePath);
     }
@@ -844,6 +849,8 @@ fn validate_relative_path(relative: &Path) -> Result<(), StoreError> {
 fn validate_normal_name(name: &OsStr) -> Result<(), StoreError> {
     let path = Path::new(name);
     if path.as_os_str().is_empty()
+        || name == OsStr::new(".")
+        || name == OsStr::new("..")
         || path.is_absolute()
         || path.components().count() != 1
         || !matches!(path.components().next(), Some(Component::Normal(_)))
@@ -851,6 +858,12 @@ fn validate_normal_name(name: &OsStr) -> Result<(), StoreError> {
         return Err(StoreError::UnsafePath);
     }
     Ok(())
+}
+
+fn is_dot_component(component: &Component<'_>) -> bool {
+    matches!(component, Component::CurDir | Component::ParentDir)
+        || component.as_os_str() == OsStr::new(".")
+        || component.as_os_str() == OsStr::new("..")
 }
 
 fn set_private_file_permissions(file: &File) -> Result<(), StoreError> {

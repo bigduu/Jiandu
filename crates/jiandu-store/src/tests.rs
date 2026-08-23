@@ -565,6 +565,25 @@ fn paths_reject_traversal_absolute_inputs_and_symlinked_store_roots() {
             .code(),
         StoreErrorCode::InvalidDataDirectory
     );
+    assert!(!root.join("missing").exists());
+    assert!(!root.join("store").exists());
+
+    let outside = TempDir::new().expect("outside temporary directory");
+    let outside_root = fs::canonicalize(outside.path()).expect("canonical outside directory");
+    assert_eq!(
+        root.parent(),
+        outside_root.parent(),
+        "temporary fixtures must share a parent for the escape regression"
+    );
+    let outside_before = tree_snapshot(&outside_root);
+    let outside_name = outside_root.file_name().expect("outside directory name");
+    assert_eq!(
+        CanonicalStore::initialize(root.join("..").join(outside_name), owner())
+            .expect_err("parent traversal cannot claim a sibling directory")
+            .code(),
+        StoreErrorCode::InvalidDataDirectory
+    );
+    assert_eq!(tree_snapshot(&outside_root), outside_before);
 
     #[cfg(unix)]
     {

@@ -70,7 +70,7 @@ impl StoreLock {
         #[cfg(unix)]
         match fs2::FileExt::try_lock_exclusive(&root_file) {
             Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(source) if lock_is_contended(&source) => {
                 return Err(crate::StoreError::StoreLocked {
                     owner: owner_diagnostics(root),
                 });
@@ -90,7 +90,7 @@ impl StoreLock {
 
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(source) if lock_is_contended(&source) => {
                 let diagnostics = read_owner(&mut file);
                 return Err(crate::StoreError::StoreLocked { owner: diagnostics });
             }
@@ -187,6 +187,11 @@ impl StoreLock {
     }
 }
 
+fn lock_is_contended(source: &std::io::Error) -> bool {
+    source.kind() == std::io::ErrorKind::WouldBlock
+        || source.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 #[cfg(unix)]
 fn owner_diagnostics(root: &StoreDirectory) -> Option<LockOwnerDiagnostics> {
     let mut file = root
@@ -205,4 +210,18 @@ fn read_owner(file: &mut File) -> Option<LockOwnerDiagnostics> {
     file.read_to_end(&mut bytes).ok()?;
     let owner: LockOwner = serde_json::from_slice(&bytes).ok()?;
     LockOwner::new(owner.instance_id, owner.process_id, owner.started_at).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_is_contended;
+
+    #[test]
+    fn only_platform_lock_contention_is_classified_as_store_contention() {
+        assert!(lock_is_contended(&fs2::lock_contended_error()));
+        assert!(!lock_is_contended(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ordinary I/O failure",
+        )));
+    }
 }
