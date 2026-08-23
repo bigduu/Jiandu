@@ -2,9 +2,11 @@
 
 Jiandu will be delivered as small vertical milestones. Each implementation issue must preserve the architecture invariants in [AGENTS.md](../AGENTS.md), include focused tests, and avoid introducing Bamboo-specific types into the core.
 
-Issue links will be added after the initial architecture commit establishes stable document URLs.
+The complete dependency graph and project-level acceptance criteria are tracked in [Jiandu #1](https://github.com/bigduu/Jiandu/issues/1).
 
 ## Milestone 0: Contract foundation
+
+Tracking issue: [#2 — agent-neutral memory contracts and conformance fixtures](https://github.com/bigduu/Jiandu/issues/2)
 
 - Define agent-neutral Rust domain types for records, scopes, provenance, revisions, queries, mutations, and errors.
 - Publish JSON Schemas and canonical serialization fixtures from the same definitions.
@@ -14,6 +16,12 @@ Issue links will be added after the initial architecture commit establishes stab
 Outcome: downstream work compiles against a small contract with no persistence or MCP dependency.
 
 ## Milestone 1: Canonical filesystem store
+
+Tracking issues:
+
+- [#3 — canonical filesystem initialization and validated reads](https://github.com/bigduu/Jiandu/issues/3)
+- [#4 — singleton atomic CAS mutations and crash recovery](https://github.com/bigduu/Jiandu/issues/4)
+- [#5 — idempotency, audit, tombstones, and portable import/export](https://github.com/bigduu/Jiandu/issues/5)
 
 - Implement data-directory initialization and exclusive ownership.
 - Add canonical record serialization, validation, and scope-safe paths.
@@ -25,6 +33,8 @@ Outcome: one local process can safely own durable memory without a model or MCP 
 
 ## Milestone 2: Derived retrieval
 
+Tracking issue: [#6 — deterministic lexical retrieval and rebuild tooling](https://github.com/bigduu/Jiandu/issues/6)
+
 - Build a deterministic lexical index from canonical records.
 - Implement structured filters, stable ranking, and cursor pagination.
 - Track store watermarks and rebuild after corruption or version changes.
@@ -33,6 +43,13 @@ Outcome: one local process can safely own durable memory without a model or MCP 
 Outcome: search is useful and rebuildable without making derived data authoritative.
 
 ## Milestone 3: Standalone MCP service
+
+Tracking issues:
+
+- [#7 — structured MCP read operations and resources](https://github.com/bigduu/Jiandu/issues/7)
+- [#8 — authorized MCP mutation operations](https://github.com/bigduu/Jiandu/issues/8)
+- [#9 — singleton Streamable HTTP daemon and local authentication](https://github.com/bigduu/Jiandu/issues/9)
+- [#10 — two-client conformance and degradation coverage](https://github.com/bigduu/Jiandu/issues/10)
 
 - Expose structured read tools and resources.
 - Add mutation tools with independent capability grants.
@@ -44,6 +61,11 @@ Outcome: at least two independent MCP clients can use the same Jiandu service sa
 
 ## Milestone 4: Lineage and interoperability
 
+Tracking issues:
+
+- [#11 — Session snapshots and copy-on-write branch semantics](https://github.com/bigduu/Jiandu/issues/11)
+- [#12 — committed turn and branch lifecycle event ingestion](https://github.com/bigduu/Jiandu/issues/12)
+
 - Define idempotent committed-turn and branch event contracts.
 - Implement Session snapshot, copy-through-message watermarks, and copy-on-write memory semantics.
 - Add a two-client conformance harness and transport failure tests.
@@ -52,6 +74,11 @@ Outcome: at least two independent MCP clients can use the same Jiandu service sa
 Outcome: Session branches are portable, deterministic, and independent from one host's database schema.
 
 ## Milestone 5: Bamboo migration
+
+Tracking issues:
+
+- [#13 — import and validate existing Bamboo filesystem memory](https://github.com/bigduu/Jiandu/issues/13)
+- [Bamboo #940 — integrate Jiandu and retire direct filesystem ownership](https://github.com/bigduu/Bamboo-agent/issues/940)
 
 - Import and validate current Bamboo filesystem memory.
 - Run shadow reads and measure parity.
