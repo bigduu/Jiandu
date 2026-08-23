@@ -211,6 +211,22 @@ fn initialization_is_deterministic_and_lock_diagnostics_are_secret_safe() {
         );
     }
 
+    #[cfg(windows)]
+    {
+        let lock_path = directory.path().join("LOCK");
+        let replaced_lock = directory.path().join("LOCK.replaced");
+        assert!(fs::rename(&lock_path, &replaced_lock).is_err());
+        assert!(fs::remove_file(&lock_path).is_err());
+        assert!(lock_path.is_file());
+        assert!(!replaced_lock.exists());
+
+        let replaced_root = directory.path().with_extension("replaced");
+        assert!(!replaced_root.exists());
+        assert!(fs::rename(directory.path(), &replaced_root).is_err());
+        assert!(directory.path().is_dir());
+        assert!(!replaced_root.exists());
+    }
+
     let error =
         CanonicalStore::open(directory.path(), owner()).expect_err("lock must be exclusive");
     match error {

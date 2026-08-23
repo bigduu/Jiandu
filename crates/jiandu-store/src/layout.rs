@@ -594,6 +594,7 @@ pub(crate) fn record_path(
 
 fn absolute_data_path(path: &Path) -> Result<PathBuf, StoreError> {
     if path.as_os_str().is_empty()
+        || has_dot_path_segment(path)
         || path
             .components()
             .any(|component| is_dot_component(&component))
@@ -759,7 +760,7 @@ fn open_regular_at(
     write: bool,
     create: bool,
     create_new: bool,
-    deny_delete: bool,
+    exclusive_writer: bool,
 ) -> Result<File, StoreError> {
     validate_normal_name(name)?;
     let mut options = OpenOptions::new();
@@ -775,13 +776,15 @@ fn open_regular_at(
         options.mode(0o600).custom_flags(libc::O_NONBLOCK);
     }
     #[cfg(windows)]
-    if deny_delete {
+    if exclusive_writer {
         use cap_std::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        // Deny writer/delete sharing while permitting a read-only handle to
+        // inspect the current owner's path-free diagnostics.
+        options.share_mode(FILE_SHARE_READ);
     }
     #[cfg(not(windows))]
-    let _ = deny_delete;
+    let _ = exclusive_writer;
     let file = directory.open_with(name, &options).map_err(|source| {
         secure_open_error(
             directory,
@@ -835,6 +838,7 @@ fn split_relative_file(relative: &Path) -> Result<(PathBuf, OsString), StoreErro
 fn validate_relative_path(relative: &Path) -> Result<(), StoreError> {
     if relative.is_absolute()
         || relative.as_os_str().is_empty()
+        || has_dot_path_segment(relative)
         || relative
             .components()
             .any(|component| {
@@ -851,6 +855,7 @@ fn validate_normal_name(name: &OsStr) -> Result<(), StoreError> {
     if path.as_os_str().is_empty()
         || name == OsStr::new(".")
         || name == OsStr::new("..")
+        || has_dot_path_segment(path)
         || path.is_absolute()
         || path.components().count() != 1
         || !matches!(path.components().next(), Some(Component::Normal(_)))
@@ -864,6 +869,32 @@ fn is_dot_component(component: &Component<'_>) -> bool {
     matches!(component, Component::CurDir | Component::ParentDir)
         || component.as_os_str() == OsStr::new(".")
         || component.as_os_str() == OsStr::new("..")
+}
+
+#[cfg(unix)]
+fn has_dot_path_segment(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    path.as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|segment| matches!(segment, b"." | b".."))
+}
+
+#[cfg(windows)]
+fn has_dot_path_segment(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    encoded
+        .split(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+        .any(|segment| matches!(segment, [46] | [46, 46]))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_dot_path_segment(path: &Path) -> bool {
+    path.components()
+        .any(|component| is_dot_component(&component))
 }
 
 fn set_private_file_permissions(file: &File) -> Result<(), StoreError> {

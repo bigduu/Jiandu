@@ -10,7 +10,9 @@ One process exclusively owns a data directory through the single persistent
 `LOCK` inode plus the opened root-directory handle. On Unix, an advisory lock
 on that directory inode keeps a replaced `LOCK` name from creating a second
 cooperative owner in the same directory. On Windows, root and `LOCK` handles
-deny delete sharing, so those names cannot be replaced while owned. `LOCK`
+deny delete sharing, and the owning `LOCK` writer also denies write sharing
+while permitting read-only diagnostics handles. Those names therefore cannot
+be replaced and a second writer cannot open the lock while owned. `LOCK`
 contains only a canonical instance UUID, process ID, and start timestamp for
 secret-safe diagnostics. It must be a no-follow opened regular file with
 exactly one hard link. Releasing a store drops the held handles and advisory

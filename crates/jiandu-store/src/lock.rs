@@ -57,8 +57,8 @@ pub type LockOwnerDiagnostics = LockOwner;
 
 #[derive(Debug)]
 pub(crate) struct StoreLock {
-    // A directory-inode lock keeps a replacement `LOCK` filename from
-    // creating a second cooperative owner in the same fixed root.
+    // Unix locks the directory inode. Windows holds a directory handle without
+    // delete sharing. Both keep ownership bound to the same fixed root.
     _root_file: File,
     file: File,
     identity: FileIdentity,
@@ -78,16 +78,29 @@ impl StoreLock {
             Err(source) => return Err(crate::StoreError::io("acquire store root lock", source)),
         }
 
-        let mut file = if create {
-            root.open_or_create_lock()?
+        let opened = if create {
+            root.open_or_create_lock()
         } else {
             root.open_existing_lock().map_err(|error| match error {
                 crate::StoreError::NotFound => crate::StoreError::InvalidLayout,
                 other => other,
-            })?
+            })
         };
+        let file = match opened {
+            Ok(file) => file,
+            #[cfg(windows)]
+            Err(error) if lock_writer_is_contended(&error) => {
+                return Err(crate::StoreError::StoreLocked {
+                    owner: owner_diagnostics(root),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(not(windows))]
+        let mut file = file;
         let identity = FileIdentity::from_file(&file)?;
 
+        #[cfg(not(windows))]
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => {}
             Err(source) if lock_is_contended(&source) => {
@@ -187,12 +200,23 @@ impl StoreLock {
     }
 }
 
+#[cfg(not(windows))]
 fn lock_is_contended(source: &std::io::Error) -> bool {
     source.kind() == std::io::ErrorKind::WouldBlock
         || source.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn lock_writer_is_contended(error: &crate::StoreError) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+    matches!(
+        error,
+        crate::StoreError::Io { source, .. }
+            if source.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+    )
+}
+
 fn owner_diagnostics(root: &StoreDirectory) -> Option<LockOwnerDiagnostics> {
     let mut file = root
         .open_existing_regular(Path::new(STORE_LOCK_FILE), false)
@@ -212,7 +236,7 @@ fn read_owner(file: &mut File) -> Option<LockOwnerDiagnostics> {
     LockOwner::new(owner.instance_id, owner.process_id, owner.started_at).ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::lock_is_contended;
 
@@ -223,5 +247,27 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "ordinary I/O failure",
         )));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::lock_writer_is_contended;
+
+    #[test]
+    fn only_writer_sharing_violations_are_classified_as_store_contention() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+        let sharing = crate::StoreError::io(
+            "test lock open",
+            std::io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION as i32),
+        );
+        assert!(lock_writer_is_contended(&sharing));
+
+        let denied = crate::StoreError::io(
+            "test lock open",
+            std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32),
+        );
+        assert!(!lock_writer_is_contended(&denied));
     }
 }
