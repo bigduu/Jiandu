@@ -36,13 +36,13 @@ relations: []
 Workspace paths are mutable metadata. Project identity is an opaque ID resolved by the host.
 ```
 
-The serialized representation is deterministic: normalized line endings, stable field order, UTC timestamps, and a final newline. This allows validation, reviewable exports, and stable content hashing.
+The serialized representation is deterministic: LF-only line endings, stable field order, UTC timestamps, and a required file-terminator LF. Parsing removes exactly that one terminator; it never trims the API body. Thus an API body that ends in LF produces a file ending in two LFs and round-trips with its body LF intact. Markdown horizontal-rule lines such as `---` remain ordinary body content after the first frontmatter terminator. BOMs, CRLF, missing terminators, unknown frontmatter fields, and semantically valid but non-canonical YAML encodings are rejected. This allows validation, reviewable exports, and stable content hashing without silently rewriting user content.
 
 ## Identity and revisions
 
 - `id` is globally unique and opaque. It does not encode a path, principal, timestamp, or scope.
 - `revision` is a positive, monotonically increasing integer per record.
-- An ETag is derived from record ID, revision, and canonical content hash.
+- An ETag is `sha256:<lowercase-hex>` over the complete canonical file bytes. Because those bytes include record ID and revision, either changes the ETag. `etag` is never accepted as a frontmatter field.
 - Renaming a title, moving a workspace, or changing display metadata never changes the ID.
 - A scope move is not an ordinary patch because it changes authorization. It requires a dedicated operation and audit record.
 
@@ -157,12 +157,12 @@ This gives the user-visible behavior of “deep copy through this message” wit
 ├── store.json                     # store UUID and format version
 ├── LOCK                           # exclusive-writer lock metadata
 ├── records/
-│   ├── principal/<shard>/<id>.md
-│   ├── project/<shard>/<id>.md
-│   ├── session/<shard>/<id>.md
-│   └── instance_global/<shard>/<id>.md
-├── lineages/<target-session-id>.json
-├── tombstones/<shard>/<id>.json
+│   ├── principal/<principal-key>/<shard>/<memory-key>.md
+│   ├── project/<project-key>/<shard>/<memory-key>.md
+│   ├── session/<session-key>/<shard>/<memory-key>.md
+│   └── instance_global/<shard>/<memory-key>.md
+├── lineages/<target-session-key>.json
+├── tombstones/<shard>/<memory-key>.json
 ├── transactions/<transaction-id>.json
 ├── receipts/<principal-shard>/<key-hash>.json
 ├── audit/<date>/<sequence>.jsonl
@@ -171,7 +171,9 @@ This gives the user-visible behavior of “deep copy through this message” wit
 └── backups/
 ```
 
-Sharding uses a stable prefix of the opaque ID only to bound directory size. Clients never observe these paths. `store.json`, record frontmatter, transaction manifests, and tombstones carry explicit format versions.
+The authoritative owner segment is part of the private layout for Principal, Project, and Session records. Every `<owner-key>` and `<memory-key>` is a domain-separated lowercase SHA-256 storage key of its opaque ID. This keeps distinct case-sensitive IDs separate on case-insensitive filesystems and bounds component length; the original IDs remain authoritative in validated frontmatter. The owner segment lets an authorized list traverse only granted owners instead of parsing other tenants' records. It is never inferred from a workspace path.
+
+Sharding uses the first two characters of the memory storage key only to bound directory size. Clients never observe these paths. Exact reads receive typed memory IDs plus host-authorized scopes, recompute the private key, and still validate the original ID/scope in frontmatter. Absent and inaccessible IDs share the same public not-found result. `store.json`, record frontmatter, transaction manifests, and tombstones carry explicit format versions.
 
 ## Atomic mutation protocol
 
@@ -194,7 +196,7 @@ Startup recovery examines transaction state and either completes an unambiguous 
 
 Human readability is not a promise that arbitrary editor writes are safe. The supported paths are MCP and the administrative CLI.
 
-A later opt-in watcher may import external edits by parsing the full record, preserving ID, requiring a matching revision/ETag marker, and applying the same mutation protocol. Invalid or conflicting files move to `quarantine` with diagnostics; Jiandu never silently overwrites the authoritative version.
+A later opt-in watcher may import external edits by parsing the full record, preserving ID, requiring a matching revision/ETag marker, and applying the same mutation protocol. Invalid or conflicting imported files may move to `quarantine` through an explicit operator action with diagnostics; Jiandu never silently overwrites the authoritative version. Ordinary exact/list reads are side-effect free: they report invalid canonical data but never rewrite or quarantine it.
 
 ## Forget, purge, and retention
 

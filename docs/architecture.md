@@ -168,7 +168,7 @@ Shutdown stops accepting new mutations, drains bounded in-flight work, flushes d
 | Store lock held | Startup fails with the owning-instance metadata. | Connect to the existing daemon; do not start another writer. |
 | Revision conflict | Mutation fails with the current revision metadata. | Re-read, reconcile, and retry with a new idempotency key. |
 | Index missing/corrupt | Mark index degraded and rebuild from canonical records. | Basic exact reads remain available; search capability reports degradation. |
-| Record invalid | Isolate it in quarantine and expose validation diagnostics. | Do not inject the invalid record. |
+| Record invalid | Fail the read with path-free validation diagnostics; move it only through an explicit operator quarantine action. | Do not inject the invalid record; ask an operator to validate/quarantine it. |
 | Client disconnects | Complete or roll back according to the transaction boundary. | Retry safely with the same idempotency key. |
 
 ## Observability

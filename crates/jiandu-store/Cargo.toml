@@ -1,0 +1,24 @@
+[package]
+name = "jiandu-store"
+description = "Exclusive canonical filesystem store and validated reads for Jiandu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs2 = "0.4.3"
+jiandu-core = { path = "../jiandu-core" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
