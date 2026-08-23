@@ -112,7 +112,8 @@
           "items": {
             "$ref": "#/$defs/Tag"
           },
-          "maxItems": 32
+          "maxItems": 32,
+          "uniqueItems": true
         },
         "createdAt": {
           "$ref": "#/$defs/Timestamp"
@@ -128,7 +129,8 @@
           "items": {
             "$ref": "#/$defs/MemoryRelation"
           },
-          "maxItems": 128
+          "maxItems": 128,
+          "uniqueItems": true
         }
       },
       "required": [
@@ -341,7 +343,8 @@
           "items": {
             "$ref": "#/$defs/MessageId"
           },
-          "maxItems": 128
+          "maxItems": 128,
+          "uniqueItems": true
         },
         "messageRange": {
           "anyOf": [

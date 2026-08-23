@@ -73,9 +73,11 @@ impl DomainErrorCode {
 #[serde(rename_all = "camelCase")]
 pub struct DomainError {
     pub code: DomainErrorCode,
+    #[schemars(length(min = 1, max = 1000))]
     pub message: String,
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(length(max = 32))]
     pub details: BTreeMap<String, Value>,
 }
 

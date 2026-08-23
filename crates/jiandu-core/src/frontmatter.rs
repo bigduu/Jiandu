@@ -147,7 +147,7 @@ pub struct FrontmatterProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_id: Option<BranchId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub message_ids: Vec<MessageId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_range: Option<FrontmatterMessageRange>,
@@ -211,12 +211,12 @@ pub struct MemoryFrontmatterV1Alpha1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 1000))]
     pub summary: Option<String>,
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub tags: Vec<Tag>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub provenance: FrontmatterProvenance,
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub relations: Vec<FrontmatterRelation>,
 }
 

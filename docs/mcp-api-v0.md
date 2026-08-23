@@ -66,7 +66,10 @@ Supported scope kinds in `v1alpha1`:
 }
 ```
 
-The `score` field is present only in ranked query results and is meaningful only within that response.
+The `summary` field is optional and reflects canonical record metadata; the
+contract layer does not synthesize a body excerpt when it is absent. The
+`score` field is required in every ranked query hit and is forbidden in
+deterministic list summaries.
 
 ### Result envelope
 
@@ -291,8 +294,10 @@ Markdown after the closing delimiter.
 - New optional response fields may be added within `v1alpha1`.
 - Input objects, scope variants, provenance objects, patches, and canonical
   frontmatter reject unknown fields. Clients must not send speculative fields.
-- Response records, summaries, result envelopes, diagnostics, and error payloads
-  may ignore newly added optional fields, but their nested closed types remain strict.
+- Response records, result envelopes, diagnostics, and error payloads may ignore
+  newly added optional fields, but their nested closed types remain strict.
+  Ranked and unranked summary projections are closed so the ranking-only `score`
+  field cannot cross the search/list boundary.
 - Existing fields cannot change meaning without an API-version change.
 - All current enums are closed: API/schema version, scope kind, memory type,
   lifecycle status, relation kind, creation actor, extraction method, list sort,

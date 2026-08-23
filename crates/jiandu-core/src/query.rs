@@ -1,7 +1,7 @@
 //! Deterministic search, list, filter, and pagination contracts.
 
 use crate::ids::{MemoryId, PageCursor, Timestamp};
-use crate::memory::{MemoryStatus, MemorySummary, MemoryType, Tag};
+use crate::memory::{MemoryStatus, MemorySummary, MemoryType, RankedMemorySummary, Tag};
 use crate::scope::ScopeSelector;
 use crate::validation::{
     MAX_FILTER_VALUES, MAX_PAGE_LIMIT, MAX_QUERY_CHARS, MAX_SCOPES, Validate, ValidationCode,
@@ -69,16 +69,16 @@ pub enum ListSort {
 pub struct MemorySearchRequest {
     #[schemars(length(min = 1, max = 4096))]
     pub query: String,
-    #[schemars(length(min = 1, max = 16))]
+    #[schemars(length(min = 1, max = 16), extend("uniqueItems" = true))]
     pub scopes: Vec<ScopeSelector>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub types: Vec<MemoryType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub statuses: Vec<MemoryStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub tags: Vec<Tag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_after: Option<Timestamp>,
@@ -106,16 +106,16 @@ impl Validate for MemorySearchRequest {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryListRequest {
-    #[schemars(length(min = 1, max = 16))]
+    #[schemars(length(min = 1, max = 16), extend("uniqueItems" = true))]
     pub scopes: Vec<ScopeSelector>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub types: Vec<MemoryType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub statuses: Vec<MemoryStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub tags: Vec<Tag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_after: Option<Timestamp>,
@@ -149,15 +149,27 @@ pub struct SearchDiagnostics {
     pub warnings: Vec<String>,
 }
 
-/// Ranked result ordered by score descending, then memory ID ascending.
+/// Ranked query result ordered by score descending, then memory ID ascending.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemorySearchResult {
-    pub memories: Vec<MemorySummary>,
+    pub memories: Vec<RankedMemorySummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<PageCursor>,
     pub has_more: bool,
     pub diagnostics: SearchDiagnostics,
+}
+
+impl Validate for MemorySearchResult {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = ValidationErrors::new();
+        for (index, memory) in self.memories.iter().enumerate() {
+            if let Err(memory_errors) = memory.validate() {
+                errors.extend(memory_errors, &format!("memories[{index}]"));
+            }
+        }
+        errors.finish()
+    }
 }
 
 /// Deterministically sorted list result.
@@ -168,6 +180,18 @@ pub struct MemoryListResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<PageCursor>,
     pub has_more: bool,
+}
+
+impl Validate for MemoryListResult {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = ValidationErrors::new();
+        for (index, memory) in self.memories.iter().enumerate() {
+            if let Err(memory_errors) = memory.validate() {
+                errors.extend(memory_errors, &format!("memories[{index}]"));
+            }
+        }
+        errors.finish()
+    }
 }
 
 fn validate_query(query: &str, errors: &mut ValidationErrors) {

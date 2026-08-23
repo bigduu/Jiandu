@@ -34,7 +34,8 @@
       "items": {
         "$ref": "#/$defs/Tag"
       },
-      "maxItems": 32
+      "maxItems": 32,
+      "uniqueItems": true
     },
     "provenance": {
       "$ref": "#/$defs/ProvenanceInput"
@@ -44,7 +45,8 @@
       "items": {
         "$ref": "#/$defs/MemoryRelation"
       },
-      "maxItems": 128
+      "maxItems": 128,
+      "uniqueItems": true
     },
     "idempotencyKey": {
       "$ref": "#/$defs/IdempotencyKey"
@@ -195,7 +197,8 @@
           "items": {
             "$ref": "#/$defs/MessageId"
           },
-          "maxItems": 128
+          "maxItems": 128,
+          "uniqueItems": true
         },
         "messageRange": {
           "anyOf": [

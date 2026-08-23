@@ -359,7 +359,7 @@ pub struct Provenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_id: Option<BranchId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub message_ids: Vec<MessageId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_range: Option<CommittedMessageRange>,
@@ -442,12 +442,12 @@ pub struct MemoryRecord {
         extend("x-jiandu-maxUtf8Bytes" = MAX_BODY_BYTES)
     )]
     pub body: String,
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub tags: Vec<Tag>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub provenance: Provenance,
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub relations: Vec<MemoryRelation>,
 }
 
@@ -475,9 +475,12 @@ impl Validate for MemoryRecord {
     }
 }
 
-/// Compact record projection used by search and list responses.
+/// Compact, unranked record projection used by deterministic list responses.
+///
+/// This projection is closed so ranking-only fields cannot leak into list
+/// output. The complete [`MemoryRecord`] remains response-extensible.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemorySummary {
     pub id: MemoryId,
     pub revision: Revision,
@@ -486,22 +489,102 @@ pub struct MemorySummary {
     #[serde(rename = "type")]
     pub memory_type: MemoryType,
     pub status: MemoryStatus,
+    #[schemars(length(min = 1, max = 200))]
     pub title: String,
-    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 1000))]
+    pub summary: Option<String>,
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub tags: Vec<Tag>,
     pub updated_at: Timestamp,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub score: Option<SearchScore>,
 }
 
 impl Validate for MemorySummary {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        let mut errors = ValidationErrors::new();
-        validate_required_text(&mut errors, "title", &self.title, MAX_TITLE_CHARS);
-        validate_required_text(&mut errors, "summary", &self.summary, MAX_SUMMARY_CHARS);
-        validate_tags(&self.tags, &mut errors, "tags");
-        errors.finish()
+        validate_summary_fields(&self.title, self.summary.as_deref(), &self.tags)
     }
+}
+
+/// Compact record projection with a required ranked-search score.
+///
+/// This is deliberately distinct from [`MemorySummary`] so search hits cannot
+/// omit their score and deterministic list results cannot carry one.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RankedMemorySummary {
+    pub id: MemoryId,
+    pub revision: Revision,
+    pub etag: Etag,
+    pub scope: MemoryScope,
+    #[serde(rename = "type")]
+    pub memory_type: MemoryType,
+    pub status: MemoryStatus,
+    #[schemars(length(min = 1, max = 200))]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 1000))]
+    pub summary: Option<String>,
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
+    pub tags: Vec<Tag>,
+    pub updated_at: Timestamp,
+    pub score: SearchScore,
+}
+
+impl RankedMemorySummary {
+    /// Attach a required ranking score to an unranked summary.
+    #[must_use]
+    pub fn from_summary(summary: MemorySummary, score: SearchScore) -> Self {
+        Self {
+            id: summary.id,
+            revision: summary.revision,
+            etag: summary.etag,
+            scope: summary.scope,
+            memory_type: summary.memory_type,
+            status: summary.status,
+            title: summary.title,
+            summary: summary.summary,
+            tags: summary.tags,
+            updated_at: summary.updated_at,
+            score,
+        }
+    }
+
+    /// Remove ranking metadata for deterministic list-style projection.
+    #[must_use]
+    pub fn into_summary(self) -> MemorySummary {
+        MemorySummary {
+            id: self.id,
+            revision: self.revision,
+            etag: self.etag,
+            scope: self.scope,
+            memory_type: self.memory_type,
+            status: self.status,
+            title: self.title,
+            summary: self.summary,
+            tags: self.tags,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+impl Validate for RankedMemorySummary {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        validate_summary_fields(&self.title, self.summary.as_deref(), &self.tags)
+    }
+}
+
+fn validate_summary_fields(
+    title: &str,
+    summary: Option<&str>,
+    tags: &[Tag],
+) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationErrors::new();
+    validate_required_text(&mut errors, "title", title, MAX_TITLE_CHARS);
+    if let Some(summary) = summary {
+        validate_required_text(&mut errors, "summary", summary, MAX_SUMMARY_CHARS);
+    }
+    validate_tags(tags, &mut errors, "tags");
+    errors.finish()
 }
 
 pub(crate) fn validate_tags(tags: &[Tag], errors: &mut ValidationErrors, field: &str) {

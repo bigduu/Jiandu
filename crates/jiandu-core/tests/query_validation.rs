@@ -1,4 +1,6 @@
-use jiandu_core::{MemoryListRequest, MemorySearchRequest, Validate};
+use jiandu_core::{
+    MemoryListRequest, MemoryListResult, MemorySearchRequest, MemorySearchResult, Validate,
+};
 use serde_json::json;
 
 #[test]
@@ -72,5 +74,107 @@ fn list_sort_values_are_closed_and_unknown_input_fields_fail() {
             "principalId": "prn_other"
         }))
         .is_err()
+    );
+}
+
+#[test]
+fn ranked_search_requires_score_while_list_summaries_do_not_expose_it() {
+    let summary = json!({
+        "id": "mem_01K3IDENTITY",
+        "revision": 7,
+        "etag": "record-7",
+        "scope": { "kind": "project", "projectId": "prj_01K3PROJECT" },
+        "type": "decision",
+        "status": "active",
+        "title": "Use opaque project identity",
+        "summary": "Workspace paths remain metadata, not identity.",
+        "tags": ["architecture", "identity"],
+        "updatedAt": "2026-08-23T10:05:00Z"
+    });
+
+    let list: MemoryListResult = serde_json::from_value(json!({
+        "memories": [summary.clone()],
+        "hasMore": false
+    }))
+    .unwrap_or_else(|error| panic!("list summary without score: {error}"));
+    list.validate()
+        .unwrap_or_else(|error| panic!("valid list result: {error}"));
+    let list_json =
+        serde_json::to_value(list).unwrap_or_else(|error| panic!("serialize list result: {error}"));
+    assert!(list_json["memories"][0].get("score").is_none());
+
+    let mut scored_list_summary = summary.clone();
+    scored_list_summary["score"] = json!(0.91);
+    assert!(
+        serde_json::from_value::<MemoryListResult>(json!({
+            "memories": [scored_list_summary],
+            "hasMore": false
+        }))
+        .is_err()
+    );
+
+    let mut summary_without_excerpt = summary.clone();
+    summary_without_excerpt
+        .as_object_mut()
+        .expect("summary is an object")
+        .remove("summary");
+    let no_excerpt: MemoryListResult = serde_json::from_value(json!({
+        "memories": [summary_without_excerpt],
+        "hasMore": false
+    }))
+    .unwrap_or_else(|error| panic!("canonical summary metadata is optional: {error}"));
+    no_excerpt
+        .validate()
+        .unwrap_or_else(|error| panic!("summary without synthesized excerpt: {error}"));
+
+    let unranked_search = json!({
+        "memories": [summary.clone()],
+        "hasMore": false,
+        "diagnostics": { "indexDegraded": false }
+    });
+    assert!(serde_json::from_value::<MemorySearchResult>(unranked_search).is_err());
+
+    let mut ranked = summary;
+    ranked["score"] = json!(0.91);
+    let search: MemorySearchResult = serde_json::from_value(json!({
+        "memories": [ranked],
+        "hasMore": false,
+        "diagnostics": { "indexDegraded": false }
+    }))
+    .unwrap_or_else(|error| panic!("ranked summary with score: {error}"));
+    search
+        .validate()
+        .unwrap_or_else(|error| panic!("valid ranked result: {error}"));
+    let search_json = serde_json::to_value(search)
+        .unwrap_or_else(|error| panic!("serialize search result: {error}"));
+    assert_eq!(search_json["memories"][0]["score"], 0.91);
+}
+
+#[test]
+fn result_validation_recurses_into_each_summary() {
+    let invalid: MemoryListResult = serde_json::from_value(json!({
+        "memories": [{
+            "id": "mem_01K3IDENTITY",
+            "revision": 7,
+            "etag": "record-7",
+            "scope": { "kind": "project", "projectId": "prj_01K3PROJECT" },
+            "type": "decision",
+            "status": "active",
+            "title": " ",
+            "tags": ["identity", "identity"],
+            "updatedAt": "2026-08-23T10:05:00Z"
+        }],
+        "hasMore": false
+    }))
+    .unwrap_or_else(|error| panic!("structurally decodable list result: {error}"));
+
+    let errors = invalid
+        .validate()
+        .expect_err("nested summary invariants must be validated");
+    assert!(
+        errors
+            .as_slice()
+            .iter()
+            .all(|issue| issue.field.starts_with("memories[0]."))
     );
 }

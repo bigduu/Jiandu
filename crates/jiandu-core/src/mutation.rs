@@ -31,7 +31,7 @@ pub struct ProvenanceInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_id: Option<BranchId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub message_ids: Vec<MessageId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_range: Option<CommittedMessageRange>,
@@ -88,11 +88,11 @@ pub struct RememberMemoryCommand {
     )]
     pub body: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub tags: Vec<Tag>,
     pub provenance: ProvenanceInput,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub relations: Vec<MemoryRelation>,
     pub idempotency_key: IdempotencyKey,
 }
@@ -119,10 +119,10 @@ impl Validate for RememberMemoryCommand {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TagPatch {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub add: Vec<Tag>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 32))]
+    #[schemars(length(max = 32), extend("uniqueItems" = true))]
     pub remove: Vec<Tag>,
 }
 
@@ -155,10 +155,10 @@ impl Validate for TagPatch {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RelationPatch {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub add: Vec<MemoryRelation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 128))]
+    #[schemars(length(max = 128), extend("uniqueItems" = true))]
     pub remove: Vec<MemoryRelation>,
 }
 

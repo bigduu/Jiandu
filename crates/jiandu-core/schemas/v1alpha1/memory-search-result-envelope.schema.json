@@ -44,13 +44,13 @@
       "minimum": 0
     },
     "MemorySearchResult": {
-      "description": "Ranked result ordered by score descending, then memory ID ascending.",
+      "description": "Ranked query result ordered by score descending, then memory ID ascending.",
       "type": "object",
       "properties": {
         "memories": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/MemorySummary"
+            "$ref": "#/$defs/RankedMemorySummary"
           }
         },
         "nextCursor": {
@@ -76,8 +76,8 @@
         "diagnostics"
       ]
     },
-    "MemorySummary": {
-      "description": "Compact record projection used by search and list responses.",
+    "RankedMemorySummary": {
+      "description": "Compact record projection with a required ranked-search score.\n\nThis is deliberately distinct from [`MemorySummary`] so search hits cannot\nomit their score and deterministic list results cannot carry one.",
       "type": "object",
       "properties": {
         "id": {
@@ -99,31 +99,34 @@
           "$ref": "#/$defs/MemoryStatus"
         },
         "title": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
         },
         "summary": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 1000
         },
         "tags": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/Tag"
-          }
+          },
+          "maxItems": 32,
+          "uniqueItems": true
         },
         "updatedAt": {
           "$ref": "#/$defs/Timestamp"
         },
         "score": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SearchScore"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/SearchScore"
         }
       },
+      "additionalProperties": false,
       "required": [
         "id",
         "revision",
@@ -132,9 +135,9 @@
         "type",
         "status",
         "title",
-        "summary",
         "tags",
-        "updatedAt"
+        "updatedAt",
+        "score"
       ]
     },
     "MemoryId": {

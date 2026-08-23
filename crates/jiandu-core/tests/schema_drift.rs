@@ -22,6 +22,16 @@ fn schema_accepts(schema: &Value, instance: &Value) -> bool {
         .is_valid(instance)
 }
 
+fn assert_unique_items(schema: &Value, pointers: &[&str]) {
+    for pointer in pointers {
+        assert_eq!(
+            schema.pointer(pointer),
+            Some(&Value::Bool(true)),
+            "{pointer} must declare uniqueItems"
+        );
+    }
+}
+
 #[test]
 fn checked_in_schemas_match_rust_definitions_exactly() {
     let generated = generated_contract_schemas();
@@ -149,5 +159,145 @@ fn scalar_schema_constraints_match_runtime_canonicalization() {
     assert_eq!(
         schema["properties"]["body"]["x-jiandu-maxUtf8Bytes"],
         65_536
+    );
+}
+
+#[test]
+fn ranked_and_unranked_summary_schemas_encode_score_and_text_bounds() {
+    let schemas = generated_contract_schemas();
+    let search = &schemas["memory-search-result-envelope.schema.json"];
+    let ranked = &search["$defs"]["RankedMemorySummary"];
+    assert_eq!(ranked["properties"]["score"]["$ref"], "#/$defs/SearchScore");
+    assert!(
+        ranked["required"]
+            .as_array()
+            .is_some_and(|fields| fields.iter().any(|field| field == "score"))
+    );
+    assert_eq!(ranked["additionalProperties"], false);
+    assert_eq!(ranked["properties"]["tags"]["uniqueItems"], true);
+
+    let list = &schemas["memory-list-result-envelope.schema.json"];
+    let summary = &list["$defs"]["MemorySummary"];
+    assert!(summary["properties"].get("score").is_none());
+    assert_eq!(summary["additionalProperties"], false);
+    assert_eq!(summary["properties"]["title"]["minLength"], 1);
+    assert_eq!(summary["properties"]["title"]["maxLength"], 200);
+    assert_eq!(summary["properties"]["summary"]["minLength"], 1);
+    assert_eq!(summary["properties"]["summary"]["maxLength"], 1_000);
+    assert_eq!(summary["properties"]["tags"]["maxItems"], 32);
+    assert_eq!(summary["properties"]["tags"]["uniqueItems"], true);
+
+    let summary_instance = serde_json::json!({
+        "id": "mem_01K3IDENTITY",
+        "revision": 7,
+        "etag": "record-7",
+        "scope": { "kind": "project", "projectId": "prj_01K3PROJECT" },
+        "type": "decision",
+        "status": "active",
+        "title": "Use opaque project identity",
+        "tags": ["architecture", "identity"],
+        "updatedAt": "2026-08-23T10:05:00Z"
+    });
+    let envelope = |memory: Value| {
+        serde_json::json!({
+            "apiVersion": "jiandu.dev/v1alpha1",
+            "correlationId": "req_01K3RESULT",
+            "storeRevision": 42,
+            "result": {
+                "memories": [memory],
+                "hasMore": false
+            }
+        })
+    };
+
+    assert!(schema_accepts(list, &envelope(summary_instance.clone())));
+
+    let mut scored_list = summary_instance.clone();
+    scored_list["score"] = serde_json::json!(0.91);
+    assert!(!schema_accepts(list, &envelope(scored_list)));
+
+    let mut duplicate_tags = summary_instance.clone();
+    duplicate_tags["tags"] = serde_json::json!(["identity", "identity"]);
+    assert!(!schema_accepts(list, &envelope(duplicate_tags)));
+
+    let mut empty_title = summary_instance.clone();
+    empty_title["title"] = serde_json::json!("");
+    assert!(!schema_accepts(list, &envelope(empty_title)));
+
+    let search_envelope = |memory: Value| {
+        serde_json::json!({
+            "apiVersion": "jiandu.dev/v1alpha1",
+            "correlationId": "req_01K3RESULT",
+            "storeRevision": 42,
+            "result": {
+                "memories": [memory],
+                "hasMore": false,
+                "diagnostics": { "indexDegraded": false }
+            }
+        })
+    };
+    assert!(!schema_accepts(
+        search,
+        &search_envelope(summary_instance.clone())
+    ));
+    let mut ranked_instance = summary_instance;
+    ranked_instance["score"] = serde_json::json!(0.91);
+    assert!(schema_accepts(search, &search_envelope(ranked_instance)));
+}
+
+#[test]
+fn generated_schemas_encode_all_collection_uniqueness_invariants() {
+    let schemas = generated_contract_schemas();
+
+    assert_unique_items(
+        &schemas["memory-record.schema.json"],
+        &[
+            "/properties/tags/uniqueItems",
+            "/properties/relations/uniqueItems",
+            "/$defs/Provenance/properties/messageIds/uniqueItems",
+        ],
+    );
+    assert_unique_items(
+        &schemas["memory-frontmatter.schema.json"],
+        &[
+            "/properties/tags/uniqueItems",
+            "/properties/relations/uniqueItems",
+            "/$defs/FrontmatterProvenance/properties/message_ids/uniqueItems",
+        ],
+    );
+    assert_unique_items(
+        &schemas["remember-memory-command.schema.json"],
+        &[
+            "/properties/tags/uniqueItems",
+            "/properties/relations/uniqueItems",
+            "/$defs/ProvenanceInput/properties/messageIds/uniqueItems",
+        ],
+    );
+    assert_unique_items(
+        &schemas["memory-search-request.schema.json"],
+        &[
+            "/properties/scopes/uniqueItems",
+            "/properties/types/uniqueItems",
+            "/properties/statuses/uniqueItems",
+            "/properties/tags/uniqueItems",
+        ],
+    );
+    assert_unique_items(
+        &schemas["memory-list-request.schema.json"],
+        &[
+            "/properties/scopes/uniqueItems",
+            "/properties/types/uniqueItems",
+            "/properties/statuses/uniqueItems",
+            "/properties/tags/uniqueItems",
+        ],
+    );
+    assert_unique_items(
+        &schemas["update-memory-command.schema.json"],
+        &[
+            "/$defs/TagPatch/properties/add/uniqueItems",
+            "/$defs/TagPatch/properties/remove/uniqueItems",
+            "/$defs/RelationPatch/properties/add/uniqueItems",
+            "/$defs/RelationPatch/properties/remove/uniqueItems",
+        ],
     );
 }

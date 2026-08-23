@@ -10,28 +10,32 @@
         "$ref": "#/$defs/ScopeSelector"
       },
       "minItems": 1,
-      "maxItems": 16
+      "maxItems": 16,
+      "uniqueItems": true
     },
     "types": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/MemoryType"
       },
-      "maxItems": 32
+      "maxItems": 32,
+      "uniqueItems": true
     },
     "statuses": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/MemoryStatus"
       },
-      "maxItems": 32
+      "maxItems": 32,
+      "uniqueItems": true
     },
     "tags": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/Tag"
       },
-      "maxItems": 32
+      "maxItems": 32,
+      "uniqueItems": true
     },
     "updatedAfter": {
       "anyOf": [
