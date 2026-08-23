@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture plus the initial agent-neutral `v1alpha1` Rust contracts. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and the first canonical-store slice (exclusive ownership plus validated reads). Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -64,23 +64,29 @@ MCP does not force a client to inject context. Jiandu returns memory records; th
 
 ## Rust layout
 
-The exact crate split will be introduced only when each boundary is needed. The intended dependency direction is:
+Crates are introduced only when their boundary is needed. The current dependency direction is:
 
 ```text
 crates/jiandu-core/                  agent-neutral domain types and contracts
   fixtures/v1alpha1/                 canonical valid and invalid conformance data
   schemas/v1alpha1/                  checked JSON Schemas generated from Rust types
   src/                               ordinary structs, enums, newtypes, and validation
+crates/jiandu-store/                 exclusive filesystem ownership and validated reads
+  fixtures/v1alpha1/                 canonical store-document conformance data
+  src/                               private paths, strict codec, lock, cursor, and read APIs
 ```
 
-Future store, index, MCP adapter, daemon, and CLI crates are introduced only when
-their boundary is needed. `jiandu-core` has no storage, transport, Bamboo,
-prompt, LLM, or filesystem-path identity dependency.
+Future index, MCP adapter, daemon, and CLI crates are introduced only when their
+boundary is needed. `jiandu-store` depends on `jiandu-core`; `jiandu-core` has
+no storage, transport, Bamboo, prompt, LLM, or filesystem-path identity
+dependency. The store's on-disk compatibility rules are documented in
+[Canonical store format v1alpha1](docs/store-format-v1alpha1.md).
 
 Run the contract gates from the repository root:
 
 ```shell
 cargo fmt --all -- --check
+cargo metadata --locked --no-deps --format-version 1
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
