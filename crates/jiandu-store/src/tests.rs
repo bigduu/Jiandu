@@ -2,12 +2,13 @@ use super::*;
 use crate::document::{decode_canonical_document, encode_canonical_document};
 use crate::layout;
 use jiandu_core::{
-    CreationActor, FrontmatterProvenance, FrontmatterScope, IdempotencyKey, ListSort,
-    MemoryFrontmatterV1Alpha1, MemoryId, MemoryListRequest, MemoryPatch, MemorySchema, MemoryScope,
-    MemoryStatus, MemoryType, PageCursor, PageLimit, PrincipalId, ProjectId, Provenance, Revision,
-    ScopeSelector, SessionId, StoreRevision, Tag, TagPatch, Timestamp, UpdateMemoryCommand,
+    ClientId, CreationActor, FrontmatterProvenance, FrontmatterScope, Grant, IdempotencyKey,
+    ListSort, MemoryFrontmatterV1Alpha1, MemoryId, MemoryListRequest, MemoryPatch, MemorySchema,
+    MemoryScope, MemoryStatus, MemoryType, PageCursor, PageLimit, PrincipalId, ProjectId,
+    ProvenanceInput, RememberMemoryCommand, Revision, ScopeSelector, SessionId, StoreRevision, Tag,
+    TagPatch, Timestamp, TrustedRequestContext, UpdateMemoryCommand,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,29 +113,64 @@ fn list_request(scopes: Vec<ScopeSelector>, limit: u16) -> MemoryListRequest {
     }
 }
 
-fn create_input(id: &str, body: &str) -> CreateMemoryInput {
-    CreateMemoryInput {
-        memory_id: memory_id(id),
+fn scope_selector(scope: &MemoryScope) -> ScopeSelector {
+    match scope {
+        MemoryScope::Principal { .. } => ScopeSelector::Principal {},
+        MemoryScope::Project { project_id } => ScopeSelector::Project {
+            project_id: project_id.clone(),
+        },
+        MemoryScope::Session { session_id } => ScopeSelector::Session {
+            session_id: session_id.clone(),
+        },
+        MemoryScope::InstanceGlobal {} => ScopeSelector::InstanceGlobal {},
+    }
+}
+
+fn remember_command(scope: &MemoryScope, id: &str, body: &str) -> RememberMemoryCommand {
+    RememberMemoryCommand {
+        scope: scope_selector(scope),
         memory_type: MemoryType::Decision,
         title: format!("Title for {id}"),
         summary: Some(format!("Summary for {id}")),
         body: body.to_owned(),
         tags: vec![Tag::new("architecture").expect("valid tag")],
-        provenance: Provenance {
-            created_by: CreationActor::Host,
-            agent_id: None,
-            session_id: None,
-            branch_id: None,
-            message_ids: Vec::new(),
-            message_range: None,
-            source_uri: None,
-            content_digest: None,
-            extraction: None,
-            confidence: None,
-        },
+        provenance: ProvenanceInput::default(),
         relations: Vec::new(),
-        created_at: timestamp("2026-08-24T02:00:00Z"),
+        idempotency_key: IdempotencyKey::new(format!("create-{id}"))
+            .expect("valid idempotency key"),
     }
+}
+
+fn authorized_mutation(
+    authority: &AuthorizedScopes,
+    scope: &MemoryScope,
+    operation: MutationOperation,
+) -> AuthorizedMutation {
+    let context = TrustedRequestContext {
+        principal_id: authority.principal_id.clone(),
+        client_id: ClientId::new("cli_store_tests").expect("valid client ID"),
+        grants: BTreeSet::from([
+            Grant::new(operation.required_grant(scope)).expect("valid mutation grant")
+        ]),
+    };
+    authority
+        .authorize_mutation(&context, scope, operation)
+        .expect("trusted context authorizes exact mutation")
+}
+
+fn create_memory(
+    store: &mut CanonicalStore,
+    authorization: &AuthorizedMutation,
+    id: &str,
+    body: &str,
+) -> Result<MutationCommit, StoreError> {
+    store.create(
+        authorization,
+        &remember_command(authorization.as_scope(), id, body),
+        memory_id(id),
+        CreationActor::Host,
+        timestamp("2026-08-24T02:00:00Z"),
+    )
 }
 
 fn update_command(id: &MemoryId, revision: u64, title: &str) -> UpdateMemoryCommand {
@@ -181,6 +217,82 @@ impl PersistenceFailpointInjector for FailOnce {
     }
 }
 
+const MUTATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::ManifestTempWritten,
+    PersistenceBoundary::ManifestTempSynced,
+    PersistenceBoundary::ManifestTempDirectorySynced,
+    PersistenceBoundary::ManifestPublished,
+    PersistenceBoundary::ManifestDirectorySynced,
+    PersistenceBoundary::RecordNamespacePrepared,
+    PersistenceBoundary::RecordTempWritten,
+    PersistenceBoundary::RecordTempSynced,
+    PersistenceBoundary::RecordTempDirectorySynced,
+    PersistenceBoundary::MetadataTempWritten,
+    PersistenceBoundary::MetadataTempSynced,
+    PersistenceBoundary::MetadataTempDirectorySynced,
+    PersistenceBoundary::IdempotencyNamespacePrepared,
+    PersistenceBoundary::MutationResultTempWritten,
+    PersistenceBoundary::MutationResultTempSynced,
+    PersistenceBoundary::MutationResultTempDirectorySynced,
+    PersistenceBoundary::MutationReceiptTempWritten,
+    PersistenceBoundary::MutationReceiptTempSynced,
+    PersistenceBoundary::MutationReceiptTempDirectorySynced,
+    PersistenceBoundary::MutationAuditTempWritten,
+    PersistenceBoundary::MutationAuditTempSynced,
+    PersistenceBoundary::MutationAuditTempDirectorySynced,
+    PersistenceBoundary::RecordRenamed,
+    PersistenceBoundary::RecordDirectorySynced,
+    PersistenceBoundary::MutationResultPublished,
+    PersistenceBoundary::MutationResultDirectorySynced,
+    PersistenceBoundary::MutationReceiptPublished,
+    PersistenceBoundary::MutationReceiptDirectorySynced,
+    PersistenceBoundary::MutationAuditPublished,
+    PersistenceBoundary::MutationAuditDirectorySynced,
+    PersistenceBoundary::MetadataRenamed,
+    PersistenceBoundary::MetadataDirectorySynced,
+    PersistenceBoundary::ManifestRemoved,
+    PersistenceBoundary::ManifestRemovalDirectorySynced,
+];
+
+const RECOVERY_IDEMPOTENCY_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::RecoveryIdempotencyNamespacePrepared,
+    PersistenceBoundary::RecoveryMutationResultDirectorySynced,
+    PersistenceBoundary::RecoveryMutationReceiptDirectorySynced,
+    PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
+];
+
+const MIGRATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::MigrationLayoutSynced,
+    PersistenceBoundary::MigrationGenesisTempWritten,
+    PersistenceBoundary::MigrationGenesisTempSynced,
+    PersistenceBoundary::MigrationGenesisTempDirectorySynced,
+    PersistenceBoundary::MigrationGenesisPublished,
+    PersistenceBoundary::MigrationGenesisDirectorySynced,
+    PersistenceBoundary::MigrationMetadataTempWritten,
+    PersistenceBoundary::MigrationMetadataTempSynced,
+    PersistenceBoundary::MigrationMetadataTempDirectorySynced,
+    PersistenceBoundary::MigrationMetadataPublished,
+    PersistenceBoundary::MigrationMetadataDirectorySynced,
+];
+
+fn mutation_target_was_published(boundary: PersistenceBoundary) -> bool {
+    matches!(
+        boundary,
+        PersistenceBoundary::RecordRenamed
+            | PersistenceBoundary::RecordDirectorySynced
+            | PersistenceBoundary::MutationResultPublished
+            | PersistenceBoundary::MutationResultDirectorySynced
+            | PersistenceBoundary::MutationReceiptPublished
+            | PersistenceBoundary::MutationReceiptDirectorySynced
+            | PersistenceBoundary::MutationAuditPublished
+            | PersistenceBoundary::MutationAuditDirectorySynced
+            | PersistenceBoundary::MetadataRenamed
+            | PersistenceBoundary::MetadataDirectorySynced
+            | PersistenceBoundary::ManifestRemoved
+            | PersistenceBoundary::ManifestRemovalDirectorySynced
+    )
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SnapshotEntry {
     bytes: Option<Vec<u8>>,
@@ -222,6 +334,72 @@ fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
     output
 }
 
+fn store_metadata(root: &Path) -> StoreMetadata {
+    serde_json::from_slice(&fs::read(root.join("store.json")).expect("read store metadata"))
+        .expect("decode store metadata")
+}
+
+fn make_legacy_store(root: &Path) -> StoreMetadata {
+    let store = CanonicalStore::initialize(root, owner()).expect("initialize migration fixture");
+    let mut metadata = store.metadata.clone();
+    drop(store);
+    metadata.format_version = crate::metadata::LEGACY_STORE_FORMAT_VERSION.to_owned();
+    metadata.audit_sequence = AuditSequence(0);
+    fs::remove_file(root.join(layout::AUDIT_GENESIS_FILE)).expect("remove v2 audit genesis");
+    fs::remove_dir_all(root.join("receipts/idempotency")).expect("remove v2 idempotency layout");
+    fs::remove_dir_all(root.join(layout::MUTATION_AUDIT_DIR))
+        .expect("remove v2 mutation audit layout");
+    fs::write(
+        root.join("store.json"),
+        metadata.canonical_bytes().expect("legacy metadata bytes"),
+    )
+    .expect("write legacy store metadata");
+    metadata
+}
+
+fn regular_files_below(root: &Path, relative: &str) -> Vec<PathBuf> {
+    tree_snapshot(&root.join(relative))
+        .into_iter()
+        .filter_map(|(path, entry)| entry.bytes.map(|_| Path::new(relative).join(path)))
+        .collect()
+}
+
+fn only_regular_file_below(root: &Path, relative: &str) -> PathBuf {
+    let files = regular_files_below(root, relative);
+    assert_eq!(files.len(), 1, "expected one file below {relative}");
+    root.join(&files[0])
+}
+
+fn committed_idempotency_fixture() -> TempDir {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_artifact_fixture"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_artifact_fixture"));
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &authorization,
+        "mem_artifact_fixture",
+        "private result body",
+    )
+    .expect("commit artifact fixture");
+    drop(store);
+    directory
+}
+
+fn assert_invalid_ledger_after(mutate: impl FnOnce(&Path)) {
+    let directory = committed_idempotency_fixture();
+    mutate(directory.path());
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("invalid private ledger fails before readiness")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+}
+
 #[test]
 fn initialization_is_deterministic_and_lock_diagnostics_are_secret_safe() {
     let directory = TempDir::new().expect("temporary directory");
@@ -252,7 +430,11 @@ fn initialization_is_deterministic_and_lock_diagnostics_are_secret_safe() {
         "transactions",
         "receipts",
         "receipts/quarantine",
+        "receipts/idempotency",
+        "receipts/idempotency/metadata",
+        "receipts/idempotency/results",
         "audit",
+        "audit/mutations",
         "index",
         "quarantine",
         "backups",
@@ -1727,9 +1909,8 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
     };
     let authority = AuthorizedScopes::new(principal_id("prn_mutation"))
         .with_project(project_id("prj_mutation"));
-    let authorized_scope = authority
-        .authorize_exact(&scope)
-        .expect("host authorizes exact project scope");
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
     assert!(
         authority
             .authorize_exact(&MemoryScope::Project {
@@ -1757,12 +1938,13 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
             .is_none()
     );
 
-    let created = store
-        .create(
-            &authorized_scope,
-            create_input("mem_mutation", "secret body"),
-        )
-        .expect("create memory");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_mutation",
+        "secret body",
+    )
+    .expect("create memory");
     assert_eq!(created.record.revision.get(), 1);
     assert_eq!(created.previous_revision, None);
     assert_eq!(created.store_revision, StoreRevision(1));
@@ -1776,15 +1958,15 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
         principal_id: principal_id("prn_other"),
     };
     let other_authority = AuthorizedScopes::new(principal_id("prn_other"));
-    let other_authorized_scope = other_authority
-        .authorize_exact(&other_scope)
-        .expect("host authorizes another exact principal scope");
-    let duplicate_error = store
-        .create(
-            &other_authorized_scope,
-            create_input("mem_mutation", "different tenant body"),
-        )
-        .expect_err("MemoryId is globally unique across canonical scopes");
+    let other_authorization =
+        authorized_mutation(&other_authority, &other_scope, MutationOperation::Create);
+    let duplicate_error = create_memory(
+        &mut store,
+        &other_authorization,
+        "mem_mutation",
+        "different tenant body",
+    )
+    .expect_err("MemoryId is globally unique across canonical scopes");
     assert_eq!(duplicate_error.code(), StoreErrorCode::AlreadyExists);
     let duplicate_diagnostic = duplicate_error.to_string();
     assert!(!duplicate_diagnostic.contains("secret body"));
@@ -1792,7 +1974,7 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
 
     let earlier = store
         .update(
-            &authorized_scope,
+            &update_authorization,
             &update_command(&created.record.id, 1, "too early"),
             timestamp("2026-08-24T01:59:59Z"),
         )
@@ -1805,7 +1987,7 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
 
     let updated = store
         .update(
-            &authorized_scope,
+            &update_authorization,
             &update_command(&created.record.id, 1, "Updated title"),
             timestamp("2026-08-24T02:01:00Z"),
         )
@@ -1817,7 +1999,7 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
 
     let stale = store
         .update(
-            &authorized_scope,
+            &update_authorization,
             &update_command(&created.record.id, 1, "stale overwrite"),
             timestamp("2026-08-24T02:02:00Z"),
         )
@@ -1856,6 +2038,557 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
     );
 }
 
+#[test]
+fn create_replays_exact_result_across_generated_values_and_restart_without_writes() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_create_replay"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_create_replay"))
+        .with_project(project_id("prj_create_replay"));
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let command = remember_command(&scope, "caller-input", "exact replay body");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let committed = store
+        .create(
+            &authorization,
+            &command,
+            memory_id("mem_create_replay_original"),
+            CreationActor::Host,
+            timestamp("2026-08-24T02:00:00Z"),
+        )
+        .expect("first create commits");
+    assert!(!committed.idempotent_replay);
+    assert_eq!(store.metadata.audit_sequence, AuditSequence(1));
+    assert_eq!(
+        regular_files_below(directory.path(), layout::IDEMPOTENCY_RECEIPTS_DIR).len(),
+        1
+    );
+    assert_eq!(
+        regular_files_below(directory.path(), layout::IDEMPOTENCY_RESULTS_DIR).len(),
+        1
+    );
+    assert_eq!(
+        regular_files_below(directory.path(), layout::MUTATION_AUDIT_DIR).len(),
+        1
+    );
+
+    let before_replay = tree_snapshot(directory.path());
+    let replay = store
+        .create(
+            &authorization,
+            &command,
+            memory_id("mem_generated_value_must_be_ignored"),
+            CreationActor::Import,
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect("identical retry replays");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.transaction_id, committed.transaction_id);
+    assert_eq!(replay.store_revision, committed.store_revision);
+    assert_eq!(replay.previous_revision, committed.previous_revision);
+    assert_eq!(replay.record, committed.record);
+    assert_eq!(tree_snapshot(directory.path()), before_replay);
+    drop(store);
+
+    let mut reopened = CanonicalStore::open(directory.path(), owner()).expect("reopen store");
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let before_restart_replay = tree_snapshot(directory.path());
+    let replay = reopened
+        .create(
+            &authorization,
+            &command,
+            memory_id("mem_another_generated_value"),
+            CreationActor::Model,
+            timestamp("2026-08-24T04:00:00Z"),
+        )
+        .expect("restart retry replays");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.record, committed.record);
+    assert_eq!(replay.store_revision, StoreRevision(1));
+    assert_eq!(reopened.metadata.audit_sequence, AuditSequence(1));
+    assert_eq!(tree_snapshot(directory.path()), before_restart_replay);
+}
+
+#[test]
+fn update_replay_precedes_cas_not_found_and_conflicting_reuse_is_write_free() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_update_replay"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_update_replay"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_update_replay",
+        "stable replay body",
+    )
+    .expect("create update target");
+    let command = update_command(&created.record.id, 1, "replayed update");
+    let committed = store
+        .update(
+            &update_authorization,
+            &command,
+            timestamp("2026-08-24T02:01:00Z"),
+        )
+        .expect("update commits");
+    assert!(!committed.idempotent_replay);
+    assert_eq!(store.metadata.audit_sequence, AuditSequence(2));
+
+    let before_replay = tree_snapshot(directory.path());
+    let replay = store
+        .update(
+            &update_authorization,
+            &command,
+            timestamp("2026-08-24T09:00:00Z"),
+        )
+        .expect("receipt lookup precedes now-stale CAS");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.record, committed.record);
+    assert_eq!(tree_snapshot(directory.path()), before_replay);
+
+    let mut conflicting = command.clone();
+    conflicting.patch.title = Some("different caller input".to_owned());
+    let diagnostic = store
+        .update(
+            &update_authorization,
+            &conflicting,
+            timestamp("2026-08-24T10:00:00Z"),
+        )
+        .expect_err("same key with different input conflicts");
+    assert_eq!(diagnostic.code(), StoreErrorCode::IdempotencyConflict);
+    assert_eq!(tree_snapshot(directory.path()), before_replay);
+
+    let mut missing = command;
+    missing.memory_id = memory_id("mem_missing_but_receipt_exists");
+    assert_eq!(
+        store
+            .update(
+                &update_authorization,
+                &missing,
+                timestamp("2026-08-24T10:01:00Z"),
+            )
+            .expect_err("receipt conflict precedes not-found lookup")
+            .code(),
+        StoreErrorCode::IdempotencyConflict
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_replay);
+
+    drop(store);
+    let mut reopened = CanonicalStore::open(directory.path(), owner()).expect("restart");
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let retry = update_command(&created.record.id, 1, "replayed update");
+    let before_restart_replay = tree_snapshot(directory.path());
+    let replay = reopened
+        .update(&authorization, &retry, timestamp("2026-08-24T11:00:00Z"))
+        .expect("restart update retry replays");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.record, committed.record);
+    assert_eq!(tree_snapshot(directory.path()), before_restart_replay);
+}
+
+#[test]
+fn authorization_precedes_private_receipt_lookup_and_principal_operation_keys_are_isolated() {
+    let directory = TempDir::new().expect("temporary directory");
+    let shared_scope = MemoryScope::Project {
+        project_id: project_id("prj_receipt_isolation"),
+    };
+    let authority_a = AuthorizedScopes::new(principal_id("prn_receipt_a"))
+        .with_project(project_id("prj_receipt_isolation"));
+    let create_a = authorized_mutation(&authority_a, &shared_scope, MutationOperation::Create);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let mut command_a = remember_command(&shared_scope, "first", "principal A body");
+    command_a.idempotency_key = IdempotencyKey::new("shared-operation-key").expect("key");
+    store
+        .create(
+            &create_a,
+            &command_a,
+            memory_id("mem_receipt_a"),
+            CreationActor::Host,
+            timestamp("2026-08-24T02:00:00Z"),
+        )
+        .expect("principal A create");
+
+    let unauthorized_context = TrustedRequestContext {
+        principal_id: principal_id("prn_receipt_a"),
+        client_id: ClientId::new("cli_unauthorized").expect("client ID"),
+        grants: BTreeSet::new(),
+    };
+    let before_denial = tree_snapshot(directory.path());
+    assert_eq!(
+        authority_a
+            .authorize_mutation(
+                &unauthorized_context,
+                &shared_scope,
+                MutationOperation::Create,
+            )
+            .expect_err("grant denial occurs before a receipt capability exists")
+            .code(),
+        StoreErrorCode::Forbidden
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_denial);
+
+    let authority_b = AuthorizedScopes::new(principal_id("prn_receipt_b"))
+        .with_project(project_id("prj_receipt_isolation"));
+    let create_b = authorized_mutation(&authority_b, &shared_scope, MutationOperation::Create);
+    let mut command_b = remember_command(&shared_scope, "second", "principal B body");
+    command_b.idempotency_key = IdempotencyKey::new("shared-operation-key").expect("key");
+    store
+        .create(
+            &create_b,
+            &command_b,
+            memory_id("mem_receipt_b"),
+            CreationActor::Host,
+            timestamp("2026-08-24T02:01:00Z"),
+        )
+        .expect("same raw key is isolated by principal");
+
+    let update_a = authorized_mutation(&authority_a, &shared_scope, MutationOperation::Update);
+    let mut update = update_command(&memory_id("mem_receipt_a"), 1, "operation isolation");
+    update.idempotency_key = IdempotencyKey::new("shared-operation-key").expect("key");
+    store
+        .update(&update_a, &update, timestamp("2026-08-24T02:02:00Z"))
+        .expect("same raw key is isolated by operation");
+    assert_eq!(store.watermark().expect("watermark"), StoreRevision(3));
+    assert_eq!(store.metadata.audit_sequence, AuditSequence(3));
+    assert_eq!(
+        regular_files_below(directory.path(), layout::IDEMPOTENCY_RECEIPTS_DIR).len(),
+        3
+    );
+}
+
+#[test]
+fn lost_acknowledgement_after_commit_replays_success_without_a_second_audit() {
+    for boundary in [
+        PersistenceBoundary::ManifestRemoved,
+        PersistenceBoundary::ManifestRemovalDirectorySynced,
+    ] {
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = MemoryScope::Session {
+            session_id: session_id("ses_lost_ack"),
+        };
+        let authority = AuthorizedScopes::new(principal_id("prn_lost_ack"))
+            .with_session(session_id("ses_lost_ack"));
+        let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let command = remember_command(&scope, "lost-ack", "lost acknowledgement body");
+        let injector = FailOnce::at(boundary);
+        let mut store = CanonicalStore::initialize_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(injector.clone()),
+        )
+        .expect("initialize");
+        assert_eq!(
+            store
+                .create(
+                    &authorization,
+                    &command,
+                    memory_id("mem_lost_ack"),
+                    CreationActor::Host,
+                    timestamp("2026-08-24T02:00:00Z"),
+                )
+                .expect_err("simulate acknowledgement loss")
+                .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+        drop(store);
+
+        let mut reopened = CanonicalStore::open(directory.path(), owner()).expect("recover commit");
+        let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let replay = reopened
+            .create(
+                &authorization,
+                &command,
+                memory_id("mem_retry_generated_id"),
+                CreationActor::Operator,
+                timestamp("2026-08-24T03:00:00Z"),
+            )
+            .expect("retry observes durable success");
+        assert!(replay.idempotent_replay, "{boundary:?}");
+        assert_eq!(replay.record.id, memory_id("mem_lost_ack"), "{boundary:?}");
+        assert_eq!(replay.store_revision, StoreRevision(1), "{boundary:?}");
+        assert_eq!(reopened.metadata.audit_sequence, AuditSequence(1));
+        assert_eq!(
+            regular_files_below(directory.path(), layout::MUTATION_AUDIT_DIR).len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn artifact_recovery_boundaries_are_restartable_and_converge_to_replayable_success() {
+    for &recovery_boundary in RECOVERY_IDEMPOTENCY_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = MemoryScope::Principal {
+            principal_id: principal_id("prn_artifact_recovery"),
+        };
+        let authority = AuthorizedScopes::new(principal_id("prn_artifact_recovery"));
+        let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let command = remember_command(&scope, "recovery", "artifact recovery body");
+        let mut store = CanonicalStore::initialize_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(PersistenceBoundary::RecordRenamed)),
+        )
+        .expect("initialize");
+        store
+            .create(
+                &authorization,
+                &command,
+                memory_id("mem_artifact_recovery"),
+                CreationActor::Host,
+                timestamp("2026-08-24T02:00:00Z"),
+            )
+            .expect_err("leave target record with base metadata");
+        drop(store);
+
+        assert_eq!(
+            CanonicalStore::open_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(FailOnce::at(recovery_boundary)),
+            )
+            .expect_err("recovery boundary prevents readiness")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{recovery_boundary:?}"
+        );
+        let mut reopened = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("retry {recovery_boundary:?}: {error:?}"));
+        let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let replay = reopened
+            .create(
+                &authorization,
+                &command,
+                memory_id("mem_recovery_retry_generated"),
+                CreationActor::Host,
+                timestamp("2026-08-24T03:00:00Z"),
+            )
+            .expect("recovered receipt replays");
+        assert!(replay.idempotent_replay, "{recovery_boundary:?}");
+        assert_eq!(reopened.watermark().expect("watermark"), StoreRevision(1));
+        assert_eq!(reopened.metadata.audit_sequence, AuditSequence(1));
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .expect("transaction directory")
+                .count(),
+            0
+        );
+    }
+}
+
+#[test]
+fn malformed_foreign_missing_oversized_and_orphaned_private_artifacts_fail_closed() {
+    assert_invalid_ledger_after(|root| {
+        let receipt = only_regular_file_below(root, layout::IDEMPOTENCY_RECEIPTS_DIR);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).expect("receipt bytes"))
+                .expect("receipt JSON");
+        value
+            .as_object_mut()
+            .expect("receipt object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        let mut bytes = serde_json::to_vec_pretty(&value).expect("tampered receipt");
+        bytes.push(b'\n');
+        fs::write(receipt, bytes).expect("write unknown receipt field");
+    });
+
+    assert_invalid_ledger_after(|root| {
+        let receipt = only_regular_file_below(root, layout::IDEMPOTENCY_RECEIPTS_DIR);
+        fs::write(receipt, vec![b'x'; 65_537]).expect("write oversized receipt");
+    });
+
+    assert_invalid_ledger_after(|root| {
+        let result = only_regular_file_below(root, layout::IDEMPOTENCY_RESULTS_DIR);
+        fs::write(result, vec![b'x'; 1_048_577]).expect("write oversized private result");
+    });
+
+    assert_invalid_ledger_after(|root| {
+        let audit = only_regular_file_below(root, layout::MUTATION_AUDIT_DIR);
+        fs::remove_file(audit).expect("remove committed audit event");
+    });
+
+    assert_invalid_ledger_after(|root| {
+        let result = only_regular_file_below(root, layout::IDEMPOTENCY_RESULTS_DIR);
+        let parent = result.parent().expect("result shard");
+        let shard = parent
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("result shard name");
+        let mut foreign_id = format!("{shard}{}", "0".repeat(62));
+        if result
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value == foreign_id)
+        {
+            foreign_id.replace_range(2..3, "1");
+        }
+        fs::copy(&result, parent.join(format!("{foreign_id}.json")))
+            .expect("copy foreign result artifact");
+    });
+
+    assert_invalid_ledger_after(|root| {
+        let result = only_regular_file_below(root, layout::IDEMPOTENCY_RESULTS_DIR);
+        let orphan = result
+            .parent()
+            .expect("result shard")
+            .join(".result-00000000-0000-4000-8000-000000000001.tmp");
+        fs::write(orphan, b"orphan private transaction artifact\n")
+            .expect("write orphan result temp");
+    });
+
+    #[cfg(unix)]
+    {
+        let directory = committed_idempotency_fixture();
+        let receipt = only_regular_file_below(directory.path(), layout::IDEMPOTENCY_RECEIPTS_DIR);
+        fs::hard_link(&receipt, receipt.with_extension("linked"))
+            .expect("create hard-linked receipt");
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("hard-linked artifact fails before readiness")
+                .code(),
+            StoreErrorCode::UnsafePath
+        );
+    }
+}
+
+#[test]
+fn manifests_receipts_audits_and_diagnostics_are_secret_safe_while_results_stay_private() {
+    const BODY: &str = "BODY_SENTINEL_7f3cf1d431804a28";
+    const REASON: &str = "REASON_SENTINEL_e1afcf5f00384cad";
+    const CREATE_KEY: &str = "raw-create-key-9719f05ca7be4d9e";
+    const UPDATE_KEY: &str = "raw-update-key-428be55b4a7e4cb0";
+    const QUERY: &str = "QUERY_SENTINEL_select_password_5bc91ff5";
+    const CREDENTIAL: &str = "CREDENTIAL_SENTINEL_sk_4ece1ac8";
+    const CANONICAL_PATH: &str = "/private/jiandu/CANONICAL_PATH_SENTINEL_77cd0e9d";
+
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_secret_safety"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_secret_safety"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let mut create = remember_command(
+        &scope,
+        "secret-safety",
+        &format!("{BODY}\n{QUERY}\n{CREDENTIAL}\n{CANONICAL_PATH}"),
+    );
+    create.idempotency_key = IdempotencyKey::new(CREATE_KEY).expect("create key");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = store
+        .create(
+            &create_authorization,
+            &create,
+            memory_id("mem_secret_safety"),
+            CreationActor::Host,
+            timestamp("2026-08-24T02:00:00Z"),
+        )
+        .expect("create secret fixture");
+    drop(store);
+
+    let injector = FailOnce::at(PersistenceBoundary::ManifestDirectorySynced);
+    let mut store = CanonicalStore::open_with_options(
+        directory.path(),
+        owner(),
+        StoreOptions::with_failpoint_injector(injector),
+    )
+    .expect("open with manifest failpoint");
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let mut update = update_command(&created.record.id, 1, "secret-safe update");
+    update.reason = REASON.to_owned();
+    update.idempotency_key = IdempotencyKey::new(UPDATE_KEY).expect("update key");
+    store
+        .update(
+            &update_authorization,
+            &update,
+            timestamp("2026-08-24T02:01:00Z"),
+        )
+        .expect_err("leave body-free update manifest");
+    let manifest = fs::read_to_string(only_regular_file_below(directory.path(), "transactions"))
+        .expect("read transaction manifest");
+    for forbidden in [
+        BODY,
+        REASON,
+        CREATE_KEY,
+        UPDATE_KEY,
+        QUERY,
+        CREDENTIAL,
+        CANONICAL_PATH,
+    ] {
+        assert!(
+            !manifest.contains(forbidden),
+            "manifest leaked sentinel {forbidden}"
+        );
+    }
+    drop(store);
+
+    let mut store = CanonicalStore::open(directory.path(), owner()).expect("roll back manifest");
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    store
+        .update(
+            &update_authorization,
+            &update,
+            timestamp("2026-08-24T02:01:00Z"),
+        )
+        .expect("commit update after rollback");
+
+    let mut conflict = update;
+    conflict.patch.title = Some("conflicting secret-safe update".to_owned());
+    let error = store
+        .update(
+            &update_authorization,
+            &conflict,
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect_err("conflicting key reuse");
+    assert_eq!(error.code(), StoreErrorCode::IdempotencyConflict);
+    let diagnostic = format!("{error:?} {error}");
+    for forbidden in [
+        BODY,
+        REASON,
+        CREATE_KEY,
+        UPDATE_KEY,
+        QUERY,
+        CREDENTIAL,
+        CANONICAL_PATH,
+    ] {
+        assert!(!diagnostic.contains(forbidden));
+    }
+    drop(store);
+
+    let snapshot = tree_snapshot(directory.path());
+    let body_bearing = [BODY, QUERY, CREDENTIAL, CANONICAL_PATH];
+    for (relative, entry) in snapshot {
+        let Some(bytes) = entry.bytes else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let private_body_location = relative.starts_with("records")
+            || relative.starts_with(layout::IDEMPOTENCY_RESULTS_DIR);
+        for sentinel in body_bearing {
+            if text.contains(sentinel) {
+                assert!(
+                    private_body_location,
+                    "body-like sentinel leaked into {}",
+                    relative.display()
+                );
+            }
+        }
+        for forbidden in [REASON, CREATE_KEY, UPDATE_KEY] {
+            assert!(
+                !text.contains(forbidden),
+                "secret metadata leaked into {}",
+                relative.display()
+            );
+        }
+    }
+}
+
 fn stale_error_text(error: &StoreError) -> String {
     error.to_string()
 }
@@ -1877,27 +2610,27 @@ fn concurrent_current_updates_serialize_to_one_commit_and_one_conflict() {
         principal_id: principal_id("prn_concurrent"),
     };
     let authority = AuthorizedScopes::new(principal_id("prn_concurrent"));
-    let authorized_scope = authority
-        .authorize_exact(&scope)
-        .expect("authorized principal scope");
-    let created = store
-        .create(
-            &authorized_scope,
-            create_input("mem_concurrent", "concurrent body"),
-        )
-        .expect("create memory");
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_concurrent",
+        "concurrent body",
+    )
+    .expect("create memory");
     let shared = Arc::new(Mutex::new(store));
     let barrier = Arc::new(Barrier::new(3));
     let mut threads = Vec::new();
     for title in ["winner-a", "winner-b"] {
         let shared = Arc::clone(&shared);
         let barrier = Arc::clone(&barrier);
-        let authorized_scope = authorized_scope.clone();
+        let update_authorization = update_authorization.clone();
         let id = created.record.id.clone();
         threads.push(std::thread::spawn(move || {
             barrier.wait();
             shared.lock().expect("store mutex").update(
-                &authorized_scope,
+                &update_authorization,
                 &update_command(&id, 1, title),
                 timestamp("2026-08-24T02:01:00Z"),
             )
@@ -1928,27 +2661,7 @@ fn concurrent_current_updates_serialize_to_one_commit_and_one_conflict() {
 
 #[test]
 fn create_failpoints_recover_old_or_new_without_partial_state() {
-    let boundaries = [
-        PersistenceBoundary::ManifestTempWritten,
-        PersistenceBoundary::ManifestTempSynced,
-        PersistenceBoundary::ManifestTempDirectorySynced,
-        PersistenceBoundary::ManifestPublished,
-        PersistenceBoundary::ManifestDirectorySynced,
-        PersistenceBoundary::RecordNamespacePrepared,
-        PersistenceBoundary::RecordTempWritten,
-        PersistenceBoundary::RecordTempSynced,
-        PersistenceBoundary::RecordTempDirectorySynced,
-        PersistenceBoundary::MetadataTempWritten,
-        PersistenceBoundary::MetadataTempSynced,
-        PersistenceBoundary::MetadataTempDirectorySynced,
-        PersistenceBoundary::RecordRenamed,
-        PersistenceBoundary::RecordDirectorySynced,
-        PersistenceBoundary::MetadataRenamed,
-        PersistenceBoundary::MetadataDirectorySynced,
-        PersistenceBoundary::ManifestRemoved,
-        PersistenceBoundary::ManifestRemovalDirectorySynced,
-    ];
-    for boundary in boundaries {
+    for &boundary in MUTATION_PERSISTENCE_BOUNDARIES {
         let directory = TempDir::new().expect("temporary directory");
         let injector = FailOnce::at(boundary);
         let mut store = CanonicalStore::initialize_with_options(
@@ -1962,16 +2675,15 @@ fn create_failpoints_recover_old_or_new_without_partial_state() {
         };
         let authority = AuthorizedScopes::new(principal_id("prn_fail_create"))
             .with_project(project_id("prj_fail_create"));
-        let authorized_scope = authority
-            .authorize_exact(&scope)
-            .expect("authorize create scope");
+        let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
         let id = memory_id("mem_fail_create");
-        let error = store
-            .create(
-                &authorized_scope,
-                create_input(id.as_str(), "body-not-in-manifest"),
-            )
-            .expect_err("boundary injects failure");
+        let error = create_memory(
+            &mut store,
+            &authorization,
+            id.as_str(),
+            "body-not-in-manifest",
+        )
+        .expect_err("boundary injects failure");
         assert_eq!(
             error.code(),
             StoreErrorCode::InjectedFailure,
@@ -1996,17 +2708,9 @@ fn create_failpoints_recover_old_or_new_without_partial_state() {
         );
         drop(store);
 
-        let reopened =
-            CanonicalStore::open(directory.path(), owner()).expect("startup recovery succeeds");
-        let committed = matches!(
-            boundary,
-            PersistenceBoundary::RecordRenamed
-                | PersistenceBoundary::RecordDirectorySynced
-                | PersistenceBoundary::MetadataRenamed
-                | PersistenceBoundary::MetadataDirectorySynced
-                | PersistenceBoundary::ManifestRemoved
-                | PersistenceBoundary::ManifestRemovalDirectorySynced
-        );
+        let reopened = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("startup recovery succeeds at {boundary:?}: {error:?}"));
+        let committed = mutation_target_was_published(boundary);
         if committed {
             let record = reopened.get(&id, &authority).expect("new state recovered");
             assert_eq!(record.result.body, "body-not-in-manifest", "{boundary:?}");
@@ -2052,17 +2756,7 @@ fn create_failpoints_recover_old_or_new_without_partial_state() {
 
 #[test]
 fn update_failpoints_recover_exactly_one_revision() {
-    let boundaries = [
-        PersistenceBoundary::ManifestDirectorySynced,
-        PersistenceBoundary::RecordTempDirectorySynced,
-        PersistenceBoundary::MetadataTempDirectorySynced,
-        PersistenceBoundary::RecordRenamed,
-        PersistenceBoundary::RecordDirectorySynced,
-        PersistenceBoundary::MetadataRenamed,
-        PersistenceBoundary::MetadataDirectorySynced,
-        PersistenceBoundary::ManifestRemoved,
-    ];
-    for boundary in boundaries {
+    for &boundary in MUTATION_PERSISTENCE_BOUNDARIES {
         let directory = TempDir::new().expect("temporary directory");
         let mut initial =
             CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
@@ -2070,15 +2764,15 @@ fn update_failpoints_recover_exactly_one_revision() {
             principal_id: principal_id("prn_fail_update"),
         };
         let authority = AuthorizedScopes::new(principal_id("prn_fail_update"));
-        let initial_scope = authority
-            .authorize_exact(&scope)
-            .expect("authorize initial create scope");
-        let created = initial
-            .create(
-                &initial_scope,
-                create_input("mem_fail_update", "stable body"),
-            )
-            .expect("create initial record");
+        let create_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let created = create_memory(
+            &mut initial,
+            &create_authorization,
+            "mem_fail_update",
+            "stable body",
+        )
+        .expect("create initial record");
         drop(initial);
         let injector = FailOnce::at(boundary);
         let mut store = CanonicalStore::open_with_options(
@@ -2087,13 +2781,12 @@ fn update_failpoints_recover_exactly_one_revision() {
             StoreOptions::with_failpoint_injector(injector),
         )
         .expect("open fault-injected store");
-        let authorized_scope = authority
-            .authorize_exact(&scope)
-            .expect("authorize update scope");
+        let update_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Update);
         assert_eq!(
             store
                 .update(
-                    &authorized_scope,
+                    &update_authorization,
                     &update_command(&created.record.id, 1, "target title"),
                     timestamp("2026-08-24T02:01:00Z"),
                 )
@@ -2103,20 +2796,14 @@ fn update_failpoints_recover_exactly_one_revision() {
             "{boundary:?}"
         );
         drop(store);
-        let reopened =
-            CanonicalStore::open(directory.path(), owner()).expect("recover update transaction");
+        let reopened = CanonicalStore::open(directory.path(), owner()).unwrap_or_else(|error| {
+            panic!("recover update transaction at {boundary:?}: {error:?}")
+        });
         let record = reopened
             .get(&created.record.id, &authority)
             .expect("record is never lost")
             .result;
-        let committed = matches!(
-            boundary,
-            PersistenceBoundary::RecordRenamed
-                | PersistenceBoundary::RecordDirectorySynced
-                | PersistenceBoundary::MetadataRenamed
-                | PersistenceBoundary::MetadataDirectorySynced
-                | PersistenceBoundary::ManifestRemoved
-        );
+        let committed = mutation_target_was_published(boundary);
         assert_eq!(record.revision.get(), if committed { 2 } else { 1 });
         assert_eq!(
             reopened.watermark().expect("recovered update watermark"),
@@ -2147,15 +2834,14 @@ fn manifest_is_strict_bounded_body_free_and_multiple_intents_fail_closed() {
         principal_id: principal_id("prn_manifest"),
     };
     let authority = AuthorizedScopes::new(principal_id("prn_manifest"));
-    let authorized_scope = authority
-        .authorize_exact(&scope)
-        .expect("authorize manifest create scope");
-    store
-        .create(
-            &authorized_scope,
-            create_input("mem_manifest", "uniquely-secret-body"),
-        )
-        .expect_err("leave durable manifest");
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    create_memory(
+        &mut store,
+        &authorization,
+        "mem_manifest",
+        "uniquely-secret-body",
+    )
+    .expect_err("leave durable manifest");
     drop(store);
     let transactions = directory.path().join("transactions");
     let manifest_path = fs::read_dir(&transactions)
@@ -2375,15 +3061,18 @@ fn recovery_itself_is_restartable_and_never_serves_an_ambiguous_handle() {
         principal_id: principal_id("prn_recovery_restart"),
     };
     let recovery_authority = AuthorizedScopes::new(principal_id("prn_recovery_restart"));
-    let authorized_scope = recovery_authority
-        .authorize_exact(&recovery_scope)
-        .expect("authorize recovery create scope");
-    store
-        .create(
-            &authorized_scope,
-            create_input("mem_recovery_restart", "recovery body"),
-        )
-        .expect_err("stop after record rename");
+    let authorization = authorized_mutation(
+        &recovery_authority,
+        &recovery_scope,
+        MutationOperation::Create,
+    );
+    create_memory(
+        &mut store,
+        &authorization,
+        "mem_recovery_restart",
+        "recovery body",
+    )
+    .expect_err("stop after record rename");
     drop(store);
 
     let recovery_failure = FailOnce::at(PersistenceBoundary::RecoveryMetadataDirectorySynced);
@@ -2439,13 +3128,14 @@ fn rollback_and_quarantine_recovery_boundaries_are_restartable() {
             principal_id: principal_id("prn_rollback_restart"),
         };
         let authority = AuthorizedScopes::new(principal_id("prn_rollback_restart"));
-        let authorized_scope = authority.authorize_exact(&scope).expect("authorize scope");
-        store
-            .create(
-                &authorized_scope,
-                create_input("mem_rollback_restart", "rollback body"),
-            )
-            .expect_err("leave rollback transaction");
+        let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+        create_memory(
+            &mut store,
+            &authorization,
+            "mem_rollback_restart",
+            "rollback body",
+        )
+        .expect_err("leave rollback transaction");
         drop(store);
         assert_eq!(
             CanonicalStore::open_with_options(
@@ -2561,15 +3251,19 @@ fn quarantine_receipt_acknowledgement_is_restartable_and_poisons_every_service_e
             principal_id: principal_id("prn_ack_recovery"),
         };
         let authority = AuthorizedScopes::new(principal_id("prn_ack_recovery"));
-        let authorized_scope = authority.authorize_exact(&scope).expect("authorize scope");
+        let create_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let update_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Update);
         let mut initial =
             CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
-        let valid = initial
-            .create(
-                &authorized_scope,
-                create_input("mem_ack_valid", "stable canonical body"),
-            )
-            .expect("create valid record");
+        let valid = create_memory(
+            &mut initial,
+            &create_authorization,
+            "mem_ack_valid",
+            "stable canonical body",
+        )
+        .expect("create valid record");
         drop(initial);
 
         let invalid_id = memory_id("mem_ack_invalid");
@@ -2631,15 +3325,17 @@ fn quarantine_receipt_acknowledgement_is_restartable_and_poisons_every_service_e
             "poisoned list read",
         );
         assert_recovery_required(
-            store.create(
-                &authorized_scope,
-                create_input("mem_ack_poisoned_create", "must not commit"),
+            create_memory(
+                &mut store,
+                &create_authorization,
+                "mem_ack_poisoned_create",
+                "must not commit",
             ),
             "poisoned create",
         );
         assert_recovery_required(
             store.update(
-                &authorized_scope,
+                &update_authorization,
                 &update_command(&valid.record.id, 1, "must not update"),
                 timestamp("2026-08-24T02:01:00Z"),
             ),
@@ -2718,13 +3414,14 @@ fn recovery_fails_closed_for_impossible_record_metadata_combinations() {
         principal_id: principal_id("prn_impossible_watermark"),
     };
     let authority = AuthorizedScopes::new(principal_id("prn_impossible_watermark"));
-    let authorized_scope = authority.authorize_exact(&scope).expect("authorize scope");
-    store
-        .create(
-            &authorized_scope,
-            create_input("mem_impossible_watermark", "uncommitted body"),
-        )
-        .expect_err("stop before staging record");
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    create_memory(
+        &mut store,
+        &authorization,
+        "mem_impossible_watermark",
+        "uncommitted body",
+    )
+    .expect_err("stop before staging record");
     drop(store);
     let manifest_path = fs::read_dir(directory.path().join("transactions"))
         .expect("transactions")
@@ -2767,14 +3464,15 @@ fn recovery_fails_closed_for_impossible_record_metadata_combinations() {
     };
     let authority = AuthorizedScopes::new(principal_id("prn_unrelated_recovery"))
         .with_project(project_id("prj_unrelated_recovery"));
-    let authorized_scope = authority.authorize_exact(&scope).expect("authorize scope");
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
     let id = memory_id("mem_unrelated_recovery");
-    store
-        .create(
-            &authorized_scope,
-            create_input(id.as_str(), "transaction target"),
-        )
-        .expect_err("stop after target rename");
+    create_memory(
+        &mut store,
+        &authorization,
+        id.as_str(),
+        "transaction target",
+    )
+    .expect_err("stop after target rename");
     drop(store);
     let mut unrelated_header = frontmatter(
         id.as_str(),
@@ -2818,13 +3516,14 @@ fn startup_and_doctor_verify_durability_or_fail_closed() {
         principal_id: principal_id("prn_doctor"),
     };
     let authority = AuthorizedScopes::new(principal_id("prn_doctor"));
-    let authorized_scope = authority.authorize_exact(&scope).expect("authorize scope");
-    let created = store
-        .create(
-            &authorized_scope,
-            create_input("mem_doctor", "doctor preserves canonical bytes"),
-        )
-        .expect("create doctor fixture");
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let created = create_memory(
+        &mut store,
+        &authorization,
+        "mem_doctor",
+        "doctor preserves canonical bytes",
+    )
+    .expect("create doctor fixture");
     let record_path =
         layout::record_path(directory.path(), &scope, &created.record.id).expect("record path");
     let record_before = fs::read(&record_path).expect("record bytes before failed startup");
@@ -2914,6 +3613,177 @@ fn legacy_receipt_layout_migrates_idempotently_across_create_and_sync_failures()
 }
 
 #[test]
+fn v1alpha1_to_v1alpha2_migration_is_restartable_at_every_boundary_and_gates_old_writers() {
+    for &boundary in MIGRATION_PERSISTENCE_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let legacy = make_legacy_store(directory.path());
+        let scope = MemoryScope::Project {
+            project_id: project_id("prj_migration_preserved"),
+        };
+        let header = frontmatter(
+            "mem_migration_preserved",
+            scope,
+            "2026-08-24T01:00:00Z",
+            "2026-08-24T01:00:00Z",
+        );
+        let record_path = write_record(directory.path(), &header, " migration body \n");
+        let record_bytes = fs::read(&record_path).expect("record before migration");
+        let record_mtime = fs::metadata(&record_path)
+            .expect("record metadata")
+            .modified()
+            .expect("record mtime");
+
+        let injector = FailOnce::at(boundary);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha1_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(injector.clone()),
+            )
+            .expect_err("migration failpoint interrupts readiness")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+
+        let published = store_metadata(directory.path()).format_version == STORE_FORMAT_VERSION;
+        let migrated = if published {
+            assert_eq!(
+                CanonicalStore::migrate_v1alpha1(directory.path(), owner())
+                    .expect_err("old writer rejects the v1alpha2 capability gate")
+                    .code(),
+                StoreErrorCode::UnsupportedStoreFormat,
+                "{boundary:?}"
+            );
+            CanonicalStore::open(directory.path(), owner()).expect("open published migration")
+        } else {
+            CanonicalStore::migrate_v1alpha1(directory.path(), owner())
+                .expect("retry pre-publish migration")
+        };
+        assert_eq!(migrated.store_id(), &legacy.store_id, "{boundary:?}");
+        assert_eq!(migrated.watermark().expect("watermark"), StoreRevision(0));
+        assert_eq!(migrated.metadata.audit_sequence, AuditSequence(0));
+        assert_eq!(
+            fs::read(&record_path).expect("record after migration"),
+            record_bytes,
+            "{boundary:?}"
+        );
+        assert_eq!(
+            fs::metadata(&record_path)
+                .expect("record metadata after migration")
+                .modified()
+                .expect("record mtime after migration"),
+            record_mtime,
+            "{boundary:?}"
+        );
+        assert!(directory.path().join(layout::AUDIT_GENESIS_FILE).is_file());
+        assert!(
+            !directory
+                .path()
+                .join(layout::STORE_METADATA_MIGRATION_FILE)
+                .exists()
+        );
+        assert!(regular_files_below(directory.path(), layout::MUTATION_AUDIT_DIR).is_empty());
+        drop(migrated);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha1(directory.path(), owner())
+                .expect_err("old writer stays gated after restart")
+                .code(),
+            StoreErrorCode::UnsupportedStoreFormat
+        );
+    }
+}
+
+#[test]
+fn migration_recovers_a_legacy_record_transaction_before_publishing_the_v2_gate() {
+    let directory = TempDir::new().expect("temporary directory");
+    let legacy = make_legacy_store(directory.path());
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_legacy_wal"),
+    };
+    let header = frontmatter(
+        "mem_legacy_wal",
+        scope.clone(),
+        "2026-08-24T01:00:00Z",
+        "2026-08-24T01:00:00Z",
+    );
+    let bytes =
+        encode_canonical_document(&header, "legacy recovered body").expect("legacy target record");
+    let record = decode_canonical_document(&bytes, Some(&header.id))
+        .expect("decode target")
+        .record;
+    let mut target_metadata = legacy.clone();
+    target_metadata.store_revision = StoreRevision(1);
+    let transaction_id = crate::transaction::new_transaction_id();
+    let manifest = crate::transaction::TransactionManifest {
+        format_version: crate::transaction::LEGACY_TRANSACTION_FORMAT_VERSION.to_owned(),
+        transaction_id,
+        store_id: legacy.store_id.clone(),
+        intent: crate::transaction::TransactionIntent::Record(Box::new(
+            crate::transaction::RecordTransaction {
+                operation: crate::transaction::RecordOperation::Create,
+                memory_id: record.id.clone(),
+                scope: scope.clone(),
+                base_revision: None,
+                base_etag: None,
+                target_revision: record.revision,
+                target_etag: record.etag.clone(),
+                base_store_metadata: legacy,
+                target_store_metadata: target_metadata,
+                idempotency: None,
+            },
+        )),
+    };
+    let root = layout::StoreDirectory::open(directory.path(), false).expect("open legacy root");
+    let failpoints =
+        crate::failpoint::Failpoints::new(FailOnce::at(PersistenceBoundary::RecordRenamed));
+    crate::transaction::persist_manifest(&root, &manifest, &failpoints)
+        .expect("persist legacy manifest");
+    let record_identity = crate::transaction::stage_record(&root, &manifest, &bytes, &failpoints)
+        .expect("stage legacy record");
+    let _metadata_identity = crate::transaction::stage_metadata(&root, &manifest, &failpoints)
+        .expect("stage legacy metadata");
+    assert_eq!(
+        crate::transaction::publish_record(&root, &manifest, record_identity, None, &failpoints,)
+            .expect_err("simulate legacy crash after record rename")
+            .code(),
+        StoreErrorCode::InjectedFailure
+    );
+    drop(root);
+
+    let migrated = CanonicalStore::migrate_v1alpha1(directory.path(), owner())
+        .expect("migration first recovers legacy transaction");
+    assert_eq!(migrated.watermark().expect("watermark"), StoreRevision(1));
+    assert_eq!(migrated.metadata.audit_sequence, AuditSequence(0));
+    assert_eq!(
+        migrated
+            .get(
+                &record.id,
+                &AuthorizedScopes::new(principal_id("prn_legacy_wal")),
+            )
+            .expect("legacy target recovered")
+            .result
+            .body,
+        "legacy recovered body"
+    );
+    assert!(regular_files_below(directory.path(), layout::IDEMPOTENCY_RECEIPTS_DIR).is_empty());
+    assert!(regular_files_below(directory.path(), layout::IDEMPOTENCY_RESULTS_DIR).is_empty());
+    assert!(regular_files_below(directory.path(), layout::MUTATION_AUDIT_DIR).is_empty());
+    assert_eq!(
+        fs::read_dir(directory.path().join("transactions"))
+            .expect("transactions")
+            .count(),
+        0
+    );
+    let genesis_file =
+        fs::File::open(directory.path().join(layout::AUDIT_GENESIS_FILE)).expect("audit genesis");
+    let genesis = crate::idempotency::AuditGenesis::decode(genesis_file, migrated.store_id())
+        .expect("decode audit genesis");
+    assert_eq!(genesis.base_store_revision, StoreRevision(1));
+}
+
+#[test]
 fn durability_probe_failpoints_cleanup_before_the_next_readiness() {
     for boundary in [
         PersistenceBoundary::DurabilityProbeFilesSynced,
@@ -2950,7 +3820,7 @@ fn durability_probe_failpoints_cleanup_before_the_next_readiness() {
 fn every_persistence_boundary_has_a_crash_recovery_scenario() {
     use std::collections::BTreeSet;
 
-    let covered: BTreeSet<_> = [
+    let mut covered: BTreeSet<_> = [
         PersistenceBoundary::ManifestTempWritten,
         PersistenceBoundary::ManifestTempSynced,
         PersistenceBoundary::ManifestTempDirectorySynced,
@@ -2993,6 +3863,189 @@ fn every_persistence_boundary_has_a_crash_recovery_scenario() {
     ]
     .into_iter()
     .collect();
+    covered.extend(MUTATION_PERSISTENCE_BOUNDARIES.iter().copied());
+    covered.extend(RECOVERY_IDEMPOTENCY_BOUNDARIES.iter().copied());
+    covered.extend(MIGRATION_PERSISTENCE_BOUNDARIES.iter().copied());
     let declared: BTreeSet<_> = PersistenceBoundary::ALL.iter().copied().collect();
     assert_eq!(covered, declared);
+}
+
+#[test]
+fn v1alpha2_private_fixtures_match_strict_rust_codecs() {
+    let store_id = StoreId::new("00000000-0000-4000-8000-000000000017").expect("store ID");
+    let created_at = timestamp("2026-08-24T00:00:00Z");
+    let base_metadata = StoreMetadata {
+        format_version: STORE_FORMAT_VERSION.to_owned(),
+        store_id: store_id.clone(),
+        store_revision: StoreRevision(41),
+        audit_sequence: AuditSequence(6),
+        created_at: created_at.clone(),
+    };
+    let target_metadata = StoreMetadata {
+        store_revision: StoreRevision(42),
+        audit_sequence: AuditSequence(7),
+        ..base_metadata.clone()
+    };
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_fixture"),
+    };
+    let header = frontmatter(
+        "mem_fixture",
+        scope.clone(),
+        "2026-08-24T01:00:00Z",
+        "2026-08-24T01:00:00Z",
+    );
+    let record = decode_canonical_document(
+        &encode_canonical_document(&header, "fixture body").expect("record bytes"),
+        Some(&header.id),
+    )
+    .expect("record")
+    .record;
+    let binding = crate::idempotency::MutationBinding {
+        receipt_id: "11".repeat(32),
+        transaction_id: "00000000-0000-4000-8000-000000000017".to_owned(),
+        principal_digest: format!("sha256:{}", "2".repeat(64)),
+        key_digest: format!("sha256:{}", "3".repeat(64)),
+        operation: MutationOperation::Create,
+        scope: scope.clone(),
+        request_fingerprint: format!("sha256:{}", "4".repeat(64)),
+        memory_id: record.id.clone(),
+        target_revision: record.revision,
+        target_etag: record.etag.clone(),
+        store_revision: StoreRevision(42),
+        audit_sequence: AuditSequence(7),
+    };
+    let artifacts = crate::idempotency::MutationArtifacts::build(
+        store_id.clone(),
+        binding.clone(),
+        None,
+        record.clone(),
+    )
+    .expect("artifacts");
+    let manifest = crate::transaction::TransactionManifest::for_record(
+        store_id.clone(),
+        binding.transaction_id.clone(),
+        crate::transaction::RecordTransaction {
+            operation: crate::transaction::RecordOperation::Create,
+            memory_id: record.id.clone(),
+            scope,
+            base_revision: None,
+            base_etag: None,
+            target_revision: record.revision,
+            target_etag: record.etag.clone(),
+            base_store_metadata: base_metadata,
+            target_store_metadata: target_metadata.clone(),
+            idempotency: Some(crate::idempotency::IdempotencyTransaction {
+                binding,
+                result_digest: artifacts.result_digest.clone(),
+                receipt_digest: artifacts.receipt_digest.clone(),
+                audit_digest: artifacts.audit_digest.clone(),
+            }),
+        },
+    )
+    .expect("manifest");
+    let genesis = crate::idempotency::AuditGenesis::new(store_id, StoreRevision(41));
+    let decoded_metadata: StoreMetadata =
+        serde_json::from_slice(include_bytes!("../fixtures/v1alpha2/store-metadata.json"))
+            .expect("decode metadata fixture");
+    assert_eq!(decoded_metadata, target_metadata);
+    let decode_directory = TempDir::new().expect("fixture decode directory");
+    let decode = |name: &str, bytes: &[u8]| {
+        let path = decode_directory.path().join(name);
+        fs::write(&path, bytes).expect("write fixture for strict decode");
+        fs::File::open(path).expect("open fixture for strict decode")
+    };
+    assert_eq!(
+        crate::idempotency::AuditGenesis::decode(
+            decode(
+                "audit-genesis.json",
+                include_bytes!("../fixtures/v1alpha2/audit-genesis.json"),
+            ),
+            &target_metadata.store_id,
+        )
+        .expect("decode genesis fixture"),
+        genesis
+    );
+    assert_eq!(
+        crate::idempotency::DurableMutationResult::decode(
+            decode(
+                "mutation-result.json",
+                include_bytes!("../fixtures/v1alpha2/mutation-result.json"),
+            ),
+            &target_metadata.store_id,
+            &artifacts.result.binding,
+        )
+        .expect("decode result fixture"),
+        artifacts.result
+    );
+    assert_eq!(
+        crate::idempotency::DurableIdempotencyReceipt::decode(
+            decode(
+                "idempotency-receipt.json",
+                include_bytes!("../fixtures/v1alpha2/idempotency-receipt.json"),
+            ),
+            &target_metadata.store_id,
+            &artifacts.receipt.binding.receipt_id,
+        )
+        .expect("decode receipt fixture"),
+        artifacts.receipt
+    );
+    assert_eq!(
+        crate::idempotency::DurableAuditEvent::decode(
+            decode(
+                "mutation-audit.json",
+                include_bytes!("../fixtures/v1alpha2/mutation-audit.json"),
+            ),
+            &target_metadata.store_id,
+            AuditSequence(7),
+        )
+        .expect("decode audit fixture"),
+        artifacts.audit
+    );
+    assert_eq!(
+        crate::transaction::TransactionManifest::decode(
+            decode(
+                "record-transaction.json",
+                include_bytes!("../fixtures/v1alpha2/record-transaction.json"),
+            ),
+            "00000000-0000-4000-8000-000000000017",
+            &target_metadata.store_id,
+        )
+        .expect("decode manifest fixture"),
+        manifest
+    );
+    for (name, bytes, fixture) in [
+        (
+            "store-metadata.json",
+            target_metadata.canonical_bytes().expect("metadata"),
+            include_bytes!("../fixtures/v1alpha2/store-metadata.json").as_slice(),
+        ),
+        (
+            "audit-genesis.json",
+            genesis.canonical_bytes().expect("genesis"),
+            include_bytes!("../fixtures/v1alpha2/audit-genesis.json").as_slice(),
+        ),
+        (
+            "mutation-result.json",
+            artifacts.result_bytes,
+            include_bytes!("../fixtures/v1alpha2/mutation-result.json").as_slice(),
+        ),
+        (
+            "idempotency-receipt.json",
+            artifacts.receipt_bytes,
+            include_bytes!("../fixtures/v1alpha2/idempotency-receipt.json").as_slice(),
+        ),
+        (
+            "mutation-audit.json",
+            artifacts.audit_bytes,
+            include_bytes!("../fixtures/v1alpha2/mutation-audit.json").as_slice(),
+        ),
+        (
+            "record-transaction.json",
+            manifest.canonical_bytes().expect("manifest"),
+            include_bytes!("../fixtures/v1alpha2/record-transaction.json").as_slice(),
+        ),
+    ] {
+        assert_eq!(bytes, fixture, "fixture drift: {name}");
+    }
 }

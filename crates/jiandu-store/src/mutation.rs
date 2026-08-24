@@ -1,47 +1,43 @@
 //! Canonical create/update CAS operations.
 
 use crate::document::{decode_canonical_document, encode_canonical_document};
+use crate::idempotency::{
+    IdempotencyTransaction, MutationArtifacts, MutationBinding, ReceiptIdentity,
+};
 use crate::layout::{self, FileIdentity};
 use crate::transaction::{self, RecordOperation, RecordTransaction, TransactionIntent};
-use crate::{AuthorizedScope, CanonicalStore, StoreError};
+use crate::{AuthorizedMutation, CanonicalStore, MutationOperation, StoreError};
 use jiandu_core::{
     CreationActor, Etag, MemoryId, MemoryPatch, MemoryRecord, MemoryRelation, MemorySchema,
-    MemoryScope, MemoryStatus, MemoryType, Provenance, RememberMemoryCommand, Revision,
-    ScopeSelector, StoreRevision, Tag, Timestamp, UpdateMemoryCommand, Validate,
+    MemoryScope, MemoryStatus, MemoryType, Provenance, ProvenanceInput, RememberMemoryCommand,
+    Revision, ScopeSelector, StoreRevision, Tag, Timestamp, UpdateMemoryCommand, Validate,
 };
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Host-resolved canonical input for one new memory.
-///
-/// ID, scope, actor, and timestamp are authoritative host values. The store
-/// stamps revision 1 and derives the ETag from canonical bytes. Idempotency is
-/// intentionally not claimed by this type; durable replay receipts belong to
-/// Issue #5.
+/// Internal host-resolved input after receipt lookup. Keeping this type private
+/// prevents callers from bypassing the idempotent public create contract.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateMemoryInput {
-    pub memory_id: MemoryId,
-    pub memory_type: MemoryType,
-    pub title: String,
-    pub summary: Option<String>,
-    pub body: String,
-    pub tags: Vec<Tag>,
-    pub provenance: Provenance,
-    pub relations: Vec<MemoryRelation>,
-    pub created_at: Timestamp,
+struct CreateMemoryInput {
+    memory_id: MemoryId,
+    memory_type: MemoryType,
+    title: String,
+    summary: Option<String>,
+    body: String,
+    tags: Vec<Tag>,
+    provenance: Provenance,
+    relations: Vec<MemoryRelation>,
+    created_at: Timestamp,
 }
 
 impl CreateMemoryInput {
-    /// Resolve the model-visible remember command without treating its
-    /// idempotency key as durable. The future receipt layer must extend the
-    /// transaction before acknowledgment rather than invoking a post-commit
-    /// callback that could falsely imply atomicity.
-    pub fn from_remember_command(
+    fn from_remember_command(
         command: &RememberMemoryCommand,
         memory_id: MemoryId,
-        authorized_scope: &AuthorizedScope,
+        authorized_scope: &AuthorizedMutation,
         created_by: CreationActor,
         created_at: Timestamp,
     ) -> Result<Self, StoreError> {
@@ -95,19 +91,83 @@ pub struct MutationCommit {
     pub store_revision: StoreRevision,
     pub previous_revision: Option<Revision>,
     pub record: MemoryRecord,
+    pub idempotent_replay: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RememberFingerprint<'a> {
+    authoritative_scope: &'a MemoryScope,
+    #[serde(rename = "type")]
+    memory_type: MemoryType,
+    title: &'a str,
+    summary: Option<&'a str>,
+    body: &'a str,
+    tags: &'a [Tag],
+    provenance: &'a ProvenanceInput,
+    relations: &'a [MemoryRelation],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateFingerprint<'a> {
+    authoritative_scope: &'a MemoryScope,
+    memory_id: &'a MemoryId,
+    expected_revision: Revision,
+    patch: &'a MemoryPatch,
+    reason: &'a str,
 }
 
 impl CanonicalStore {
-    /// Create one canonical memory atomically, failing if the target already
-    /// exists. The current owner serializes this operation with all other
-    /// mutations through the exclusive `&mut self` borrow.
+    /// Idempotently create one canonical memory. Receipt lookup occurs after
+    /// operation authorization and validation, but before generated ID/time or
+    /// any existing-record check can affect the outcome.
     pub fn create(
         &mut self,
-        authorized_scope: &AuthorizedScope,
-        input: CreateMemoryInput,
+        authorization: &AuthorizedMutation,
+        command: &RememberMemoryCommand,
+        memory_id: MemoryId,
+        created_by: CreationActor,
+        created_at: Timestamp,
     ) -> Result<MutationCommit, StoreError> {
         self.validate_ownership()?;
-        let (record, bytes) = input.into_record(authorized_scope.as_scope().clone())?;
+        require_operation(authorization, MutationOperation::Create)?;
+        command.validate().map_err(|_| StoreError::InvalidRequest)?;
+        if !selector_resolves_to(&command.scope, authorization.as_scope()) {
+            return Err(StoreError::InvalidRequest);
+        }
+        let request_fingerprint = crate::idempotency::request_fingerprint(&RememberFingerprint {
+            authoritative_scope: authorization.as_scope(),
+            memory_type: command.memory_type,
+            title: &command.title,
+            summary: command.summary.as_deref(),
+            body: &command.body,
+            tags: &command.tags,
+            provenance: &command.provenance,
+            relations: &command.relations,
+        })?;
+        let receipt_identity = ReceiptIdentity::derive(
+            authorization.principal_id(),
+            MutationOperation::Create,
+            &command.idempotency_key,
+        );
+        if let Some(replay) = self.lookup_replay(
+            authorization,
+            MutationOperation::Create,
+            &receipt_identity,
+            &request_fingerprint,
+        )? {
+            return Ok(replay);
+        }
+
+        let input = CreateMemoryInput::from_remember_command(
+            command,
+            memory_id,
+            authorization,
+            created_by,
+            created_at,
+        )?;
+        let (record, bytes) = input.into_record(authorization.as_scope().clone())?;
         if record_id_exists_anywhere(&self.root, &record.id)? {
             return Err(StoreError::AlreadyExists {
                 id: record.id.clone(),
@@ -115,8 +175,30 @@ impl CanonicalStore {
         }
         self.ensure_metadata_current()?;
         let target_metadata = next_store_metadata(&self.metadata)?;
+        let transaction_id = transaction::new_transaction_id();
+        let binding = MutationBinding {
+            receipt_id: receipt_identity.receipt_id,
+            transaction_id: transaction_id.clone(),
+            principal_digest: receipt_identity.principal_digest,
+            key_digest: receipt_identity.key_digest,
+            operation: MutationOperation::Create,
+            scope: record.scope.clone(),
+            request_fingerprint,
+            memory_id: record.id.clone(),
+            target_revision: record.revision,
+            target_etag: record.etag.clone(),
+            store_revision: target_metadata.store_revision,
+            audit_sequence: target_metadata.audit_sequence,
+        };
+        let artifacts = MutationArtifacts::build(
+            self.metadata.store_id.clone(),
+            binding.clone(),
+            None,
+            record.clone(),
+        )?;
         let manifest = transaction::TransactionManifest::for_record(
             self.metadata.store_id.clone(),
+            transaction_id,
             RecordTransaction {
                 operation: RecordOperation::Create,
                 memory_id: record.id.clone(),
@@ -127,28 +209,55 @@ impl CanonicalStore {
                 target_etag: record.etag.clone(),
                 base_store_metadata: self.metadata.clone(),
                 target_store_metadata: target_metadata,
+                idempotency: Some(IdempotencyTransaction {
+                    binding,
+                    result_digest: artifacts.result_digest.clone(),
+                    receipt_digest: artifacts.receipt_digest.clone(),
+                    audit_digest: artifacts.audit_digest.clone(),
+                }),
             },
         )?;
-        self.commit_record(manifest, record, &bytes, None, None)
+        self.commit_record(manifest, record, &bytes, artifacts, None, None)
     }
 
     /// Apply one optimistic patch to the exact authoritative scope. A stale
     /// revision returns only the current revision, never a body or path.
     pub fn update(
         &mut self,
-        authorized_scope: &AuthorizedScope,
+        authorization: &AuthorizedMutation,
         command: &UpdateMemoryCommand,
         updated_at: Timestamp,
     ) -> Result<MutationCommit, StoreError> {
         self.validate_ownership()?;
+        require_operation(authorization, MutationOperation::Update)?;
         command.validate().map_err(|_| StoreError::InvalidRequest)?;
-        let scope = authorized_scope.as_scope();
+        let scope = authorization.as_scope();
+        let request_fingerprint = crate::idempotency::request_fingerprint(&UpdateFingerprint {
+            authoritative_scope: scope,
+            memory_id: &command.memory_id,
+            expected_revision: command.expected_revision,
+            patch: &command.patch,
+            reason: &command.reason,
+        })?;
+        let receipt_identity = ReceiptIdentity::derive(
+            authorization.principal_id(),
+            MutationOperation::Update,
+            &command.idempotency_key,
+        );
+        if let Some(replay) = self.lookup_replay(
+            authorization,
+            MutationOperation::Update,
+            &receipt_identity,
+            &request_fingerprint,
+        )? {
+            return Ok(replay);
+        }
         let relative = layout::record_relative_path(scope, &command.memory_id);
         let file = self
             .root
             .try_open_regular(&relative, false)?
             .ok_or(StoreError::NotFound)?;
-        let identity = FileIdentity::from_file(&file)?;
+        let current_identity = FileIdentity::from_file(&file)?;
         let read_file = file
             .try_clone()
             .map_err(|source| StoreError::io("clone current record handle", source))?;
@@ -174,8 +283,30 @@ impl CanonicalStore {
         let (target_record, bytes) = canonicalize_record(&target_record)?;
         self.ensure_metadata_current()?;
         let target_metadata = next_store_metadata(&self.metadata)?;
+        let transaction_id = transaction::new_transaction_id();
+        let binding = MutationBinding {
+            receipt_id: receipt_identity.receipt_id,
+            transaction_id: transaction_id.clone(),
+            principal_digest: receipt_identity.principal_digest,
+            key_digest: receipt_identity.key_digest,
+            operation: MutationOperation::Update,
+            scope: current.scope.clone(),
+            request_fingerprint,
+            memory_id: current.id.clone(),
+            target_revision: target_record.revision,
+            target_etag: target_record.etag.clone(),
+            store_revision: target_metadata.store_revision,
+            audit_sequence: target_metadata.audit_sequence,
+        };
+        let artifacts = MutationArtifacts::build(
+            self.metadata.store_id.clone(),
+            binding.clone(),
+            Some(current.revision),
+            target_record.clone(),
+        )?;
         let manifest = transaction::TransactionManifest::for_record(
             self.metadata.store_id.clone(),
+            transaction_id,
             RecordTransaction {
                 operation: RecordOperation::Update,
                 memory_id: current.id.clone(),
@@ -186,13 +317,20 @@ impl CanonicalStore {
                 target_etag: target_record.etag.clone(),
                 base_store_metadata: self.metadata.clone(),
                 target_store_metadata: target_metadata,
+                idempotency: Some(IdempotencyTransaction {
+                    binding,
+                    result_digest: artifacts.result_digest.clone(),
+                    receipt_digest: artifacts.receipt_digest.clone(),
+                    audit_digest: artifacts.audit_digest.clone(),
+                }),
             },
         )?;
         self.commit_record(
             manifest,
             target_record,
             &bytes,
-            Some(identity),
+            artifacts,
+            Some(current_identity),
             Some(current.revision),
         )
     }
@@ -202,6 +340,7 @@ impl CanonicalStore {
         manifest: transaction::TransactionManifest,
         record: MemoryRecord,
         bytes: &[u8],
+        artifacts: MutationArtifacts,
         expected_current: Option<FileIdentity>,
         previous_revision: Option<Revision>,
     ) -> Result<MutationCommit, StoreError> {
@@ -220,11 +359,48 @@ impl CanonicalStore {
             transaction::stage_record(&self.root, &manifest, bytes, &self.failpoints)?;
         let metadata_identity =
             transaction::stage_metadata(&self.root, &manifest, &self.failpoints)?;
+        transaction::prepare_idempotency_namespaces(&self.root, &manifest, &self.failpoints)?;
+        let result_identity = transaction::stage_mutation_result(
+            &self.root,
+            &manifest,
+            &artifacts.result_bytes,
+            &self.failpoints,
+        )?;
+        let receipt_identity = transaction::stage_idempotency_receipt(
+            &self.root,
+            &manifest,
+            &artifacts.receipt_bytes,
+            &self.failpoints,
+        )?;
+        let audit_identity = transaction::stage_mutation_audit(
+            &self.root,
+            &manifest,
+            &artifacts.audit_bytes,
+            &self.failpoints,
+        )?;
         transaction::publish_record(
             &self.root,
             &manifest,
             record_identity,
             expected_current,
+            &self.failpoints,
+        )?;
+        transaction::publish_mutation_result(
+            &self.root,
+            &manifest,
+            result_identity,
+            &self.failpoints,
+        )?;
+        transaction::publish_idempotency_receipt(
+            &self.root,
+            &manifest,
+            receipt_identity,
+            &self.failpoints,
+        )?;
+        transaction::publish_mutation_audit(
+            &self.root,
+            &manifest,
+            audit_identity,
             &self.failpoints,
         )?;
         transaction::publish_metadata(&self.root, &manifest, metadata_identity, &self.failpoints)?;
@@ -236,7 +412,61 @@ impl CanonicalStore {
             store_revision: self.metadata.store_revision,
             previous_revision,
             record,
+            idempotent_replay: false,
         })
+    }
+
+    fn lookup_replay(
+        &self,
+        authorization: &AuthorizedMutation,
+        operation: MutationOperation,
+        identity: &ReceiptIdentity,
+        request_fingerprint: &str,
+    ) -> Result<Option<MutationCommit>, StoreError> {
+        let Some(receipt) = crate::idempotency::read_receipt(
+            &self.root,
+            &self.metadata.store_id,
+            identity,
+            operation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let binding = &receipt.binding;
+        if binding.receipt_id != identity.receipt_id
+            || binding.principal_digest != identity.principal_digest
+            || binding.key_digest != identity.key_digest
+            || binding.operation != operation
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        // The freshly minted capability must still authorize the exact scope
+        // stored in the receipt. Scope/fingerprint differences are conflicting
+        // key reuse, never a reason to disclose the historical result.
+        if binding.scope != *authorization.as_scope()
+            || binding.request_fingerprint != request_fingerprint
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let result = crate::idempotency::read_result(
+            &self.root,
+            &self.metadata.store_id,
+            binding,
+            &receipt.result_digest,
+        )?;
+        crate::idempotency::verify_audit(
+            &self.root,
+            &self.metadata.store_id,
+            binding,
+            &receipt.result_digest,
+        )?;
+        Ok(Some(MutationCommit {
+            transaction_id: binding.transaction_id.clone(),
+            store_revision: binding.store_revision,
+            previous_revision: result.previous_revision,
+            record: result.record,
+            idempotent_replay: true,
+        }))
     }
 
     fn ensure_metadata_current(&self) -> Result<(), StoreError> {
@@ -266,7 +496,25 @@ fn next_store_metadata(current: &crate::StoreMetadata) -> Result<crate::StoreMet
             .checked_add(1)
             .ok_or(StoreError::RevisionOverflow)?,
     );
+    target.audit_sequence = crate::AuditSequence(
+        current
+            .audit_sequence
+            .0
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?,
+    );
     Ok(target)
+}
+
+fn require_operation(
+    authorization: &AuthorizedMutation,
+    expected: MutationOperation,
+) -> Result<(), StoreError> {
+    if authorization.operation() == expected {
+        Ok(())
+    } else {
+        Err(StoreError::Forbidden)
+    }
 }
 
 fn apply_patch(

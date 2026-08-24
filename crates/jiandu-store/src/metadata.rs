@@ -8,7 +8,18 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-pub const STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha1";
+/// Store format that requires every create/update to publish an idempotency
+/// receipt and one sequence-addressed audit event before acknowledgement.
+pub const STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha2";
+pub(crate) const LEGACY_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha1";
+
+/// Independent monotonic address of the private mutation audit ledger.
+///
+/// Zero is the genesis watermark. Each committed create/update advances this
+/// value exactly once; idempotent replay never advances it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct AuditSequence(pub u64);
 
 /// Opaque UUID-backed store identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -58,7 +69,18 @@ pub struct StoreMetadata {
     pub format_version: String,
     pub store_id: StoreId,
     pub store_revision: StoreRevision,
+    #[serde(default)]
+    pub audit_sequence: AuditSequence,
     pub created_at: Timestamp,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyStoreMetadata<'a> {
+    format_version: &'a str,
+    store_id: &'a StoreId,
+    store_revision: StoreRevision,
+    created_at: &'a Timestamp,
 }
 
 impl StoreMetadata {
@@ -67,15 +89,33 @@ impl StoreMetadata {
             format_version: STORE_FORMAT_VERSION.to_owned(),
             store_id: StoreId::random(),
             store_revision: StoreRevision(0),
+            audit_sequence: AuditSequence(0),
             created_at: timestamp_now()?,
         })
     }
 
     pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, crate::StoreError> {
-        let mut bytes =
-            serde_json::to_vec_pretty(self).map_err(|_| crate::StoreError::InvalidStoreMetadata)?;
+        let mut bytes = if self.format_version == LEGACY_STORE_FORMAT_VERSION {
+            serde_json::to_vec_pretty(&LegacyStoreMetadata {
+                format_version: &self.format_version,
+                store_id: &self.store_id,
+                store_revision: self.store_revision,
+                created_at: &self.created_at,
+            })
+        } else {
+            serde_json::to_vec_pretty(self)
+        }
+        .map_err(|_| crate::StoreError::InvalidStoreMetadata)?;
         bytes.push(b'\n');
         Ok(bytes)
+    }
+
+    pub(crate) fn upgraded_from_legacy(mut self) -> Result<Self, crate::StoreError> {
+        if self.format_version != LEGACY_STORE_FORMAT_VERSION || self.audit_sequence.0 != 0 {
+            return Err(crate::StoreError::InvalidStoreMetadata);
+        }
+        self.format_version = STORE_FORMAT_VERSION.to_owned();
+        Ok(self)
     }
 }
 

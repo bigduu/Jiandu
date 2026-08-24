@@ -1,5 +1,10 @@
 # Canonical Store Format `v1alpha1`
 
+> Historical compatibility source: new stores use
+> [`jiandu.store/v1alpha2`](store-format-v1alpha2.md). This document remains
+> authoritative for validating and recovering the legacy state before the
+> explicit migration publishes its capability gate.
+
 This document commits the on-disk compatibility boundary implemented by
 `jiandu-store`. Paths described here are private implementation details: MCP
 clients and model-visible requests use opaque IDs and typed scopes only.
@@ -261,8 +266,8 @@ ambiguous because atomic replacement cannot legitimately remove the old file.
 Recovery never commits merely because a temp or manifest exists and never
 invents an acknowledgement. A crash after a durable canonical commit but
 before the caller receives it can therefore yield a committed mutation that is
-not replay-safe yet; Issue #5 must extend the same manifest boundary with
-idempotency/audit durability before claiming replay semantics.
+not replay-safe in this legacy format. `v1alpha2` extends this exact manifest
+boundary with pre-acknowledgement idempotency/audit durability.
 
 Every persistence boundary has a deterministic failpoint. Tests interrupt and
 reopen across manifest write/sync/publish, record and metadata temp write/sync,
@@ -303,8 +308,7 @@ directories are synced in that order. A strict, path-free operator receipt is
 then published under `receipts/quarantine/` before the manifest is removed.
 The pending receipt ledger survives restart until explicit acknowledgement;
 acknowledgement removes only the receipt, never quarantined bytes. This
-namespace is intentionally separate from Issue #5's future idempotency
-receipts.
+namespace is intentionally separate from `v1alpha2` idempotency receipts.
 
 Acknowledgement is itself a durable one-file deletion. After resolving the
 exact receipt, the live handle is poisoned before unlink, the receipt directory
@@ -329,8 +333,10 @@ must still be operated on by a version that understands this ledger.
 
 ## Compatibility and non-goals
 
-`jiandu.store/v1alpha1` readers do not migrate unknown future formats. A future
-format requires an explicit migration implementation and conformance fixtures.
+`jiandu.store/v1alpha1` readers do not migrate unknown future formats.
+`v1alpha2` therefore uses an explicit root-locked migration and checked
+conformance fixtures; after its metadata-last capability gate is published, an
+older writer fails closed.
 The canonical YAML serializer and dependency lockfile are part of drift
 protection for this alpha format.
 
@@ -339,6 +345,6 @@ replacement, deterministic startup recovery, durability diagnostics, and
 recoverable operator quarantine. It deliberately does not claim idempotent
 request replay, audit-event atomicity, forget/tombstones, import/export,
 search/indexing, MCP transport, Bamboo integration, prompt construction, model
-calls, or filesystem-path identity. Those remain separate roadmap issues; in
-particular, Issue #5 must extend the transaction before acknowledgement rather
-than bolt on a fallible post-commit callback.
+calls, or filesystem-path identity. Those remain separate roadmap issues. The
+implemented `v1alpha2` successor extends the transaction before
+acknowledgement instead of adding a fallible post-commit callback.

@@ -154,7 +154,7 @@ This gives the user-visible behavior of “deep copy through this message” wit
 
 ```text
 <data-dir>/
-├── store.json                     # store UUID and format version
+├── store.json                     # store UUID, format, storeRevision, auditSequence
 ├── LOCK                           # exclusive-writer lock metadata
 ├── records/
 │   ├── principal/<principal-key>/<shard>/<memory-key>.md
@@ -166,8 +166,12 @@ This gives the user-visible behavior of “deep copy through this message” wit
 ├── transactions/<transaction-id>.json
 ├── receipts/
 │   ├── quarantine/quarantine-<transaction-id>.json
-│   └── <future-idempotency-layout-from-#5>/
-├── audit/<date>/<sequence>.jsonl
+│   └── idempotency/
+│       ├── metadata/<principal-digest>/<operation>/<shard>/<receipt-id>.json
+│       └── results/<shard>/<receipt-id>.json
+├── audit/
+│   ├── genesis.json
+│   └── mutations/<20-digit-audit-sequence>.json
 ├── index/lexical.sqlite           # derived and rebuildable
 ├── quarantine/
 └── backups/
@@ -177,36 +181,43 @@ The authoritative owner segment is part of the private layout for Principal, Pro
 
 Sharding uses the first two characters of the memory storage key only to bound directory size. Clients never observe these paths. Exact reads receive typed memory IDs plus host-authorized scopes, recompute the private key, and still validate the original ID/scope in frontmatter. Absent and inaccessible IDs share the same public not-found result. `store.json`, record frontmatter, transaction manifests, and tombstones carry explicit format versions.
 
-## Atomic mutation protocol
+## Atomic idempotent mutation protocol
 
-The implemented #4 create/update core follows one state machine:
+The implemented #4/#17 create/update core follows one state machine:
 
-1. the host resolves an `AuthorizedScope`, validates the public command, and
-   canonicalizes the target record;
-2. create checks the globally unique ID by exact private key without parsing
-   another tenant's body; update loads the exact authorized record, holds its
-   file identity, and checks `expectedRevision`;
+1. the host authenticates the trusted request context, resolves an
+   operation-specific `AuthorizedMutation` for one exact scope, and validates
+   the public command;
+2. Jiandu fingerprints authoritative scope plus canonical caller input and
+   looks up the principal/operation/key-digest receipt before generated values,
+   create existence checks, update `NotFound`, or CAS;
 3. Jiandu durably publishes a strict, body/path-free versioned transaction
-   manifest;
-4. it writes and fsyncs a same-shard record temp and a root metadata temp, then
-   syncs their directories;
-5. it atomically replaces the record, syncs its shard, atomically replaces
-   `store.json`, and syncs the root;
-6. it removes and syncs the manifest before acknowledging the canonical
+   manifest binding the target record, metadata, private result, body-free
+   receipt, and body-free audit event by digest;
+4. it stages and fsyncs all five target files on their final filesystems;
+5. it atomically publishes record, private result, receipt, and audit in order,
+   then publishes `store.json` last as the commit watermark; and
+6. it removes and syncs the manifest before acknowledging the original
    create/update result.
 
 Startup recovery compares both record state (base/target/ambiguous) and store
 metadata state (base/target/ambiguous). It rolls back only base/base, completes
-target/base or target/target, and fails closed for impossible or unknown
-combinations. A post-boundary error poisons the current handle until this
-startup path runs. Full byte/state/failpoint details are committed in
-[the store-format document](store-format-v1alpha1.md).
+target/base or target/target only after reconstructing/verifying every artifact
+against the strict manifest digests, and fails closed for impossible or unknown
+combinations. Base/base with any published result/receipt/audit is impossible.
+A post-boundary error poisons the current handle until this startup path runs.
 
-Issue #5 will extend this same pre-acknowledgement transaction with durable
-idempotency receipts, audit entries, and tombstones. The current commit result
-is deliberately not called an idempotency receipt: adding a fallible
-post-commit callback would falsely claim atomicity. Derived index maintenance
-also remains asynchronous and non-authoritative in its own milestone.
+An identical retry with fresh exact-scope authority returns the original
+record/revision/ETag/store revision and does not rewrite state or advance
+`auditSequence`. Conflicting key reuse fails before any write. The complete
+result is retained only in a bounded, non-enumerable private artifact; metadata,
+WAL, audit, and diagnostics contain no body, update reason, raw key/query,
+credential, or path. Full byte/state/migration/failpoint details are committed
+in [the `v1alpha2` store-format document](store-format-v1alpha2.md).
+
+Forget/tombstone retention and hard-purge/receipt-GC lifecycle are Issue #18.
+Derived index maintenance remains asynchronous and non-authoritative in its own
+milestone.
 
 ## External edits
 

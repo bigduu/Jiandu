@@ -16,6 +16,8 @@ pub enum StoreErrorCode {
     StoreLocked,
     InvalidLayout,
     UnsafePath,
+    Unauthenticated,
+    Forbidden,
     InvalidRequest,
     InvalidRecord,
     DuplicateMemoryId,
@@ -26,6 +28,7 @@ pub enum StoreErrorCode {
     AlreadyExists,
     RevisionConflict,
     RevisionOverflow,
+    IdempotencyConflict,
     RecoveryRequired,
     InvalidTransaction,
     UnsupportedDurability,
@@ -63,6 +66,8 @@ pub enum StoreError {
     },
     InvalidLayout,
     UnsafePath,
+    Unauthenticated,
+    Forbidden,
     InvalidRequest,
     InvalidRecord {
         id: Option<MemoryId>,
@@ -84,6 +89,7 @@ pub enum StoreError {
         current_revision: Revision,
     },
     RevisionOverflow,
+    IdempotencyConflict,
     RecoveryRequired,
     InvalidTransaction,
     UnsupportedDurability {
@@ -110,6 +116,8 @@ impl StoreError {
             Self::StoreLocked { .. } => StoreErrorCode::StoreLocked,
             Self::InvalidLayout => StoreErrorCode::InvalidLayout,
             Self::UnsafePath => StoreErrorCode::UnsafePath,
+            Self::Unauthenticated => StoreErrorCode::Unauthenticated,
+            Self::Forbidden => StoreErrorCode::Forbidden,
             Self::InvalidRequest => StoreErrorCode::InvalidRequest,
             Self::InvalidRecord { .. } => StoreErrorCode::InvalidRecord,
             Self::DuplicateMemoryId { .. } => StoreErrorCode::DuplicateMemoryId,
@@ -120,6 +128,7 @@ impl StoreError {
             Self::AlreadyExists { .. } => StoreErrorCode::AlreadyExists,
             Self::RevisionConflict { .. } => StoreErrorCode::RevisionConflict,
             Self::RevisionOverflow => StoreErrorCode::RevisionOverflow,
+            Self::IdempotencyConflict => StoreErrorCode::IdempotencyConflict,
             Self::RecoveryRequired => StoreErrorCode::RecoveryRequired,
             Self::InvalidTransaction => StoreErrorCode::InvalidTransaction,
             Self::UnsupportedDurability { .. } => StoreErrorCode::UnsupportedDurability,
@@ -153,6 +162,8 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidLayout => formatter.write_str("invalid Jiandu store layout"),
             Self::UnsafePath => formatter.write_str("unsafe Jiandu store path"),
+            Self::Unauthenticated => formatter.write_str("trusted mutation identity is invalid"),
+            Self::Forbidden => formatter.write_str("mutation is not authorized"),
             Self::InvalidRequest => formatter.write_str("invalid Jiandu store request"),
             Self::InvalidRecord {
                 id: Some(id),
@@ -180,6 +191,9 @@ impl fmt::Display for StoreError {
                 current_revision.get()
             ),
             Self::RevisionOverflow => formatter.write_str("memory or store revision overflow"),
+            Self::IdempotencyConflict => {
+                formatter.write_str("idempotency key was reused for different input")
+            }
             Self::RecoveryRequired => formatter.write_str("store handle requires restart recovery"),
             Self::InvalidTransaction => formatter.write_str("invalid or ambiguous transaction"),
             Self::UnsupportedDurability { capability } => {

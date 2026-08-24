@@ -144,7 +144,13 @@ Input:
 }
 ```
 
-The service validates scope authority and content policy, then returns the created record. Repeating an identical request with the same idempotency key returns the original result. Reusing the key for different input returns `IDEMPOTENCY_CONFLICT`.
+The service validates current exact-scope authority and content policy, then
+returns the created record. Repeating an identical request with the same
+authenticated principal, operation, idempotency key, and canonical input
+returns the original result with `idempotentReplay: true`. Reusing the key for
+different canonical input returns `IDEMPOTENCY_CONFLICT` before a persistent
+write. Generated IDs, timestamps, and correlation metadata do not change retry
+identity.
 
 ### `memory_update`
 
@@ -177,6 +183,13 @@ The same tag or relation cannot appear in both `add` and `remove`; duplicate
 values and self-relations are invalid. `expectedRevision` is a positive integer.
 
 A stale revision returns `REVISION_CONFLICT` and current revision metadata without exposing an inaccessible record body.
+
+Receipt lookup occurs before record lookup and CAS, so retrying the exact
+successful update returns its original record/revision/ETag/store revision even
+though the supplied `expectedRevision` is now stale. Present authorization is
+still required on every retry. Exact replay lasts only while the private result
+artifact is retained; the explicit forget/hard-purge/receipt-GC lifecycle will
+define when that historical replay capability ends.
 
 ### `memory_forget`
 

@@ -1,7 +1,8 @@
 //! Deterministic startup reconciliation for interrupted store transactions.
 
 use crate::failpoint::Failpoints;
-use crate::layout::{self, StoreDirectory};
+use crate::idempotency::MutationArtifacts;
+use crate::layout::{self, FileIdentity, StoreDirectory};
 use crate::transaction::{self, TransactionIntent, TransactionManifest};
 use crate::{PersistenceBoundary, QuarantineReceipt, StoreError, StoreId, StoreMetadata};
 use std::ffi::OsStr;
@@ -157,6 +158,60 @@ fn recover_record(
     } else {
         MetadataState::Ambiguous
     };
+    if record.idempotency.is_none() {
+        return recover_legacy_record_state(
+            root,
+            manifest,
+            failpoints,
+            record_state,
+            metadata_state,
+        );
+    }
+    let published_artifact = mutation_artifact_published(root, record)?;
+    match (record_state, metadata_state) {
+        (RecordState::Base, MetadataState::Base) => {
+            if published_artifact {
+                return Err(StoreError::InvalidTransaction);
+            }
+            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_manifest(root, manifest, failpoints)?;
+            Ok(record.base_store_metadata.clone())
+        }
+        (RecordState::Target, MetadataState::Base) => {
+            let target = read_target_record(root, record)?;
+            let artifacts =
+                MutationArtifacts::from_record_intent(manifest.store_id.clone(), record, target)?;
+            complete_mutation_artifacts(root, manifest, &artifacts, failpoints)?;
+            recover_target_metadata(root, manifest, failpoints)?;
+            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_manifest(root, manifest, failpoints)?;
+            Ok(record.target_store_metadata.clone())
+        }
+        (RecordState::Target, MetadataState::Target) => {
+            let target = read_target_record(root, record)?;
+            let artifacts =
+                MutationArtifacts::from_record_intent(manifest.store_id.clone(), record, target)?;
+            complete_mutation_artifacts(root, manifest, &artifacts, failpoints)?;
+            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_manifest(root, manifest, failpoints)?;
+            Ok(record.target_store_metadata.clone())
+        }
+        (RecordState::Base, MetadataState::Target)
+        | (RecordState::Ambiguous, _)
+        | (_, MetadataState::Ambiguous) => Err(StoreError::InvalidTransaction),
+    }
+}
+
+fn recover_legacy_record_state(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    failpoints: &Failpoints,
+    record_state: RecordState,
+    metadata_state: MetadataState,
+) -> Result<StoreMetadata, StoreError> {
+    let TransactionIntent::Record(record) = &manifest.intent else {
+        return Err(StoreError::InvalidTransaction);
+    };
     match (record_state, metadata_state) {
         (RecordState::Base, MetadataState::Base) => {
             cleanup_record_temps(root, manifest, failpoints)?;
@@ -220,6 +275,239 @@ fn classify_record(
     Ok(RecordState::Ambiguous)
 }
 
+fn read_target_record(
+    root: &StoreDirectory,
+    record: &transaction::RecordTransaction,
+) -> Result<jiandu_core::MemoryRecord, StoreError> {
+    let relative = layout::record_relative_path(&record.scope, &record.memory_id);
+    let file = root
+        .try_open_regular(&relative, false)?
+        .ok_or(StoreError::InvalidTransaction)?;
+    let decoded = crate::CanonicalStore::read_record_file(
+        file,
+        &record.scope,
+        Some(&record.memory_id),
+        &layout::record_storage_key(&record.memory_id),
+        &layout::record_shard(&record.memory_id),
+    )?;
+    if decoded.revision != record.target_revision || decoded.etag != record.target_etag {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(decoded)
+}
+
+fn mutation_artifact_published(
+    root: &StoreDirectory,
+    record: &transaction::RecordTransaction,
+) -> Result<bool, StoreError> {
+    let idempotency = record
+        .idempotency
+        .as_ref()
+        .ok_or(StoreError::InvalidTransaction)?;
+    for relative in [
+        crate::idempotency::result_relative(&idempotency.binding.receipt_id)?,
+        crate::idempotency::receipt_relative_for_binding(&idempotency.binding)?,
+        crate::idempotency::audit_relative(idempotency.binding.audit_sequence)?,
+    ] {
+        if root.regular_file_exists(&relative)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Clone, Copy)]
+enum MutationArtifactKind {
+    Result,
+    Receipt,
+    Audit,
+}
+
+fn complete_mutation_artifacts(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    artifacts: &MutationArtifacts,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let TransactionIntent::Record(record) = &manifest.intent else {
+        return Err(StoreError::InvalidTransaction);
+    };
+    let binding = &record
+        .idempotency
+        .as_ref()
+        .ok_or(StoreError::InvalidTransaction)?
+        .binding;
+    for relative in [
+        crate::idempotency::result_relative(&binding.receipt_id)?,
+        crate::idempotency::receipt_relative_for_binding(binding)?,
+        crate::idempotency::audit_relative(binding.audit_sequence)?,
+    ] {
+        let parent = relative.parent().ok_or(StoreError::InvalidTransaction)?;
+        root.create_directory_all(parent)?;
+        // Recovery can recreate several previously unseen directory entries
+        // (principal, operation, and shard). Sync every ancestor, as the live
+        // mutation path does, before any reconstructed artifact can become
+        // committed by the metadata watermark.
+        transaction::sync_directory_chain(
+            root,
+            parent,
+            "sync recovered mutation artifact namespace",
+        )?;
+    }
+    failpoints.check(PersistenceBoundary::RecoveryIdempotencyNamespacePrepared)?;
+    for kind in [
+        MutationArtifactKind::Result,
+        MutationArtifactKind::Receipt,
+        MutationArtifactKind::Audit,
+    ] {
+        complete_mutation_artifact(root, manifest, artifacts, kind, failpoints)?;
+    }
+    Ok(())
+}
+
+fn complete_mutation_artifact(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    artifacts: &MutationArtifacts,
+    kind: MutationArtifactKind,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let TransactionIntent::Record(record) = &manifest.intent else {
+        return Err(StoreError::InvalidTransaction);
+    };
+    let binding = &record
+        .idempotency
+        .as_ref()
+        .ok_or(StoreError::InvalidTransaction)?
+        .binding;
+    let (staged, published) = match kind {
+        MutationArtifactKind::Result => (
+            crate::idempotency::result_temp_relative(binding)?,
+            crate::idempotency::result_relative(&binding.receipt_id)?,
+        ),
+        MutationArtifactKind::Receipt => (
+            crate::idempotency::receipt_temp_relative(binding)?,
+            crate::idempotency::receipt_relative_for_binding(binding)?,
+        ),
+        MutationArtifactKind::Audit => (
+            crate::idempotency::audit_temp_relative(binding)?,
+            crate::idempotency::audit_relative(binding.audit_sequence)?,
+        ),
+    };
+
+    if let Some(file) = root.try_open_regular(&published, false)? {
+        validate_mutation_artifact(file, artifacts, kind)?;
+        if root.remove_regular_file_if_exists(&staged)? {
+            transaction::sync_parent(root, &staged, "sync recovered artifact temp cleanup")?;
+        }
+    } else {
+        let staged_identity = if let Some(file) = root.try_open_regular(&staged, false)? {
+            validate_mutation_artifact(
+                file.try_clone()
+                    .map_err(|source| StoreError::io("clone staged mutation artifact", source))?,
+                artifacts,
+                kind,
+            )?;
+            FileIdentity::from_file(&file)?
+        } else {
+            match kind {
+                MutationArtifactKind::Result => transaction::stage_mutation_result(
+                    root,
+                    manifest,
+                    &artifacts.result_bytes,
+                    failpoints,
+                )?,
+                MutationArtifactKind::Receipt => transaction::stage_idempotency_receipt(
+                    root,
+                    manifest,
+                    &artifacts.receipt_bytes,
+                    failpoints,
+                )?,
+                MutationArtifactKind::Audit => transaction::stage_mutation_audit(
+                    root,
+                    manifest,
+                    &artifacts.audit_bytes,
+                    failpoints,
+                )?,
+            }
+        };
+        match kind {
+            MutationArtifactKind::Result => {
+                transaction::publish_mutation_result(root, manifest, staged_identity, failpoints)?
+            }
+            MutationArtifactKind::Receipt => transaction::publish_idempotency_receipt(
+                root,
+                manifest,
+                staged_identity,
+                failpoints,
+            )?,
+            MutationArtifactKind::Audit => {
+                transaction::publish_mutation_audit(root, manifest, staged_identity, failpoints)?
+            }
+        }
+    }
+
+    transaction::sync_parent(root, &published, "sync recovered mutation artifact")?;
+    failpoints.check(match kind {
+        MutationArtifactKind::Result => PersistenceBoundary::RecoveryMutationResultDirectorySynced,
+        MutationArtifactKind::Receipt => {
+            PersistenceBoundary::RecoveryMutationReceiptDirectorySynced
+        }
+        MutationArtifactKind::Audit => PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
+    })
+}
+
+fn validate_mutation_artifact(
+    file: std::fs::File,
+    artifacts: &MutationArtifacts,
+    kind: MutationArtifactKind,
+) -> Result<(), StoreError> {
+    StoreDirectory::validate_private_open_file(&file)?;
+    let digest_file = file
+        .try_clone()
+        .map_err(|source| StoreError::io("clone mutation artifact for digest", source))?;
+    let expected_digest = match kind {
+        MutationArtifactKind::Result => &artifacts.result_digest,
+        MutationArtifactKind::Receipt => &artifacts.receipt_digest,
+        MutationArtifactKind::Audit => &artifacts.audit_digest,
+    };
+    if transaction::raw_file_digest(digest_file)? != *expected_digest {
+        return Err(StoreError::InvalidTransaction);
+    }
+    match kind {
+        MutationArtifactKind::Result => {
+            let decoded = crate::idempotency::DurableMutationResult::decode(
+                file,
+                &artifacts.result.store_id,
+                &artifacts.result.binding,
+            )?;
+            (decoded == artifacts.result)
+                .then_some(())
+                .ok_or(StoreError::InvalidTransaction)
+        }
+        MutationArtifactKind::Receipt => {
+            let decoded = crate::idempotency::DurableIdempotencyReceipt::decode(
+                file,
+                &artifacts.receipt.store_id,
+                &artifacts.receipt.binding.receipt_id,
+            )?;
+            (decoded == artifacts.receipt)
+                .then_some(())
+                .ok_or(StoreError::InvalidTransaction)
+        }
+        MutationArtifactKind::Audit => {
+            let decoded = crate::idempotency::DurableAuditEvent::decode(
+                file,
+                &artifacts.audit.store_id,
+                artifacts.audit.binding.audit_sequence,
+            )?;
+            (decoded == artifacts.audit)
+                .then_some(())
+                .ok_or(StoreError::InvalidTransaction)
+        }
+    }
+}
+
 fn recover_target_metadata(
     root: &StoreDirectory,
     manifest: &TransactionManifest,
@@ -248,6 +536,29 @@ fn cleanup_record_temps(
     if root.remove_regular_file_if_exists(&metadata_temp)? {
         root.sync_root("sync recovery metadata temp cleanup")?;
         failpoints.check(PersistenceBoundary::RecoveryMetadataDirectorySynced)?;
+    }
+    if let TransactionIntent::Record(record) = &manifest.intent
+        && let Some(idempotency) = &record.idempotency
+    {
+        for (relative, boundary) in [
+            (
+                crate::idempotency::result_temp_relative(&idempotency.binding)?,
+                PersistenceBoundary::RecoveryMutationResultDirectorySynced,
+            ),
+            (
+                crate::idempotency::receipt_temp_relative(&idempotency.binding)?,
+                PersistenceBoundary::RecoveryMutationReceiptDirectorySynced,
+            ),
+            (
+                crate::idempotency::audit_temp_relative(&idempotency.binding)?,
+                PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
+            ),
+        ] {
+            if root.remove_regular_file_if_exists(&relative)? {
+                transaction::sync_parent(root, &relative, "sync recovery artifact temp cleanup")?;
+                failpoints.check(boundary)?;
+            }
+        }
     }
     Ok(())
 }
@@ -373,6 +684,9 @@ fn reject_orphan_metadata_temp(
     for entry in entries {
         let entry = entry.map_err(|source| StoreError::io("read store control entry", source))?;
         let name = entry.file_name();
+        if name == OsStr::new(layout::STORE_METADATA_MIGRATION_FILE) {
+            continue;
+        }
         let Some(name_string) = name.to_str() else {
             continue;
         };

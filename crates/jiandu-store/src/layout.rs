@@ -18,9 +18,32 @@ use std::cell::RefCell;
 
 pub(crate) const STORE_METADATA_FILE: &str = "store.json";
 pub(crate) const STORE_METADATA_INIT_FILE: &str = ".store.json.init";
+pub(crate) const STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha2.tmp";
 pub(crate) const STORE_LOCK_FILE: &str = "LOCK";
 pub(crate) const QUARANTINE_DIR: &str = "quarantine";
 pub(crate) const QUARANTINE_RECEIPTS_DIR: &str = "receipts/quarantine";
+pub(crate) const IDEMPOTENCY_RECEIPTS_DIR: &str = "receipts/idempotency/metadata";
+pub(crate) const IDEMPOTENCY_RESULTS_DIR: &str = "receipts/idempotency/results";
+pub(crate) const MUTATION_AUDIT_DIR: &str = "audit/mutations";
+pub(crate) const AUDIT_GENESIS_FILE: &str = "audit/genesis.json";
+pub(crate) const AUDIT_GENESIS_TEMP_FILE: &str = "audit/.genesis-v1alpha2.tmp";
+
+const LEGACY_REQUIRED_DIRECTORIES: &[&str] = &[
+    "records",
+    "records/principal",
+    "records/project",
+    "records/session",
+    "records/instance_global",
+    "lineages",
+    "tombstones",
+    "transactions",
+    "receipts",
+    QUARANTINE_RECEIPTS_DIR,
+    "audit",
+    "index",
+    QUARANTINE_DIR,
+    "backups",
+];
 
 const REQUIRED_DIRECTORIES: &[&str] = &[
     "records",
@@ -33,7 +56,11 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "transactions",
     "receipts",
     QUARANTINE_RECEIPTS_DIR,
+    "receipts/idempotency",
+    IDEMPOTENCY_RECEIPTS_DIR,
+    IDEMPOTENCY_RESULTS_DIR,
     "audit",
+    MUTATION_AUDIT_DIR,
     "index",
     QUARANTINE_DIR,
     "backups",
@@ -530,6 +557,8 @@ pub(crate) fn validate_initialization_state(root: &StoreDirectory) -> Result<(),
 
             if relative == Path::new(STORE_LOCK_FILE)
                 || relative == Path::new(STORE_METADATA_INIT_FILE)
+                || relative == Path::new(AUDIT_GENESIS_FILE)
+                || relative == Path::new(AUDIT_GENESIS_TEMP_FILE)
             {
                 if !metadata.is_file() || IdentityMetadataExt::nlink(&metadata) != 1 {
                     return Err(StoreError::UnsafePath);
@@ -578,6 +607,47 @@ pub(crate) fn validate_layout(root: &StoreDirectory) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+/// Validate the exact directory capabilities needed to recover a v1alpha1
+/// transaction before the v1alpha2 format marker is published.
+pub(crate) fn validate_legacy_layout(root: &StoreDirectory) -> Result<(), StoreError> {
+    for relative in LEGACY_REQUIRED_DIRECTORIES {
+        let relative = Path::new(relative);
+        if relative == Path::new(QUARANTINE_RECEIPTS_DIR) {
+            if let Some(directory) = root.try_open_directory(relative)? {
+                validate_private_directory_handle(&directory, StoreError::InvalidLayout)?;
+            }
+        } else {
+            root.validate_private_directory(relative)?;
+        }
+    }
+    Ok(())
+}
+
+/// Idempotently prepare and sync the fixed v1alpha2 receipt/result/audit
+/// namespaces while the exclusive root lock is held.
+pub(crate) fn ensure_v2_layout(root: &StoreDirectory) -> Result<(), StoreError> {
+    for relative in [
+        "receipts/idempotency",
+        IDEMPOTENCY_RECEIPTS_DIR,
+        IDEMPOTENCY_RESULTS_DIR,
+        MUTATION_AUDIT_DIR,
+    ] {
+        root.create_directory_all(Path::new(relative))?;
+        root.validate_private_directory(Path::new(relative))?;
+    }
+    for relative in [
+        MUTATION_AUDIT_DIR,
+        "audit",
+        IDEMPOTENCY_RESULTS_DIR,
+        IDEMPOTENCY_RECEIPTS_DIR,
+        "receipts/idempotency",
+        "receipts",
+    ] {
+        root.sync_directory(Path::new(relative), "sync v1alpha2 store layout")?;
+    }
+    root.sync_root("sync v1alpha2 store layout root")
 }
 
 /// Idempotently extend the original v1alpha1 layout with the namespaced
