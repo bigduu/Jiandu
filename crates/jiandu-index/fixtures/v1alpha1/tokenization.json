@@ -1,0 +1,30 @@
+{
+  "formatVersion": "jiandu.index.tokenizer-fixture/v1alpha1",
+  "cases": [
+    {
+      "name": "nfkc-and-lowercase",
+      "input": "Ｊｉａｎｄｕ Memory",
+      "tokens": ["jiandu", "memory"]
+    },
+    {
+      "name": "cjk-unigrams-and-bigrams",
+      "input": "项目记忆",
+      "tokens": ["项", "项目", "目", "目记", "记", "记忆", "忆"]
+    },
+    {
+      "name": "mixed-script-and-punctuation",
+      "input": "Latin-中文,テスト!",
+      "tokens": ["latin", "中", "中文", "文", "テ", "テス", "ス", "スト", "ト"]
+    },
+    {
+      "name": "punctuation-only",
+      "input": "  ——— !!! ",
+      "tokens": []
+    },
+    {
+      "name": "compatibility-and-canonical-composition",
+      "input": "① Café Straße",
+      "tokens": ["1", "café", "straße"]
+    }
+  ]
+}

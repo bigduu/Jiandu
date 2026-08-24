@@ -197,6 +197,17 @@ nonzero, linked, symlinked, partial, or foreign witnesses. Normal list scans
 skip only a syntactically valid witness after that readiness check. Descriptor
 truncation does not promise secure erasure of filesystem blocks or backups.
 
+`index/lexical.sqlite` is a private derived image, never an identity or source
+of truth. Its rows retain the public `MemorySummary` projection, exact
+scope/revision/ETag/update metadata, and deterministic weighted tokens derived
+from title, summary, body, tags, type, status, scope, and update metadata. It
+does not retain the raw body or provenance as an index row. The complete image
+is bound to canonical store ID/revision and a logical content checksum.
+Deleting the file loses no canonical data; the admin rebuild seam recreates it
+from a stable all-store snapshot. Normal search accepts only a private
+store-minted exact-scope query capability and cannot make index scope keys or
+paths part of the public API.
+
 ## Atomic idempotent mutation protocol
 
 The implemented #4/#17 create/update core follows one state machine:

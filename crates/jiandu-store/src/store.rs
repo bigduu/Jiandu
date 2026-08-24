@@ -8,6 +8,8 @@ use jiandu_core::{
     MemorySummary, PrincipalId, ProjectId, ScopeSelector, SessionId, StoreRevision, Timestamp,
     TrustedRequestContext, Validate,
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsStr;
@@ -71,6 +73,51 @@ impl AuthorizedScopes {
             MemoryScope::InstanceGlobal {} => self.instance_global,
         };
         allowed.then(|| AuthorizedScope(scope.clone()))
+    }
+
+    /// Resolve a bounded selector set into an unforgeable, read-only snapshot
+    /// capability. The opaque fingerprint binds both the selected scopes and
+    /// the complete current host authority, so a later authorization change
+    /// safely invalidates derived-search cursors.
+    pub fn authorize_index_query(
+        &self,
+        selectors: &[ScopeSelector],
+    ) -> Result<AuthorizedIndexQuery, StoreError> {
+        const MAX_SNAPSHOT_SCOPES: usize = 16;
+
+        if selectors.is_empty() || selectors.len() > MAX_SNAPSHOT_SCOPES {
+            return Err(StoreError::InvalidRequest);
+        }
+        let unique = selectors.iter().collect::<HashSet<_>>();
+        if unique.len() != selectors.len() {
+            return Err(StoreError::InvalidRequest);
+        }
+        let mut scopes = self.resolve_requested(selectors);
+        if scopes.len() != selectors.len() {
+            return Err(StoreError::Forbidden);
+        }
+        scopes.sort_by_key(scope_fingerprint_key);
+        let binding = SnapshotAuthorityBinding {
+            principal_id: &self.principal_id,
+            project_ids: &self.project_ids,
+            session_ids: &self.session_ids,
+            instance_global: self.instance_global,
+            selected_scopes: &scopes,
+        };
+        let bytes = serde_json::to_vec(&binding).map_err(|_| StoreError::InvalidRequest)?;
+        let authority_fingerprint =
+            lower_hex_digest(b"jiandu/authorized-index-query/authority/v1\0", &bytes);
+        let selector_bytes =
+            serde_json::to_vec(selectors).map_err(|_| StoreError::InvalidRequest)?;
+        let selector_fingerprint = lower_hex_digest(
+            b"jiandu/authorized-index-query/selectors/v1\0",
+            &selector_bytes,
+        );
+        Ok(AuthorizedIndexQuery {
+            scopes,
+            authority_fingerprint,
+            selector_fingerprint,
+        })
     }
 
     /// Authenticate and authorize one exact mutation scope before any private
@@ -181,6 +228,94 @@ impl AuthorizedScopes {
                 _ => None,
             })
             .collect()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotAuthorityBinding<'a> {
+    principal_id: &'a PrincipalId,
+    project_ids: &'a BTreeSet<ProjectId>,
+    session_ids: &'a BTreeSet<SessionId>,
+    instance_global: bool,
+    selected_scopes: &'a [MemoryScope],
+}
+
+fn scope_fingerprint_key(scope: &MemoryScope) -> String {
+    match scope {
+        MemoryScope::Principal { principal_id } => format!("0:{}", principal_id.as_str()),
+        MemoryScope::Project { project_id } => format!("1:{}", project_id.as_str()),
+        MemoryScope::Session { session_id } => format!("2:{}", session_id.as_str()),
+        MemoryScope::InstanceGlobal {} => "3:".to_owned(),
+    }
+}
+
+fn lower_hex_digest(domain: &[u8], value: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+/// Private-field proof of fresh lexical-query authority for an exact selector
+/// set. It contains no record bodies and cannot authorize a canonical scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedIndexQuery {
+    pub(crate) scopes: Vec<MemoryScope>,
+    pub(crate) authority_fingerprint: String,
+    selector_fingerprint: String,
+}
+
+impl AuthorizedIndexQuery {
+    /// Exact authoritative scopes selected for this query.
+    #[must_use]
+    pub fn scopes(&self) -> &[MemoryScope] {
+        &self.scopes
+    }
+
+    /// Opaque digest binding the full current authority and selected scopes.
+    #[must_use]
+    pub fn authority_fingerprint(&self) -> &str {
+        &self.authority_fingerprint
+    }
+
+    /// Whether this capability was minted for this exact model-visible scope
+    /// selector sequence. Query adapters use this to prevent accidentally
+    /// applying a broader capability to a narrower request.
+    #[must_use]
+    pub fn matches_selectors(&self, selectors: &[ScopeSelector]) -> bool {
+        serde_json::to_vec(selectors).is_ok_and(|bytes| {
+            lower_hex_digest(b"jiandu/authorized-index-query/selectors/v1\0", &bytes)
+                == self.selector_fingerprint
+        })
+    }
+}
+
+/// Complete path-free canonical records observed at one stable watermark for
+/// rebuilding a single all-store derived index. Construction requires the
+/// separate operator-only index capability.
+#[derive(Clone, PartialEq)]
+pub struct CanonicalIndexSnapshot {
+    pub store_id: StoreId,
+    pub store_revision: StoreRevision,
+    pub records: Vec<MemoryRecord>,
+}
+
+impl fmt::Debug for CanonicalIndexSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalIndexSnapshot")
+            .field("store_id", &self.store_id)
+            .field("store_revision", &self.store_revision)
+            .field("record_count", &self.records.len())
+            .finish_non_exhaustive()
     }
 }
 

@@ -1,0 +1,139 @@
+{
+  "fixtureFormatVersion": "jiandu.index.snapshot-fixture/v1alpha1",
+  "metadata": {
+    "formatVersion": "jiandu.index.lexical/v1alpha1",
+    "sourceStoreId": "00000000-0000-4000-8000-000000000006",
+    "sourceStoreRevision": 7,
+    "documentCount": 1,
+    "contentChecksum": "1f5ea5b1e707ae57ebe991540ac69fb228f1f148c240a26744a1358d93e889f9"
+  },
+  "documents": [
+    {
+      "summary": {
+        "id": "mem_fixture",
+        "revision": 1,
+        "etag": "etag-mem_fixture",
+        "scope": {
+          "kind": "principal",
+          "principalId": "prn_fixture"
+        },
+        "type": "decision",
+        "status": "active",
+        "title": "项目 Alpha",
+        "summary": "summary for mem_fixture",
+        "tags": [
+          "fixture",
+          "stable"
+        ],
+        "updatedAt": "2026-08-25T00:00:00Z"
+      },
+      "scopeKey": "principal:prn_fixture",
+      "terms": [
+        {
+          "token": "00",
+          "weight": 1
+        },
+        {
+          "token": "00z",
+          "weight": 1
+        },
+        {
+          "token": "08",
+          "weight": 1
+        },
+        {
+          "token": "1",
+          "weight": 1
+        },
+        {
+          "token": "2026",
+          "weight": 1
+        },
+        {
+          "token": "25t00",
+          "weight": 1
+        },
+        {
+          "token": "active",
+          "weight": 2
+        },
+        {
+          "token": "alpha",
+          "weight": 12
+        },
+        {
+          "token": "body",
+          "weight": 4
+        },
+        {
+          "token": "cjk",
+          "weight": 4
+        },
+        {
+          "token": "decision",
+          "weight": 2
+        },
+        {
+          "token": "deterministic",
+          "weight": 4
+        },
+        {
+          "token": "fixture",
+          "weight": 20
+        },
+        {
+          "token": "for",
+          "weight": 8
+        },
+        {
+          "token": "mem",
+          "weight": 8
+        },
+        {
+          "token": "principal",
+          "weight": 2
+        },
+        {
+          "token": "prn",
+          "weight": 2
+        },
+        {
+          "token": "revision",
+          "weight": 1
+        },
+        {
+          "token": "stable",
+          "weight": 10
+        },
+        {
+          "token": "summary",
+          "weight": 8
+        },
+        {
+          "token": "忆",
+          "weight": 4
+        },
+        {
+          "token": "目",
+          "weight": 12
+        },
+        {
+          "token": "记",
+          "weight": 4
+        },
+        {
+          "token": "记忆",
+          "weight": 4
+        },
+        {
+          "token": "项",
+          "weight": 12
+        },
+        {
+          "token": "项目",
+          "weight": 12
+        }
+      ]
+    }
+  ]
+}

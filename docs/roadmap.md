@@ -48,10 +48,13 @@ Outcome: one local process can safely own durable memory without a model or MCP 
 
 Tracking issue: [#6 — deterministic lexical retrieval and rebuild tooling](https://github.com/bigduu/Jiandu/issues/6)
 
-- Build a deterministic lexical index from canonical records.
-- Implement structured filters, stable ranking, and cursor pagination.
-- Track store watermarks and rebuild after corruption or version changes.
-- Add retrieval conformance and scope-leakage tests.
+- Build a deterministic lexical index from canonical records (done).
+- Implement structured filters, stable ranking, and authenticated cursor
+  pagination (done).
+- Track store watermarks and rebuild after missing/corrupt/version-mismatched
+  derived state (done).
+- Add retrieval conformance, cross-platform replacement, and scope-leakage
+  tests (done).
 
 Outcome: search is useful and rebuildable without making derived data authoritative.
 

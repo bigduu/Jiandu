@@ -27,11 +27,11 @@ pub use error::{InvalidRecordReason, StoreError, StoreErrorCode};
 pub use failpoint::{PersistenceBoundary, PersistenceFailpointInjector};
 pub use idempotency::MutationOperation;
 pub use inspection::{
-    AuthorizedExportAdmin, AuthorizedValidationAdmin, ExportDigest, PORTABLE_EXPORT_FORMAT_VERSION,
-    PORTABLE_TOMBSTONE_FORMAT_VERSION, PortableExportBundle, PortableMemoryRecord,
-    PortableProvenance, PortableTombstone, ReadOnlyStoreInspector, SnapshotWatermark,
-    VALIDATION_REPORT_FORMAT_VERSION, ValidationArtifact, ValidationCode, ValidationFinding,
-    ValidationMode, ValidationReport, generated_inspection_schemas,
+    AuthorizedExportAdmin, AuthorizedIndexAdmin, AuthorizedValidationAdmin, ExportDigest,
+    PORTABLE_EXPORT_FORMAT_VERSION, PORTABLE_TOMBSTONE_FORMAT_VERSION, PortableExportBundle,
+    PortableMemoryRecord, PortableProvenance, PortableTombstone, ReadOnlyStoreInspector,
+    SnapshotWatermark, VALIDATION_REPORT_FORMAT_VERSION, ValidationArtifact, ValidationCode,
+    ValidationFinding, ValidationMode, ValidationReport, generated_inspection_schemas,
 };
 pub use lock::{LockOwner, LockOwnerDiagnostics};
 pub use metadata::{AuditSequence, STORE_FORMAT_VERSION, StoreId, StoreMetadata};
@@ -43,8 +43,9 @@ pub use portable_import::{
     ImportScopeDecision, PortableImportResult, generated_import_schemas,
 };
 pub use store::{
-    AuthorizedAdmin, AuthorizedMutation, AuthorizedScope, AuthorizedScopes, CanonicalStore,
-    QuarantineReceipt, StoreOptions, StoreRead, StoreWatermark,
+    AuthorizedAdmin, AuthorizedIndexQuery, AuthorizedMutation, AuthorizedScope, AuthorizedScopes,
+    CanonicalIndexSnapshot, CanonicalStore, QuarantineReceipt, StoreOptions, StoreRead,
+    StoreWatermark,
 };
 pub use tombstone::{AdminAction, AdminActionPlan, AdminPlanTarget};
 

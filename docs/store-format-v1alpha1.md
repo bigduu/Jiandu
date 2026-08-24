@@ -102,7 +102,7 @@ redirecting reads into the replacement tree.
 ├── receipts/
 │   └── quarantine/
 ├── audit/
-├── index/
+├── index/lexical.sqlite       # derived v1alpha1 index; never canonical
 ├── quarantine/
 └── backups/
 ```
