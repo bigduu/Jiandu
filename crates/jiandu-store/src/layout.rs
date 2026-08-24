@@ -18,7 +18,8 @@ use std::cell::RefCell;
 
 pub(crate) const STORE_METADATA_FILE: &str = "store.json";
 pub(crate) const STORE_METADATA_INIT_FILE: &str = ".store.json.init";
-pub(crate) const STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha3.tmp";
+pub(crate) const STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha4.tmp";
+pub(crate) const V3_STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha3.tmp";
 pub(crate) const PREVIOUS_STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha2.tmp";
 pub(crate) const STORE_LOCK_FILE: &str = "LOCK";
 pub(crate) const QUARANTINE_DIR: &str = "quarantine";
@@ -29,6 +30,10 @@ pub(crate) const MUTATION_AUDIT_DIR: &str = "audit/mutations";
 pub(crate) const AUDIT_GENESIS_FILE: &str = "audit/genesis.json";
 pub(crate) const AUDIT_GENESIS_TEMP_FILE: &str = "audit/.genesis-v1alpha2.tmp";
 pub(crate) const TOMBSTONES_DIR: &str = "tombstones";
+pub(crate) const IMPORT_RECEIPTS_DIR: &str = "receipts/import/metadata";
+pub(crate) const IMPORT_RESULTS_DIR: &str = "receipts/import/results";
+pub(crate) const IMPORT_AUDIT_DIR: &str = "audit/imports";
+pub(crate) const IMPORT_BACKUPS_DIR: &str = "backups/imports";
 
 const TOMBSTONE_SCOPE_DIRECTORIES: &[&str] = &[
     "tombstones/principal",
@@ -75,7 +80,7 @@ const V2_REQUIRED_DIRECTORIES: &[&str] = &[
     "backups",
 ];
 
-const REQUIRED_DIRECTORIES: &[&str] = &[
+const V3_REQUIRED_DIRECTORIES: &[&str] = &[
     "records",
     "records/principal",
     "records/project",
@@ -98,6 +103,36 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "index",
     QUARANTINE_DIR,
     "backups",
+];
+
+const REQUIRED_DIRECTORIES: &[&str] = &[
+    "records",
+    "records/principal",
+    "records/project",
+    "records/session",
+    "records/instance_global",
+    "lineages",
+    TOMBSTONES_DIR,
+    "tombstones/principal",
+    "tombstones/project",
+    "tombstones/session",
+    "tombstones/instance_global",
+    "transactions",
+    "receipts",
+    QUARANTINE_RECEIPTS_DIR,
+    "receipts/idempotency",
+    IDEMPOTENCY_RECEIPTS_DIR,
+    IDEMPOTENCY_RESULTS_DIR,
+    "receipts/import",
+    IMPORT_RECEIPTS_DIR,
+    IMPORT_RESULTS_DIR,
+    "audit",
+    MUTATION_AUDIT_DIR,
+    IMPORT_AUDIT_DIR,
+    "index",
+    QUARANTINE_DIR,
+    "backups",
+    IMPORT_BACKUPS_DIR,
 ];
 
 #[cfg(test)]
@@ -440,6 +475,9 @@ impl StoreDirectory {
         let Some(file) = self.try_open_regular(relative, false)? else {
             return Ok(false);
         };
+        if !Self::has_single_link(&file)? {
+            return Ok(false);
+        }
         Ok(FileIdentity::from_file(&file)? == expected)
     }
 
@@ -452,6 +490,9 @@ impl StoreDirectory {
             return Ok(false);
         };
         Self::validate_private_open_file(&file)?;
+        if !Self::has_single_link(&file)? {
+            return Ok(false);
+        }
         Ok(FileIdentity::from_file(&file)? == expected)
     }
 
@@ -697,6 +738,12 @@ pub(crate) fn validate_v2_layout(root: &StoreDirectory) -> Result<(), StoreError
     validate_required_directories(root, V2_REQUIRED_DIRECTORIES)
 }
 
+/// Validate the v1alpha3 tombstone layout before recovering its WAL during
+/// the explicit v1alpha4 capability migration.
+pub(crate) fn validate_v3_layout(root: &StoreDirectory) -> Result<(), StoreError> {
+    validate_required_directories(root, V3_REQUIRED_DIRECTORIES)
+}
+
 /// Validate the exact directory capabilities needed to recover a v1alpha1
 /// transaction before the v1alpha2 format marker is published.
 pub(crate) fn validate_legacy_layout(root: &StoreDirectory) -> Result<(), StoreError> {
@@ -757,6 +804,34 @@ pub(crate) fn ensure_v3_layout(root: &StoreDirectory) -> Result<(), StoreError> 
     }
     root.sync_directory(Path::new(TOMBSTONES_DIR), "sync v1alpha3 tombstone root")?;
     root.sync_root("sync v1alpha3 store layout root")
+}
+
+/// Idempotently prepare and sync the private v1alpha4 import ledger and
+/// recovery-safe backup metadata namespaces while the root lock is held.
+pub(crate) fn ensure_v4_layout(root: &StoreDirectory) -> Result<(), StoreError> {
+    for relative in [
+        "receipts/import",
+        IMPORT_RECEIPTS_DIR,
+        IMPORT_RESULTS_DIR,
+        IMPORT_AUDIT_DIR,
+        IMPORT_BACKUPS_DIR,
+    ] {
+        root.create_directory_all(Path::new(relative))?;
+        root.validate_private_directory(Path::new(relative))?;
+    }
+    for relative in [
+        IMPORT_RESULTS_DIR,
+        IMPORT_RECEIPTS_DIR,
+        "receipts/import",
+        "receipts",
+        IMPORT_AUDIT_DIR,
+        "audit",
+        IMPORT_BACKUPS_DIR,
+        "backups",
+    ] {
+        root.sync_directory(Path::new(relative), "sync v1alpha4 import layout")?;
+    }
+    root.sync_root("sync v1alpha4 store layout root")
 }
 
 /// Idempotently extend the original v1alpha1 layout with the namespaced

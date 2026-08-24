@@ -57,7 +57,7 @@ separate grants:
 Write, forget, lifecycle-plan, or scoped-read authority does not imply either
 admin grant. These host/operator APIs are not model-visible MCP tool schemas.
 
-There is one deliberately narrow global check required by the `v1alpha3`
+There is one deliberately narrow global check required by the v3/v4
 non-resurrection invariant. Before any authorized candidate record body is
 opened, inspection performs a bounded traversal of tombstone namespace names
 and collects only domain-separated hashed memory storage keys. It checks strict
@@ -182,15 +182,18 @@ read. Exceeding a budget yields a deterministic safe report and refuses export.
 
 ## Compatibility and deferred work
 
-Adding these read-only formats does not change `jiandu.store/v1alpha3`, the
+Adding these read-only formats does not change the canonical store marker, the
 public memory API, or historical `v1alpha1`/`v1alpha2`/`v1alpha3` fixtures. A
 reader must match the exact format identifiers and strict canonical bytes;
 future fields require a new export/report version rather than being silently
-ignored. The checked fixtures exercise both provenance representations
+ignored. The strict source-store field accepts supported v3 and v4 producers;
+the checked v3 fixture bytes remain unchanged. The checked fixtures exercise both provenance representations
 (`messageIds` and `messageRange`), multiple records/scopes, canonical ordering,
 one protected tombstone, restart stability, and strict decode.
 
-Committed import, backup manifests, remote backup, restore/hard-purge execution,
-receipt retirement, CLI/MCP transport, indexes/search, filesystem watchers, and
-Bamboo mapping are separate issues. This bundle grants no import, resurrection,
-scope reassignment, or deletion authority.
+Committed import and receipt-bound backup metadata are specified separately in
+[Portable Import and Backup Metadata `v1alpha1`](portable-import-v1alpha1.md).
+Remote backup, restore/hard-purge execution, receipt retirement, CLI/MCP
+transport, indexes/search, filesystem watchers, and Bamboo mapping remain
+separate issues. This bundle itself grants no import, resurrection, scope
+reassignment, or deletion authority.

@@ -1,10 +1,12 @@
 # Canonical Store Format `v1alpha1`
 
-> Historical compatibility source: new stores use
-> [`jiandu.store/v1alpha2`](store-format-v1alpha2.md), followed by the current
-> [`jiandu.store/v1alpha3`](store-format-v1alpha3.md). This document remains
-> authoritative for validating and recovering the legacy state before the
-> explicit migration publishes its capability gate.
+> Historical compatibility source: `v1alpha2` succeeded this format,
+> [`jiandu.store/v1alpha3`](store-format-v1alpha3.md) is the historical
+> forget/tombstone format, and
+> [`jiandu.store/v1alpha4`](store-format-v1alpha4.md) is the current writer
+> format. This document remains authoritative for validating and recovering
+> the legacy state before the explicit migration publishes its capability
+> gate.
 
 This document commits the on-disk compatibility boundary implemented by
 `jiandu-store`. Paths described here are private implementation details: MCP

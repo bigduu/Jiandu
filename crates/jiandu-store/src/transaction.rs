@@ -13,12 +13,14 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub(crate) const TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha3";
+pub(crate) const TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha4";
+pub(crate) const V3_TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha3";
 pub(crate) const PREVIOUS_TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha2";
 pub(crate) const LEGACY_TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha1";
 pub(crate) const QUARANTINE_RECEIPT_FORMAT_VERSION: &str =
     "jiandu.store.quarantine-receipt/v1alpha1";
 const MAX_TRANSACTION_BYTES: usize = 65_536;
+const MAX_IMPORT_TRANSACTION_BYTES: usize = 262_144;
 const SHA256_ETAG_LENGTH: usize = 71;
 const SHA256_DIGEST_LENGTH: usize = 71;
 
@@ -77,6 +79,7 @@ pub(crate) struct QuarantineTransaction {
 pub(crate) enum TransactionIntent {
     Record(Box<RecordTransaction>),
     Forget(Box<ForgetTransaction>),
+    Import(Box<crate::portable_import::ImportTransaction>),
     Quarantine(QuarantineTransaction),
 }
 
@@ -136,9 +139,24 @@ impl TransactionManifest {
         Ok(manifest)
     }
 
+    pub(crate) fn for_import(
+        store_id: StoreId,
+        transaction_id: String,
+        transaction: crate::portable_import::ImportTransaction,
+    ) -> Result<Self, StoreError> {
+        let manifest = Self {
+            format_version: TRANSACTION_FORMAT_VERSION.to_owned(),
+            transaction_id,
+            store_id,
+            intent: TransactionIntent::Import(Box::new(transaction)),
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
         self.validate()?;
-        canonical_json(self)
+        canonical_json_bounded(self, self.maximum_bytes())
     }
 
     pub(crate) fn decode(
@@ -146,11 +164,12 @@ impl TransactionManifest {
         expected_transaction_id: &str,
         expected_store_id: &StoreId,
     ) -> Result<Self, StoreError> {
-        let bytes = read_bounded(file)?;
+        let bytes = read_bounded(file, MAX_IMPORT_TRANSACTION_BYTES)?;
         let manifest: Self =
             serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidTransaction)?;
         manifest.validate()?;
-        if manifest.transaction_id != expected_transaction_id
+        if bytes.len() > manifest.maximum_bytes()
+            || manifest.transaction_id != expected_transaction_id
             || &manifest.store_id != expected_store_id
             || manifest.canonical_bytes()? != bytes
         {
@@ -159,10 +178,21 @@ impl TransactionManifest {
         Ok(manifest)
     }
 
+    fn maximum_bytes(&self) -> usize {
+        if matches!(self.intent, TransactionIntent::Import(_))
+            && self.format_version == TRANSACTION_FORMAT_VERSION
+        {
+            MAX_IMPORT_TRANSACTION_BYTES
+        } else {
+            MAX_TRANSACTION_BYTES
+        }
+    }
+
     fn validate(&self) -> Result<(), StoreError> {
         if !matches!(
             self.format_version.as_str(),
             TRANSACTION_FORMAT_VERSION
+                | V3_TRANSACTION_FORMAT_VERSION
                 | PREVIOUS_TRANSACTION_FORMAT_VERSION
                 | LEGACY_TRANSACTION_FORMAT_VERSION
         ) || !valid_transaction_id(&self.transaction_id)
@@ -175,6 +205,14 @@ impl TransactionManifest {
             }
             TransactionIntent::Forget(forget) => {
                 forget.validate(&self.store_id, &self.format_version, &self.transaction_id)
+            }
+            TransactionIntent::Import(import) => {
+                crate::portable_import::validate_import_transaction(
+                    import,
+                    &self.store_id,
+                    &self.transaction_id,
+                    &self.format_version,
+                )
             }
             TransactionIntent::Quarantine(quarantine) => quarantine.validate(),
         }
@@ -214,6 +252,7 @@ impl RecordTransaction {
         let expected_store_format = match manifest_format {
             LEGACY_TRANSACTION_FORMAT_VERSION => crate::metadata::LEGACY_STORE_FORMAT_VERSION,
             PREVIOUS_TRANSACTION_FORMAT_VERSION => crate::metadata::PREVIOUS_STORE_FORMAT_VERSION,
+            V3_TRANSACTION_FORMAT_VERSION => crate::metadata::V3_STORE_FORMAT_VERSION,
             TRANSACTION_FORMAT_VERSION => crate::STORE_FORMAT_VERSION,
             _ => return Err(StoreError::InvalidTransaction),
         };
@@ -265,9 +304,13 @@ impl ForgetTransaction {
         manifest_format: &str,
         transaction_id: &str,
     ) -> Result<(), StoreError> {
-        if manifest_format != TRANSACTION_FORMAT_VERSION
-            || self.base_store_metadata.format_version != crate::STORE_FORMAT_VERSION
-            || self.target_store_metadata.format_version != crate::STORE_FORMAT_VERSION
+        let expected_store_format = match manifest_format {
+            V3_TRANSACTION_FORMAT_VERSION => crate::metadata::V3_STORE_FORMAT_VERSION,
+            TRANSACTION_FORMAT_VERSION => crate::STORE_FORMAT_VERSION,
+            _ => return Err(StoreError::InvalidTransaction),
+        };
+        if self.base_store_metadata.format_version != expected_store_format
+            || self.target_store_metadata.format_version != expected_store_format
             || &self.base_store_metadata.store_id != store_id
             || &self.target_store_metadata.store_id != store_id
             || self.base_store_metadata.created_at != self.target_store_metadata.created_at
@@ -367,7 +410,7 @@ impl DurableQuarantineReceipt {
         expected_transaction_id: &str,
         expected_store_id: &StoreId,
     ) -> Result<Self, StoreError> {
-        let bytes = read_bounded(file)?;
+        let bytes = read_bounded(file, MAX_TRANSACTION_BYTES)?;
         let receipt: Self =
             serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidTransaction)?;
         receipt.validate()?;
@@ -420,25 +463,29 @@ pub(crate) fn valid_content_digest(value: &str) -> bool {
 }
 
 fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>, StoreError> {
+    canonical_json_bounded(value, MAX_TRANSACTION_BYTES)
+}
+
+fn canonical_json_bounded(value: &impl Serialize, maximum: usize) -> Result<Vec<u8>, StoreError> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| StoreError::InvalidTransaction)?;
     bytes.push(b'\n');
-    if bytes.len() > MAX_TRANSACTION_BYTES {
+    if bytes.len() > maximum {
         return Err(StoreError::InvalidTransaction);
     }
     Ok(bytes)
 }
 
-fn read_bounded(file: File) -> Result<Vec<u8>, StoreError> {
+fn read_bounded(file: File, maximum: usize) -> Result<Vec<u8>, StoreError> {
     if file
         .metadata()
         .map_err(|source| StoreError::io("inspect transaction file", source))?
         .len()
-        > MAX_TRANSACTION_BYTES as u64
+        > maximum as u64
     {
         return Err(StoreError::InvalidTransaction);
     }
     let mut bytes = Vec::new();
-    file.take((MAX_TRANSACTION_BYTES + 1) as u64)
+    file.take((maximum + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|source| StoreError::io("read transaction file", source))?;
     Ok(bytes)
@@ -464,6 +511,7 @@ pub(crate) fn record_relative(manifest: &TransactionManifest) -> Result<PathBuf,
             &forget.scope,
             &forget.memory_id,
         )),
+        TransactionIntent::Import(_) => Err(StoreError::InvalidTransaction),
         TransactionIntent::Quarantine(_) => Err(StoreError::InvalidTransaction),
     }
 }
@@ -990,13 +1038,13 @@ pub(crate) fn publish_metadata(
 }
 
 #[derive(Clone, Copy)]
-struct ArtifactPublication {
-    published_boundary: PersistenceBoundary,
-    synced_boundary: PersistenceBoundary,
-    sync_operation: &'static str,
+pub(crate) struct ArtifactPublication {
+    pub(crate) published_boundary: PersistenceBoundary,
+    pub(crate) synced_boundary: PersistenceBoundary,
+    pub(crate) sync_operation: &'static str,
 }
 
-fn publish_new_artifact(
+pub(crate) fn publish_new_artifact(
     root: &StoreDirectory,
     staged: &Path,
     target: &Path,
@@ -1025,6 +1073,7 @@ pub(crate) fn mutation_idempotency(
             .as_ref()
             .ok_or(StoreError::InvalidTransaction),
         TransactionIntent::Forget(forget) => Ok(&forget.idempotency),
+        TransactionIntent::Import(_) => Err(StoreError::InvalidTransaction),
         TransactionIntent::Quarantine(_) => Err(StoreError::InvalidTransaction),
     }
 }
@@ -1035,6 +1084,7 @@ pub(crate) fn target_store_metadata(
     match &manifest.intent {
         TransactionIntent::Record(record) => Ok(&record.target_store_metadata),
         TransactionIntent::Forget(forget) => Ok(&forget.target_store_metadata),
+        TransactionIntent::Import(import) => Ok(&import.target_store_metadata),
         TransactionIntent::Quarantine(_) => Err(StoreError::InvalidTransaction),
     }
 }
@@ -1115,16 +1165,16 @@ pub(crate) fn raw_file_digest(mut file: File) -> Result<String, StoreError> {
 }
 
 #[derive(Clone, Copy)]
-struct FilePersistence {
-    write_operation: &'static str,
-    sync_operation: &'static str,
-    directory_operation: &'static str,
-    written: PersistenceBoundary,
-    synced: PersistenceBoundary,
-    directory_synced: PersistenceBoundary,
+pub(crate) struct FilePersistence {
+    pub(crate) write_operation: &'static str,
+    pub(crate) sync_operation: &'static str,
+    pub(crate) directory_operation: &'static str,
+    pub(crate) written: PersistenceBoundary,
+    pub(crate) synced: PersistenceBoundary,
+    pub(crate) directory_synced: PersistenceBoundary,
 }
 
-fn write_new_file(
+pub(crate) fn write_new_file(
     root: &StoreDirectory,
     relative: &Path,
     bytes: &[u8],

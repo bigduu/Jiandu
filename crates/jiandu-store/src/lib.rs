@@ -16,6 +16,7 @@ mod layout;
 mod lock;
 mod metadata;
 mod mutation;
+mod portable_import;
 mod recovery;
 mod store;
 mod tombstone;
@@ -35,6 +36,12 @@ pub use inspection::{
 pub use lock::{LockOwner, LockOwnerDiagnostics};
 pub use metadata::{AuditSequence, STORE_FORMAT_VERSION, StoreId, StoreMetadata};
 pub use mutation::{ForgetCommit, MutationCommit};
+pub use portable_import::{
+    AuthorizedBackupMetadata, BACKUP_METADATA_FORMAT_VERSION, BackupMetadata,
+    IMPORT_PLAN_FORMAT_VERSION, IMPORT_RESULT_FORMAT_VERSION, ImportClassification, ImportCommit,
+    ImportDigest, ImportDryRunPlan, ImportItemKind, ImportPlanCounts, ImportPlanEntry,
+    ImportScopeDecision, PortableImportResult, generated_import_schemas,
+};
 pub use store::{
     AuthorizedAdmin, AuthorizedMutation, AuthorizedScope, AuthorizedScopes, CanonicalStore,
     QuarantineReceipt, StoreOptions, StoreRead, StoreWatermark,

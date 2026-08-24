@@ -25,7 +25,7 @@ Tracking issues:
   - [#17 — durable create/update idempotency and audit](https://github.com/bigduu/Jiandu/issues/17)
   - [#18 — idempotent forget and protected tombstones](https://github.com/bigduu/Jiandu/issues/18) — implemented in the canonical store core
   - [#19 — deterministic validation and portable export](https://github.com/bigduu/Jiandu/issues/19) — implemented in the canonical store core
-  - [#20 — committed import and recovery-safe backup metadata](https://github.com/bigduu/Jiandu/issues/20)
+  - [#20 — committed import and recovery-safe backup metadata](https://github.com/bigduu/Jiandu/issues/20) — implemented in the canonical store core
 
 - Implement data-directory initialization and exclusive ownership.
 - Add canonical record serialization, validation, and scope-safe paths.
@@ -36,10 +36,11 @@ Tracking issues:
 - Add independently authorized idempotent forget/protected tombstones with a
   descriptor-erased, ledger-bound zero-length witness (done),
   followed by bounded read-only validation and deterministic authorized
-  portable export (done); keep import and backup behavior in their separate
-  consistency slices.
-- Implement committed import, recovery-safe backup metadata, and their
-  migration hooks in #20.
+  portable export (done), followed by deterministic import planning,
+  all-or-none committed import, and receipt-bound recovery-safe backup metadata
+  (done).
+- Preserve the explicit v3-to-v4 capability migration and strict import/backup
+  schemas, fixtures, failpoint recovery, and authority tests delivered in #20.
 
 Outcome: one local process can safely own durable memory without a model or MCP transport.
 

@@ -242,7 +242,7 @@ decode another tenant's record/tombstone content. Before reading an authorized
 candidate body it does one bounded global tombstone namespace pass that
 collects only hashed storage keys. It checks strict names and filesystem
 type/link/permission metadata without opening the file. This narrow,
-non-decoding check is required by the `v1alpha3`
+non-decoding check is required by the `v1alpha3`/`v1alpha4`
 cross-scope non-resurrection rule; it exposes no unauthorized tombstone
 scope/metadata/count and cannot add one to a report or bundle.
 
@@ -261,6 +261,30 @@ Authorized public record fields remain exact user content and are not a
 path- or credential-redaction boundary. Exact formats, stable finding codes,
 snapshot/read-only coordination, schemas, and compatibility rules are defined
 in [Validation Report and Portable Export `v1alpha1`](portable-export-v1alpha1.md).
+
+## Host/operator portable import and backup metadata
+
+Issue #20 is implemented at the canonical-store Rust boundary and adds no
+model-visible MCP request schema. A host passes strict portable-export bytes to
+a deterministic zero-write planner with fresh exact-scope authority and
+independent `memory:import:{scope-kind}` grants. Commit accepts only the same
+fully committable plan, rechecks every scope, and uses one bounded
+metadata-last v4 WAL for all records/tombstones plus body-free backup metadata,
+result, receipt, and audit.
+
+Idempotency identity is trusted principal plus a digest of the raw key;
+fingerprinting binds exact canonical source and plan input. Authorization and
+exact replay lookup precede target conflict checks. An acknowledgement-loss
+retry returns the original result/backup metadata without a second audit;
+conflicting reuse or missing scope authority writes nothing.
+
+Backup metadata is readable only through the distinct host grant
+`memory:admin:backup_metadata`. It is receipt/audit-bound recovery information,
+not the portable bundle, a remote backup, a scheduled job, or a model tool.
+The current slice has no import/backup MCP tool, CLI transport, upload, restore,
+or retention executor. See
+[Portable Import and Backup Metadata `v1alpha1`](portable-import-v1alpha1.md)
+and [Canonical Store Format `v1alpha4`](store-format-v1alpha4.md).
 
 ## MCP resources
 

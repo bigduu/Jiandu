@@ -778,6 +778,7 @@ pub(crate) enum LedgerIssue {
     Receipt,
     Result,
     Audit,
+    Backup,
     Tombstone,
     Witness,
     Limit,
@@ -826,13 +827,21 @@ pub(crate) fn inspect_ledger(
             return issues;
         }
     };
-    let expected_count = usize::try_from(metadata.audit_sequence.0).unwrap_or(usize::MAX);
-    if receipts.len() != expected_count {
-        issues.insert(LedgerIssue::Receipt);
-    }
+    let import_ledger = match crate::portable_import::inspect_import_ledger(root, metadata, budget)
+    {
+        Ok(inspection) => inspection,
+        Err((issue, error)) => {
+            issues.insert(issue);
+            record_unsafe_issue(&mut issues, &error);
+            if budget.exceeded() {
+                issues.insert(LedgerIssue::Limit);
+            }
+            return issues;
+        }
+    };
 
     let mut expected_results = BTreeSet::new();
-    let mut expected_tombstones = BTreeSet::new();
+    let mut expected_tombstones = import_ledger.tombstone_paths;
     let mut expected_witnesses = BTreeSet::new();
     let mut receipts_by_sequence = BTreeMap::new();
     for receipt in receipts {
@@ -882,7 +891,7 @@ pub(crate) fn inspect_ledger(
                 Some(DurableMutationResult::Record(_)),
             ) => {}
             (MutationOperation::Forget, Some(DurableMutationResult::Forget(result)))
-                if metadata.format_version == crate::STORE_FORMAT_VERSION =>
+                if supports_tombstones(&metadata.format_version) =>
             {
                 let tombstone = match crate::tombstone::read_exact_bounded(
                     root,
@@ -951,6 +960,24 @@ pub(crate) fn inspect_ledger(
         expected_results.insert(result_path);
     }
 
+    let mutation_sequences = receipts_by_sequence
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if mutation_sequences
+        .intersection(&import_ledger.sequences)
+        .next()
+        .is_some()
+        || !validate_combined_audit_sequences(
+            metadata.audit_sequence,
+            &mutation_sequences,
+            &import_ledger.sequences,
+        )
+    {
+        issues.insert(LedgerIssue::Audit);
+        issues.insert(LedgerIssue::Receipt);
+    }
+
     if let Err(error) = validate_result_namespace(root, &expected_results, budget) {
         issues.insert(LedgerIssue::Result);
         record_unsafe_issue(&mut issues, &error);
@@ -959,7 +986,7 @@ pub(crate) fn inspect_ledger(
         issues.insert(LedgerIssue::Audit);
         record_unsafe_issue(&mut issues, &error);
     }
-    if metadata.format_version == crate::STORE_FORMAT_VERSION
+    if supports_tombstones(&metadata.format_version)
         && let Err(error) =
             validate_tombstone_namespace(root, metadata, &expected_tombstones, budget)
     {
@@ -1002,7 +1029,7 @@ fn read_all_receipts(
             let operation = match operation_name.to_str() {
                 Some("create") => MutationOperation::Create,
                 Some("update") => MutationOperation::Update,
-                Some("forget") if metadata.format_version == crate::STORE_FORMAT_VERSION => {
+                Some("forget") if supports_tombstones(&metadata.format_version) => {
                     MutationOperation::Forget
                 }
                 _ => return Err(StoreError::InvalidTransaction),
@@ -1044,6 +1071,13 @@ fn read_all_receipts(
         }
     }
     Ok(receipts)
+}
+
+fn supports_tombstones(format: &str) -> bool {
+    matches!(
+        format,
+        crate::STORE_FORMAT_VERSION | crate::metadata::V3_STORE_FORMAT_VERSION
+    )
 }
 
 fn validate_tombstone_namespace(
@@ -1298,25 +1332,40 @@ fn validate_audit_namespace(
             return Err(StoreError::InvalidTransaction);
         }
     }
-    let expected_len =
-        usize::try_from(metadata.audit_sequence.0).map_err(|_| StoreError::InvalidTransaction)?;
-    if observed.len() != expected_len {
-        return Err(StoreError::InvalidTransaction);
-    }
-    let mut previous = 0_u64;
-    for sequence in observed {
-        if sequence.0 != previous.saturating_add(1) {
-            return Err(StoreError::InvalidTransaction);
-        }
-        previous = sequence.0;
-    }
-    if previous != metadata.audit_sequence.0 {
+    if observed.len() != receipts.len()
+        || observed
+            .iter()
+            .zip(receipts.keys())
+            .any(|(observed, expected)| observed != expected)
+    {
         return Err(StoreError::InvalidTransaction);
     }
     Ok(())
 }
 
-fn entry_names(
+fn validate_combined_audit_sequences(
+    watermark: AuditSequence,
+    mutation: &BTreeSet<AuditSequence>,
+    import: &BTreeSet<AuditSequence>,
+) -> bool {
+    let expected_len = usize::try_from(watermark.0).unwrap_or(usize::MAX);
+    if mutation.len().checked_add(import.len()) != Some(expected_len) {
+        return false;
+    }
+    let mut previous = 0_u64;
+    for sequence in mutation.union(import) {
+        let Some(expected) = previous.checked_add(1) else {
+            return false;
+        };
+        if sequence.0 != expected {
+            return false;
+        }
+        previous = sequence.0;
+    }
+    previous == watermark.0
+}
+
+pub(crate) fn entry_names(
     directory: &cap_std::fs::Dir,
     operation: &'static str,
     budget: &mut impl LedgerScanBudget,
@@ -1340,7 +1389,10 @@ fn entry_names(
     Ok(names)
 }
 
-fn charge_file(file: &File, budget: &mut impl LedgerScanBudget) -> Result<(), StoreError> {
+pub(crate) fn charge_file(
+    file: &File,
+    budget: &mut impl LedgerScanBudget,
+) -> Result<(), StoreError> {
     let length = file
         .metadata()
         .map_err(|source| StoreError::io("inspect bounded ledger artifact", source))?

@@ -69,7 +69,8 @@ The store is the source of truth. It provides:
 - tombstones and audit entries;
 - bounded side-effect-free validation and deterministic authorized portable
   export; and
-- explicit import and backup seams in later consistency slices.
+- deterministic import planning, all-or-none batch import, and receipt-bound
+  recovery-safe backup metadata.
 
 Human inspection is supported. Direct mutation is not part of the public consistency contract; changes should go through MCP or the administrative CLI.
 
@@ -117,7 +118,7 @@ replacement, unsupported export source, or a bounded validation finding
 refuses export rather than producing a normalized or mixed bundle.
 
 Scoped inspection traverses and decodes record/tombstone contents only beneath
-explicitly authorized owner segments. To preserve the `v1alpha3` global
+explicitly authorized owner segments. To preserve the v3/v4 global
 non-resurrection guarantee, it separately performs one bounded, namespace-only
 collection of domain-separated tombstone storage keys before opening any
 authorized candidate body. That pass checks strict entry names and filesystem
@@ -129,6 +130,34 @@ bound, and compatibility rules are specified in
 Private replay/audit/witness artifacts cannot be safely partitioned by memory
 scope, so scoped inspection never traverses that ledger; its exact invariants
 are checked only by the admin whole-store mode.
+
+### Portable import and backup metadata
+
+Portable import is a host/operator store API, not a model-visible MCP tool. It
+strictly decodes the portable bundle before write and produces a deterministic,
+side-effect-free plan from fresh exact-scope capabilities plus independent
+`memory:import:*` grants. The plan classifies accepted, conflicting,
+unauthorized, tombstone-protected, and oversized-invalid items without creating
+a manifest or changing a watermark. Commit rechecks the plan and authority and
+admits only a bounded, fully committable batch.
+
+The v4 batch WAL stages every canonical record/tombstone and the body-free
+backup/result/receipt/audit artifacts on their final filesystems, publishes all
+targets, and advances `store.json` last. Any post-WAL failure poisons the live
+handle. Startup either removes safe pre-publication staging and returns to the
+old store, completes an exact published prefix, or fails closed; no partial
+batch is serviceable. Principal/key/request digests provide exact retry before
+fresh target conflict checks, so acknowledgement loss replays the original
+result and backup metadata without another audit sequence.
+
+Backup metadata is not a fallible callback or self-authorizing standalone
+file. It is persisted and exact-set-bound by the same receipt/audit transaction,
+returned in `ImportCommit`, and readable only through a separate
+`memory:admin:backup_metadata` host capability with full ledger/file-identity
+revalidation. Exact public codecs, bounds, privacy, and compatibility are in
+[Portable Import and Backup Metadata `v1alpha1`](portable-import-v1alpha1.md);
+layout, recovery, and migration are in
+[Canonical Store Format `v1alpha4`](store-format-v1alpha4.md).
 
 ## Integration flows
 
@@ -178,9 +207,9 @@ On startup, Jiandu:
 2. acquires an exclusive lock and records instance metadata;
 3. checks the store format and deterministically completes or rolls back the
    single interrupted transaction, failing closed on ambiguous state;
-4. validates the exact receipt/result/audit/tombstone/logical-erasure-witness
-   ledger against its independent audit watermark and rejects malformed,
-   missing, foreign, or resurrected identities;
+4. validates the exact mutation/import receipt/result/audit/backup/tombstone/
+   logical-erasure-witness ledger against its independent audit watermark and
+   rejects malformed, missing, foreign, or resurrected identities;
 5. probes required file-sync and same-filesystem atomic-replace behavior and
    fails closed if the filesystem cannot provide it;
 6. validates index compatibility and schedules a rebuild if needed;
@@ -190,25 +219,28 @@ On startup, Jiandu:
 The implemented canonical mutation core gives every create/update success a monotonically
 increasing record revision and content-bound opaque ETag, and every committed
 create/update/forget one new store watermark, one durable receipt/private
-result, and one sequence-addressed audit
-event. The host authenticates and authorizes an exact operation/scope before
+result, and one sequence-addressed audit event; each committed portable-import
+batch likewise advances target metadata and audit sequence exactly once. The
+host authenticates and authorizes an exact operation/scope before
 private receipt lookup. Identical principal/operation/key/input retries return
 the original success even after disconnect/restart and advance no watermark;
 conflicting reuse fails before record lookup, CAS, or a write. Updates with a
 stale expected revision otherwise fail without overwriting newer data and
 disclose only the current revision.
 
-Record/tombstone, result, receipt, audit, and metadata are one pre-acknowledgement WAL
-transaction with metadata published last. Startup can rebuild missing
+Record/tombstone, backup metadata, result, receipt, audit, and metadata are one
+pre-acknowledgement WAL transaction with metadata published last. Startup can rebuild missing
 artifacts only from an exact target record and strict digest-bound intent. It
 never guesses. Forget publishes and syncs its tombstone before renaming the
 held canonical record to a private witness, truncating that held descriptor to
 zero, syncing it, and retaining the verified zero-length witness; it then
 commits body-free artifacts and metadata last. This is logical erasure, not a
 claim that prior physical blocks or backups were securely erased. The explicit
-`v1alpha2` to `v1alpha3` migration first recovers a
-v2 WAL and validates its ledger, prepares/syncs tombstone layout, then publishes
-the new store-format capability gate last so old writers fail closed.
+`v1alpha2` to `v1alpha3` migration first recovers a v2 WAL and validates its
+ledger, prepares/syncs tombstone layout, then publishes the new store-format
+capability gate last. The explicit v3-to-v4 migration similarly recovers and
+validates the v3 store before syncing import-ledger layout and publishing v4
+metadata last, so older writers fail closed.
 
 Shutdown stops accepting new mutations, drains bounded in-flight work, and
 releases the store lock. No fallible post-commit receipt callback exists:

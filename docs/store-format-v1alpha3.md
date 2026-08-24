@@ -1,5 +1,9 @@
 # Canonical Store Format `v1alpha3`
 
+> Historical contract: [`jiandu.store/v1alpha4`](store-format-v1alpha4.md) is
+> the current writer format. This document and its checked fixtures remain the
+> immutable forget/tombstone and `v1alpha3` migration-source contract.
+
 `jiandu.store/v1alpha3` adds ordinary, idempotent single-record forget and
 protected tombstones to the receipt/audit guarantees of
 [`v1alpha2`](store-format-v1alpha2.md). Record/frontmatter and public API schema
@@ -161,8 +165,8 @@ tombstone-key set once and filters candidates before opening or decoding a
 `.md` body, including when the tombstone is outside the caller's allowed
 scopes. Create checks protected IDs globally and returns ordinary `NotFound`;
 update also returns `NotFound`. Neither can implicitly resurrect or change
-tombstone scope authority. Import is a later slice and must honor the same
-rule.
+tombstone scope authority. The v4 successor's import protocol honors the same
+rule; see [Canonical Store Format `v1alpha4`](store-format-v1alpha4.md).
 
 Ordinary forget retains historical create/update private replay results and its
 own body-free result while their receipts remain live. Those mutation replays
@@ -210,8 +214,8 @@ fails closed. Canonical record bytes and mtimes are unchanged. Normal open
 never migrates an old or unknown format.
 
 `v1alpha1` explicit migration recovers its legacy WAL, creates both historical
-receipt/audit and current tombstone layouts, writes audit genesis, and then
-publishes the current v3 marker metadata-last.
+receipt/audit and then-current tombstone layouts, writes audit genesis, and
+then publishes the historical v3 marker metadata-last.
 
 ## Read-only validation and portable export
 
@@ -246,8 +250,9 @@ rules are specified in
 
 ## Non-goals
 
-This format does not implement restore/hard-purge execution, receipt GC,
-retention scheduling, remote backup deletion, committed import, backup
-metadata, search/indexing, MCP/CLI transport, Bamboo integration, prompt
-construction, or model calls. Validation/export are separate read-only output
-formats, not new `v1alpha3` mutation capabilities.
+This historical format does not itself implement restore/hard-purge execution,
+receipt GC, retention scheduling, remote backup deletion, committed import,
+backup metadata, search/indexing, MCP/CLI transport, Bamboo integration, prompt
+construction, or model calls. Committed import/backup metadata require the
+explicit v4 capability migration. Validation/export remain separate read-only
+output formats, not v3 mutation capabilities.

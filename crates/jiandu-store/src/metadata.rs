@@ -9,16 +9,18 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-/// Store format that additionally protects forgotten identities with strict
-/// tombstones and a metadata-last forget transaction.
-pub const STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha3";
+/// Store format that adds portable batch import and recovery-safe backup
+/// metadata behind an explicit metadata-last capability gate.
+pub const STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha4";
+pub(crate) const V3_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha3";
 pub(crate) const PREVIOUS_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha2";
 pub(crate) const LEGACY_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha1";
 
 /// Independent monotonic address of the private mutation audit ledger.
 ///
-/// Zero is the genesis watermark. Each committed create/update advances this
-/// value exactly once; idempotent replay never advances it.
+/// Zero is the genesis watermark. Each committed audited mutation or portable
+/// import advances this value exactly once; idempotent replay never advances
+/// it.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]

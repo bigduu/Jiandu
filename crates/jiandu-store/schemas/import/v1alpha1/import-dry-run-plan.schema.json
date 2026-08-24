@@ -1,87 +1,71 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ValidationReport",
-  "description": "Strict canonical validation report. Invalid stores can omit identity and\nwatermark while still returning closed safe findings.",
+  "title": "ImportDryRunPlan",
+  "description": "Strict deterministic zero-write import dry run.",
   "type": "object",
   "properties": {
     "formatVersion": {
-      "description": "Validation report format identifier.",
       "type": "string",
-      "minLength": 33,
-      "maxLength": 33,
-      "pattern": "^jiandu\\.validation-report/v1alpha1$"
-    },
-    "mode": {
-      "description": "Scope visibility mode used by this inspection.",
-      "$ref": "#/$defs/ValidationMode"
+      "minLength": 27,
+      "maxLength": 27,
+      "pattern": "^jiandu\\.import-plan/v1alpha1$"
     },
     "sourceStoreId": {
-      "description": "Opaque source identity, omitted when metadata is not authoritative.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/StoreId"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/StoreId"
     },
-    "snapshot": {
-      "description": "Snapshot watermark, omitted together with source identity.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/SnapshotWatermark"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "bundleDigest": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
     },
-    "inspectedScopes": {
-      "description": "Canonically sorted scopes inspected or discovered.",
+    "targetStoreId": {
+      "$ref": "#/$defs/StoreId"
+    },
+    "targetSnapshot": {
+      "$ref": "#/$defs/SnapshotWatermark"
+    },
+    "scopes": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/MemoryScope"
+        "$ref": "#/$defs/ImportScopeDecision"
       },
-      "maxItems": 10000,
+      "minItems": 1,
+      "maxItems": 100,
       "uniqueItems": true
     },
-    "findings": {
-      "description": "Canonically sorted, deduplicated safe findings.",
+    "entries": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ValidationFinding"
+        "$ref": "#/$defs/ImportPlanEntry"
       },
-      "maxItems": 257,
+      "maxItems": 1000,
       "uniqueItems": true
     },
-    "truncated": {
-      "description": "Whether a bounded scan stopped before visiting the whole selection.",
+    "counts": {
+      "$ref": "#/$defs/ImportPlanCounts"
+    },
+    "committable": {
       "type": "boolean"
     },
     "digest": {
-      "description": "Domain-separated digest of every preceding report field.",
-      "$ref": "#/$defs/ExportDigest"
+      "$ref": "#/$defs/ImportDigest"
     }
   },
   "additionalProperties": false,
   "required": [
     "formatVersion",
-    "mode",
-    "inspectedScopes",
-    "findings",
-    "truncated",
+    "sourceStoreId",
+    "bundleDigest",
+    "targetStoreId",
+    "targetSnapshot",
+    "scopes",
+    "entries",
+    "counts",
+    "committable",
     "digest"
   ],
   "$defs": {
-    "ValidationMode": {
-      "description": "Whether validation was limited to explicit scopes or covered the store.",
-      "type": "string",
-      "enum": [
-        "scoped",
-        "all_scopes"
-      ]
-    },
     "StoreId": {
       "description": "Opaque UUID-backed store identity.",
       "type": "string",
@@ -119,6 +103,23 @@
       "type": "integer",
       "format": "uint64",
       "minimum": 0
+    },
+    "ImportScopeDecision": {
+      "description": "Fresh per-scope authority decision included in the dry run.",
+      "type": "object",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        "authorized": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "authorized"
+      ]
     },
     "MemoryScope": {
       "description": "Authoritative scope stamped onto a resolved memory record.\n\nUnlike a request selector, a Principal record carries the trusted owner ID\nselected by policy. Project and Session membership remain authorization\ndata outside this value.",
@@ -207,86 +208,37 @@
       "maxLength": 128,
       "pattern": "^ses_[A-Za-z0-9_-]+$"
     },
-    "ValidationFinding": {
-      "description": "One path/body/credential/key/query-free validation finding.",
+    "ImportPlanEntry": {
+      "description": "Body-free plan entry for one opaque portable record or tombstone.",
       "type": "object",
       "properties": {
-        "code": {
-          "description": "Closed machine-readable finding category.",
-          "$ref": "#/$defs/ValidationCode"
-        },
-        "artifact": {
-          "description": "Logical artifact class affected by the finding.",
-          "$ref": "#/$defs/ValidationArtifact"
-        },
-        "scope": {
-          "description": "Authorized or admin-visible logical scope when safely known.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MemoryScope"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "kind": {
+          "$ref": "#/$defs/ImportItemKind"
         },
         "memoryId": {
-          "description": "Opaque memory identity only when safely bound and authorized.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MemoryId"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/MemoryId"
+        },
+        "scope": {
+          "$ref": "#/$defs/MemoryScope"
+        },
+        "classification": {
+          "$ref": "#/$defs/ImportClassification"
         }
       },
       "additionalProperties": false,
       "required": [
-        "code",
-        "artifact"
+        "kind",
+        "memoryId",
+        "scope",
+        "classification"
       ]
     },
-    "ValidationCode": {
-      "description": "Closed, stable and secret-safe validation categories.",
+    "ImportItemKind": {
+      "description": "Portable entry kind classified by a dry run.",
       "type": "string",
       "enum": [
-        "store_metadata_inconsistent",
-        "unsupported_store_version",
-        "layout_inconsistent",
-        "unsafe_entry",
-        "active_transaction",
-        "record_malformed",
-        "record_id_mismatch",
-        "scope_path_mismatch",
-        "shard_mismatch",
-        "duplicate_memory_id",
-        "record_tombstone_conflict",
-        "tombstone_inconsistent",
-        "receipt_inconsistent",
-        "result_inconsistent",
-        "audit_inconsistent",
-        "witness_inconsistent",
-        "snapshot_changed",
-        "scan_limit_exceeded",
-        "finding_limit_reached"
-      ]
-    },
-    "ValidationArtifact": {
-      "description": "Stable logical artifact category; never a canonical or ambient path.",
-      "type": "string",
-      "enum": [
-        "store_metadata",
-        "layout",
-        "transaction",
         "record",
-        "tombstone",
-        "receipt",
-        "result",
-        "audit",
-        "witness",
-        "snapshot"
+        "tombstone"
       ]
     },
     "MemoryId": {
@@ -295,8 +247,58 @@
       "maxLength": 128,
       "pattern": "^mem_[A-Za-z0-9_-]+$"
     },
-    "ExportDigest": {
-      "description": "Domain-separated SHA-256 digest of a canonical report or bundle payload.",
+    "ImportClassification": {
+      "description": "Closed deterministic import classification.",
+      "type": "string",
+      "enum": [
+        "accepted",
+        "conflicting",
+        "unauthorized",
+        "tombstone_protected",
+        "invalid"
+      ]
+    },
+    "ImportPlanCounts": {
+      "description": "Exact category totals committed into the plan digest.",
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "conflicting": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unauthorized": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tombstoneProtected": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "invalid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "accepted",
+        "conflicting",
+        "unauthorized",
+        "tombstoneProtected",
+        "invalid"
+      ]
+    },
+    "ImportDigest": {
+      "description": "Domain-separated lowercase SHA-256 digest used by import contracts.",
       "type": "string",
       "minLength": 71,
       "maxLength": 71,
