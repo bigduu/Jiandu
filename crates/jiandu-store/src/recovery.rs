@@ -47,6 +47,12 @@ pub(crate) fn recover(
             manifest.as_ref().expect("manifest"),
             failpoints,
         )?,
+        Some(TransactionIntent::Import(_)) => crate::portable_import::recover_import(
+            root,
+            metadata,
+            manifest.as_ref().expect("manifest"),
+            failpoints,
+        )?,
         Some(TransactionIntent::Quarantine(_)) => {
             recover_quarantine(root, manifest.as_ref().expect("manifest"), failpoints)?;
             metadata
@@ -160,6 +166,7 @@ fn read_single_active_manifest(
             crate::metadata::PREVIOUS_STORE_FORMAT_VERSION => {
                 transaction::PREVIOUS_TRANSACTION_FORMAT_VERSION
             }
+            crate::metadata::V3_STORE_FORMAT_VERSION => transaction::V3_TRANSACTION_FORMAT_VERSION,
             crate::STORE_FORMAT_VERSION => transaction::TRANSACTION_FORMAT_VERSION,
             _ => return Err(StoreError::InvalidStoreMetadata),
         };
@@ -792,7 +799,7 @@ fn validate_mutation_artifact(
     }
 }
 
-fn recover_target_metadata(
+pub(crate) fn recover_target_metadata(
     root: &StoreDirectory,
     manifest: &TransactionManifest,
     failpoints: &Failpoints,
@@ -1003,7 +1010,10 @@ fn reject_orphan_metadata_temp(
     for entry in entries {
         let entry = entry.map_err(|source| StoreError::io("read store control entry", source))?;
         let name = entry.file_name();
-        if name == OsStr::new(layout::STORE_METADATA_MIGRATION_FILE) {
+        if name == OsStr::new(layout::STORE_METADATA_MIGRATION_FILE)
+            || name == OsStr::new(layout::V3_STORE_METADATA_MIGRATION_FILE)
+            || name == OsStr::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE)
+        {
             continue;
         }
         let Some(name_string) = name.to_str() else {
@@ -1089,6 +1099,7 @@ fn reject_orphan_record_temps_in(
 fn is_record_transaction_temp(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         (name.starts_with(".record-") && name.ends_with(".tmp"))
+            || (name.starts_with(".import-record-") && name.ends_with(".tmp"))
             || (name.starts_with(".forgotten-") && name.ends_with(".body"))
     })
 }
@@ -1115,9 +1126,10 @@ fn reject_orphan_tombstone_temps_in(
         let metadata = directory
             .symlink_metadata(&name)
             .map_err(|source| StoreError::io("inspect tombstone namespace entry", source))?;
-        let is_temp = name
-            .to_str()
-            .is_some_and(|name| name.starts_with(".tombstone-") && name.ends_with(".tmp"));
+        let is_temp = name.to_str().is_some_and(|name| {
+            (name.starts_with(".tombstone-") || name.starts_with(".import-tombstone-"))
+                && name.ends_with(".tmp")
+        });
         if metadata.is_symlink() {
             if is_temp {
                 return Err(StoreError::UnsafePath);

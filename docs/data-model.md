@@ -171,15 +171,19 @@ This gives the user-visible behavior of “deep copy through this message” wit
 ├── transactions/<transaction-id>.json
 ├── receipts/
 │   ├── quarantine/quarantine-<transaction-id>.json
-│   └── idempotency/
-│       ├── metadata/<principal-digest>/<operation>/<shard>/<receipt-id>.json
+│   ├── idempotency/
+│   │   ├── metadata/<principal-digest>/<operation>/<shard>/<receipt-id>.json
+│   │   └── results/<shard>/<receipt-id>.json
+│   └── import/
+│       ├── metadata/<principal-digest>/<shard>/<receipt-id>.json
 │       └── results/<shard>/<receipt-id>.json
 ├── audit/
 │   ├── genesis.json
-│   └── mutations/<20-digit-audit-sequence>.json
+│   ├── mutations/<20-digit-audit-sequence>.json
+│   └── imports/<20-digit-audit-sequence>.json
 ├── index/lexical.sqlite           # derived and rebuildable
 ├── quarantine/
-└── backups/
+└── backups/imports/<transaction-id>.json
 ```
 
 The authoritative owner segment is part of the private layout for Principal, Project, and Session records. Every `<owner-key>` and `<memory-key>` is a domain-separated lowercase SHA-256 storage key of its opaque ID. This keeps distinct case-sensitive IDs separate on case-insensitive filesystems and bounds component length; the original IDs remain authoritative in validated frontmatter. The owner segment lets an authorized list traverse only granted owners instead of parsing other tenants' records. It is never inferred from a workspace path.
@@ -230,6 +234,8 @@ implemented single-record forget transaction publishes protection before
 removing the canonical record, commits its body-free result/receipt/audit and
 metadata in one WAL, and is specified in
 [the `v1alpha3` document](store-format-v1alpha3.md).
+The bounded portable batch extension and its explicit capability migration are
+specified in [the `v1alpha4` document](store-format-v1alpha4.md).
 Derived index maintenance remains asynchronous and non-authoritative in its own
 milestone.
 
@@ -282,6 +288,36 @@ resurrection and does not make foreign tombstone metadata, counts, or identity
 part of the report or bundle. See
 [Validation Report and Portable Export `v1alpha1`](portable-export-v1alpha1.md)
 for canonical ordering, strict formats, bounds, and authorization.
+
+## Portable import and backup metadata
+
+The committed import seam consumes only strict canonical portable-export bytes.
+A zero-write dry run records fresh exact-scope authority and deterministically
+classifies every record/tombstone as accepted, conflicting, unauthorized,
+tombstone-protected, or invalid because the batch is oversized. It never
+accepts a separate destination scope, changes an opaque ID, or treats a private
+storage key/path as identity.
+
+A committable batch preserves every public record field exactly, including ID,
+revision, ETag, scope, relations, timestamps, and full provenance. Imported
+tombstones preserve logical ID/scope/revision/ETag/forgotten time and are
+rebound to the local protected-tombstone transaction without a forgotten body.
+The target store revision is `max(base + 1, source snapshot)` and one batch
+advances the independent audit sequence once.
+
+Record/tombstone staging, receipt-bound backup metadata, result, receipt,
+audit, and target metadata share one bounded metadata-last v4 WAL. Exact
+principal/key/input retries replay the original result after disconnect or
+restart; conflicting key reuse and any noncommittable/fresh-unauthorized state
+exit before write. Historical imported records may later update or forget
+normally; imported tombstones remain exact non-resurrection protection.
+
+Backup metadata contains only version/store/transaction identities, exact
+base/source/target watermarks, bundle/plan digests, item counts, and its digest.
+It is returned from the WAL commit/replay and can be read only with a separate
+host backup-metadata capability. It contains no record body, path, raw key,
+query, credential, upload destination, schedule, or retention policy. See
+[Portable Import and Backup Metadata `v1alpha1`](portable-import-v1alpha1.md).
 
 ## Derived data
 

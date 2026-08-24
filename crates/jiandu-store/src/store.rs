@@ -394,6 +394,7 @@ impl CanonicalStore {
         root.validate_ambient_identity()?;
         lock.publish_owner(&root, &owner)?;
         if root.regular_file_exists(Path::new(layout::STORE_METADATA_MIGRATION_FILE))?
+            || root.regular_file_exists(Path::new(layout::V3_STORE_METADATA_MIGRATION_FILE))?
             || root
                 .regular_file_exists(Path::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE))?
         {
@@ -420,8 +421,8 @@ impl CanonicalStore {
     }
 
     /// Explicitly migrate a locked v1alpha1 store through the historical
-    /// receipt/audit layout into the current tombstone-gated format. An older
-    /// writer rejects the final capability marker.
+    /// receipt/audit and tombstone layouts into the current portable-import
+    /// format. An older writer rejects the final capability marker.
     pub fn migrate_v1alpha1(
         data_dir: impl AsRef<Path>,
         owner: crate::LockOwner,
@@ -455,7 +456,27 @@ impl CanonicalStore {
         // upgrading a v1 store. Validate and remove only a matching staged v2
         // marker before legacy WAL recovery; arbitrary or linked bytes fail
         // closed instead of being swept as migration debris.
-        cleanup_previous_migration_metadata(&root, &locked_metadata, &options.failpoints)?;
+        cleanup_staged_migration_metadata(
+            &root,
+            &locked_metadata,
+            layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE,
+            crate::metadata::PREVIOUS_STORE_FORMAT_VERSION,
+            &options.failpoints,
+        )?;
+        cleanup_staged_migration_metadata(
+            &root,
+            &locked_metadata,
+            layout::V3_STORE_METADATA_MIGRATION_FILE,
+            crate::metadata::V3_STORE_FORMAT_VERSION,
+            &options.failpoints,
+        )?;
+        cleanup_staged_migration_metadata(
+            &root,
+            &locked_metadata,
+            layout::STORE_METADATA_MIGRATION_FILE,
+            crate::STORE_FORMAT_VERSION,
+            &options.failpoints,
+        )?;
 
         // Legacy recovery must run while the legacy format marker is still
         // authoritative. Only after it removes the old WAL do we create v2
@@ -468,6 +489,7 @@ impl CanonicalStore {
 
         layout::ensure_v2_layout(&root)?;
         layout::ensure_v3_layout(&root)?;
+        layout::ensure_v4_layout(&root)?;
         options
             .failpoints
             .check(crate::PersistenceBoundary::MigrationLayoutSynced)?;
@@ -496,10 +518,10 @@ impl CanonicalStore {
         })
     }
 
-    /// Explicitly migrate a root-locked v1alpha2 store to the v1alpha3
-    /// tombstone capability. Any active v1alpha2 WAL is recovered and the
-    /// complete historical ledger is validated before a v3 directory or
-    /// metadata marker is published.
+    /// Explicitly migrate a root-locked v1alpha2 store through the v1alpha3
+    /// tombstone layout to the current v1alpha4 capability. Any active
+    /// v1alpha2 WAL is recovered and the complete historical ledger is
+    /// validated before current directories or metadata are published.
     pub fn migrate_v1alpha2(
         data_dir: impl AsRef<Path>,
         owner: crate::LockOwner,
@@ -529,6 +551,21 @@ impl CanonicalStore {
         root.validate_ambient_identity()?;
         lock.publish_owner(&root, &owner)?;
 
+        cleanup_staged_migration_metadata(
+            &root,
+            &locked_metadata,
+            layout::V3_STORE_METADATA_MIGRATION_FILE,
+            crate::metadata::V3_STORE_FORMAT_VERSION,
+            &options.failpoints,
+        )?;
+        cleanup_staged_migration_metadata(
+            &root,
+            &locked_metadata,
+            layout::STORE_METADATA_MIGRATION_FILE,
+            crate::STORE_FORMAT_VERSION,
+            &options.failpoints,
+        )?;
+
         layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
         let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
         if recovered.metadata.format_version != crate::metadata::PREVIOUS_STORE_FORMAT_VERSION {
@@ -538,6 +575,7 @@ impl CanonicalStore {
         crate::idempotency::validate_ledger(&root, &recovered.metadata)?;
 
         layout::ensure_v3_layout(&root)?;
+        layout::ensure_v4_layout(&root)?;
         options
             .failpoints
             .check(crate::PersistenceBoundary::MigrationLayoutSynced)?;
@@ -545,6 +583,82 @@ impl CanonicalStore {
             .metadata
             .clone()
             .upgraded_to_current(crate::metadata::PREVIOUS_STORE_FORMAT_VERSION)?;
+        publish_migrated_metadata(&root, &target_metadata, &options.failpoints)?;
+        layout::validate_layout(&root)?;
+        validate_audit_genesis(&root, &target_metadata)?;
+        crate::idempotency::validate_ledger(&root, &target_metadata)?;
+        crate::durability::probe(
+            &root,
+            &options.failpoints,
+            options.forced_unsupported_durability,
+        )?;
+        Ok(Self {
+            root,
+            metadata: target_metadata,
+            lock,
+            failpoints: options.failpoints,
+            poisoned: false,
+            quarantine_receipts: recovered.quarantine_receipts,
+            forced_unsupported_durability: options.forced_unsupported_durability,
+        })
+    }
+
+    /// Explicitly migrate a root-locked v1alpha3 tombstone store to the
+    /// v1alpha4 portable-import capability. Active v3 WAL recovery and the
+    /// complete v3 ledger validation both finish before any v4 marker is
+    /// published.
+    pub fn migrate_v1alpha3(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+    ) -> Result<Self, StoreError> {
+        Self::migrate_v1alpha3_with_options(data_dir, owner, StoreOptions::default())
+    }
+
+    pub fn migrate_v1alpha3_with_options(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+        options: StoreOptions,
+    ) -> Result<Self, StoreError> {
+        let root = layout::StoreDirectory::open(data_dir.as_ref(), false)?;
+        root.validate_private_root()?;
+        let (metadata, original_metadata_bytes) = read_v3_store_metadata(&root)?;
+        layout::validate_v3_layout(&root)?;
+        if !root.regular_file_exists(Path::new(layout::STORE_LOCK_FILE))? {
+            return Err(StoreError::InvalidLayout);
+        }
+        let _lock_file = root.validate_private_file(Path::new(layout::STORE_LOCK_FILE))?;
+
+        let mut lock = crate::lock::StoreLock::acquire(&root, false)?;
+        let (locked_metadata, locked_metadata_bytes) = read_v3_store_metadata(&root)?;
+        if locked_metadata != metadata || locked_metadata_bytes != original_metadata_bytes {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        root.validate_ambient_identity()?;
+        lock.publish_owner(&root, &owner)?;
+
+        cleanup_staged_migration_metadata(
+            &root,
+            &locked_metadata,
+            layout::STORE_METADATA_MIGRATION_FILE,
+            crate::STORE_FORMAT_VERSION,
+            &options.failpoints,
+        )?;
+        layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
+        let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
+        if recovered.metadata.format_version != crate::metadata::V3_STORE_FORMAT_VERSION {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        validate_audit_genesis(&root, &recovered.metadata)?;
+        crate::idempotency::validate_ledger(&root, &recovered.metadata)?;
+
+        layout::ensure_v4_layout(&root)?;
+        options
+            .failpoints
+            .check(crate::PersistenceBoundary::MigrationLayoutSynced)?;
+        let target_metadata = recovered
+            .metadata
+            .clone()
+            .upgraded_to_current(crate::metadata::V3_STORE_FORMAT_VERSION)?;
         publish_migrated_metadata(&root, &target_metadata, &options.failpoints)?;
         layout::validate_layout(&root)?;
         validate_audit_genesis(&root, &target_metadata)?;
@@ -805,7 +919,8 @@ impl CanonicalStore {
                 crate::transaction::quarantine_relative(quarantine)?
             }
             crate::transaction::TransactionIntent::Record(_)
-            | crate::transaction::TransactionIntent::Forget(_) => {
+            | crate::transaction::TransactionIntent::Forget(_)
+            | crate::transaction::TransactionIntent::Import(_) => {
                 return Err(StoreError::InvalidTransaction);
             }
         };
@@ -1196,6 +1311,16 @@ fn read_previous_store_metadata(
     read_store_metadata_file_for(file, crate::metadata::PREVIOUS_STORE_FORMAT_VERSION)
 }
 
+fn read_v3_store_metadata(
+    root: &layout::StoreDirectory,
+) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
+    let file = root
+        .try_open_regular(Path::new(layout::STORE_METADATA_FILE), false)?
+        .ok_or(StoreError::NotInitialized)?;
+    layout::StoreDirectory::validate_private_open_file(&file)?;
+    read_store_metadata_file_for(file, crate::metadata::V3_STORE_FORMAT_VERSION)
+}
+
 fn read_store_metadata_file(file: File) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
     read_store_metadata_file_for(file, crate::STORE_FORMAT_VERSION)
 }
@@ -1365,12 +1490,14 @@ fn publish_migrated_metadata(
     failpoints.check(crate::PersistenceBoundary::MigrationMetadataDirectorySynced)
 }
 
-fn cleanup_previous_migration_metadata(
+fn cleanup_staged_migration_metadata(
     root: &layout::StoreDirectory,
-    legacy_metadata: &StoreMetadata,
+    source_metadata: &StoreMetadata,
+    relative: &str,
+    staged_format: &str,
     failpoints: &crate::failpoint::Failpoints,
 ) -> Result<(), StoreError> {
-    let relative = Path::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE);
+    let relative = Path::new(relative);
     let Some(file) = root.try_open_regular(relative, false)? else {
         return Ok(());
     };
@@ -1378,12 +1505,11 @@ fn cleanup_previous_migration_metadata(
     if !layout::StoreDirectory::has_single_link(&file)? {
         return Err(StoreError::UnsafePath);
     }
-    let (staged, _) =
-        read_store_metadata_file_for(file, crate::metadata::PREVIOUS_STORE_FORMAT_VERSION)?;
-    if staged.store_id != legacy_metadata.store_id
-        || staged.store_revision != legacy_metadata.store_revision
-        || staged.audit_sequence != legacy_metadata.audit_sequence
-        || staged.created_at != legacy_metadata.created_at
+    let (staged, _) = read_store_metadata_file_for(file, staged_format)?;
+    if staged.store_id != source_metadata.store_id
+        || staged.store_revision != source_metadata.store_revision
+        || staged.audit_sequence != source_metadata.audit_sequence
+        || staged.created_at != source_metadata.created_at
     {
         return Err(StoreError::InvalidStoreMetadata);
     }

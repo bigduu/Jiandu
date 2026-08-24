@@ -366,7 +366,7 @@ pub struct PortableExportBundle {
     pub format_version: String,
     #[schemars(
         length(min = 21, max = 21),
-        regex(pattern = r"^jiandu\.store/v1alpha3$")
+        regex(pattern = r"^jiandu\.store/v1alpha[34]$")
     )]
     pub source_store_format: String,
     pub source_store_id: StoreId,
@@ -722,6 +722,14 @@ fn inspect(
                         crate::idempotency::LedgerIssue::Audit => {
                             (ValidationCode::AuditInconsistent, ValidationArtifact::Audit)
                         }
+                        // v1alpha1 has a closed artifact taxonomy. Import backup metadata is
+                        // receipt-bound, so corruption remains classified with that existing
+                        // ledger category until a future validation-report version can add a
+                        // dedicated wire variant.
+                        crate::idempotency::LedgerIssue::Backup => (
+                            ValidationCode::ReceiptInconsistent,
+                            ValidationArtifact::Receipt,
+                        ),
                         crate::idempotency::LedgerIssue::Tombstone => (
                             ValidationCode::TombstoneInconsistent,
                             ValidationArtifact::Tombstone,
@@ -2451,7 +2459,10 @@ impl PortableExportBundle {
 
     fn validate(&self) -> Result<(), StoreError> {
         if self.format_version != PORTABLE_EXPORT_FORMAT_VERSION
-            || self.source_store_format != crate::STORE_FORMAT_VERSION
+            || !matches!(
+                self.source_store_format.as_str(),
+                crate::STORE_FORMAT_VERSION | crate::metadata::V3_STORE_FORMAT_VERSION
+            )
             || self.scopes.len() > MAX_DISCOVERED_SCOPES
             || !is_sorted_scopes(&self.scopes)
             || self.snapshot.audit_sequence.0 > self.snapshot.store_revision.0

@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BackupMetadata",
+  "description": "Strict body-free recovery metadata for one committed portable import.",
+  "type": "object",
+  "properties": {
+    "formatVersion": {
+      "type": "string",
+      "minLength": 31,
+      "maxLength": 31,
+      "pattern": "^jiandu\\.backup-metadata/v1alpha1$"
+    },
+    "storeId": {
+      "$ref": "#/$defs/StoreId"
+    },
+    "transactionId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "baseSnapshot": {
+      "$ref": "#/$defs/SnapshotWatermark"
+    },
+    "targetSnapshot": {
+      "$ref": "#/$defs/SnapshotWatermark"
+    },
+    "sourceStoreId": {
+      "$ref": "#/$defs/StoreId"
+    },
+    "sourceSnapshot": {
+      "$ref": "#/$defs/SnapshotWatermark"
+    },
+    "bundleDigest": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "planDigest": {
+      "$ref": "#/$defs/ImportDigest"
+    },
+    "recordCount": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "tombstoneCount": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "digest": {
+      "$ref": "#/$defs/ImportDigest"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "formatVersion",
+    "storeId",
+    "transactionId",
+    "baseSnapshot",
+    "targetSnapshot",
+    "sourceStoreId",
+    "sourceSnapshot",
+    "bundleDigest",
+    "planDigest",
+    "recordCount",
+    "tombstoneCount",
+    "digest"
+  ],
+  "$defs": {
+    "StoreId": {
+      "description": "Opaque UUID-backed store identity.",
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "SnapshotWatermark": {
+      "description": "Stable metadata watermark captured under one read-only coordinated snapshot.",
+      "type": "object",
+      "properties": {
+        "storeRevision": {
+          "description": "Canonical store revision at the coordinated snapshot.",
+          "$ref": "#/$defs/StoreRevision"
+        },
+        "auditSequence": {
+          "description": "Independent private-audit sequence at the same snapshot.",
+          "$ref": "#/$defs/AuditSequence"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "storeRevision",
+        "auditSequence"
+      ]
+    },
+    "StoreRevision": {
+      "description": "Monotonic revision of the canonical store; zero represents an empty store.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "AuditSequence": {
+      "description": "Independent monotonic address of the private mutation audit ledger.\n\nZero is the genesis watermark. Each committed audited mutation or portable\nimport advances this value exactly once; idempotent replay never advances\nit.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "ImportDigest": {
+      "description": "Domain-separated lowercase SHA-256 digest used by import contracts.",
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

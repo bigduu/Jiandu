@@ -1,7 +1,9 @@
 # Canonical Store Format `v1alpha2`
 
 > Historical contract: [`jiandu.store/v1alpha3`](store-format-v1alpha3.md) is
-> the current writer format. This document and its checked fixtures remain the
+> the forget/tombstone successor and
+> [`jiandu.store/v1alpha4`](store-format-v1alpha4.md) is the current writer
+> format. This document and its checked fixtures remain the
 > immutable create/update receipt/audit and `v1alpha2` migration-source
 > contract.
 

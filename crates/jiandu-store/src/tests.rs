@@ -361,6 +361,78 @@ const PREVIOUS_MIGRATION_RECOVERY_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::MigrationPreviousMetadataDirectorySynced,
 ];
 
+const IMPORT_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::ManifestTempWritten,
+    PersistenceBoundary::ManifestTempSynced,
+    PersistenceBoundary::ManifestTempDirectorySynced,
+    PersistenceBoundary::ManifestPublished,
+    PersistenceBoundary::ManifestDirectorySynced,
+    PersistenceBoundary::RecordNamespacePrepared,
+    PersistenceBoundary::RecordTempWritten,
+    PersistenceBoundary::RecordTempSynced,
+    PersistenceBoundary::RecordTempDirectorySynced,
+    PersistenceBoundary::TombstoneNamespacePrepared,
+    PersistenceBoundary::TombstoneTempWritten,
+    PersistenceBoundary::TombstoneTempSynced,
+    PersistenceBoundary::TombstoneTempDirectorySynced,
+    PersistenceBoundary::BackupMetadataTempWritten,
+    PersistenceBoundary::BackupMetadataTempSynced,
+    PersistenceBoundary::BackupMetadataTempDirectorySynced,
+    PersistenceBoundary::MutationResultTempWritten,
+    PersistenceBoundary::MutationResultTempSynced,
+    PersistenceBoundary::MutationResultTempDirectorySynced,
+    PersistenceBoundary::MutationReceiptTempWritten,
+    PersistenceBoundary::MutationReceiptTempSynced,
+    PersistenceBoundary::MutationReceiptTempDirectorySynced,
+    PersistenceBoundary::MutationAuditTempWritten,
+    PersistenceBoundary::MutationAuditTempSynced,
+    PersistenceBoundary::MutationAuditTempDirectorySynced,
+    PersistenceBoundary::MetadataTempWritten,
+    PersistenceBoundary::MetadataTempSynced,
+    PersistenceBoundary::MetadataTempDirectorySynced,
+    PersistenceBoundary::IdempotencyNamespacePrepared,
+    PersistenceBoundary::RecordRenamed,
+    PersistenceBoundary::RecordDirectorySynced,
+    PersistenceBoundary::TombstonePublished,
+    PersistenceBoundary::TombstoneDirectorySynced,
+    PersistenceBoundary::BackupMetadataPublished,
+    PersistenceBoundary::BackupMetadataDirectorySynced,
+    PersistenceBoundary::MutationResultPublished,
+    PersistenceBoundary::MutationResultDirectorySynced,
+    PersistenceBoundary::MutationReceiptPublished,
+    PersistenceBoundary::MutationReceiptDirectorySynced,
+    PersistenceBoundary::MutationAuditPublished,
+    PersistenceBoundary::MutationAuditDirectorySynced,
+    PersistenceBoundary::MetadataRenamed,
+    PersistenceBoundary::MetadataDirectorySynced,
+    PersistenceBoundary::ManifestRemoved,
+    PersistenceBoundary::ManifestRemovalDirectorySynced,
+];
+
+const IMPORT_RECOVERY_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::RecoveryRecordDirectorySynced,
+    PersistenceBoundary::RecoveryTombstoneSynced,
+    PersistenceBoundary::RecoveryBackupMetadataDirectorySynced,
+    PersistenceBoundary::RecoveryMutationResultDirectorySynced,
+    PersistenceBoundary::RecoveryMutationReceiptDirectorySynced,
+    PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
+    PersistenceBoundary::RecoveryMetadataDirectorySynced,
+    PersistenceBoundary::RecoveryManifestDirectorySynced,
+];
+
+fn import_target_was_published(boundary: PersistenceBoundary) -> bool {
+    IMPORT_PERSISTENCE_BOUNDARIES
+        .iter()
+        .position(|candidate| *candidate == boundary)
+        .is_some_and(|position| {
+            position
+                >= IMPORT_PERSISTENCE_BOUNDARIES
+                    .iter()
+                    .position(|candidate| *candidate == PersistenceBoundary::RecordRenamed)
+                    .expect("record publication boundary")
+        })
+}
+
 fn mutation_target_was_published(boundary: PersistenceBoundary) -> bool {
     matches!(
         boundary,
@@ -425,10 +497,39 @@ fn store_metadata(root: &Path) -> StoreMetadata {
         .expect("decode store metadata")
 }
 
+fn remove_v4_layout(root: &Path) {
+    for relative in [
+        "receipts/import",
+        layout::IMPORT_AUDIT_DIR,
+        layout::IMPORT_BACKUPS_DIR,
+    ] {
+        fs::remove_dir_all(root.join(relative)).expect("remove v4 import layout");
+        assert!(
+            !root.join(relative).exists(),
+            "v4 source layout absent: {relative}"
+        );
+    }
+}
+
+fn assert_v4_layout_present(root: &Path) {
+    for relative in [
+        layout::IMPORT_RECEIPTS_DIR,
+        layout::IMPORT_RESULTS_DIR,
+        layout::IMPORT_AUDIT_DIR,
+        layout::IMPORT_BACKUPS_DIR,
+    ] {
+        assert!(
+            root.join(relative).is_dir(),
+            "v4 target layout present: {relative}"
+        );
+    }
+}
+
 fn make_legacy_store(root: &Path) -> StoreMetadata {
     let store = CanonicalStore::initialize(root, owner()).expect("initialize migration fixture");
     let mut metadata = store.metadata.clone();
     drop(store);
+    remove_v4_layout(root);
     metadata.format_version = crate::metadata::LEGACY_STORE_FORMAT_VERSION.to_owned();
     metadata.audit_sequence = AuditSequence(0);
     fs::remove_file(root.join(layout::AUDIT_GENESIS_FILE)).expect("remove v2 audit genesis");
@@ -451,6 +552,7 @@ fn make_v1alpha2_store(root: &Path) -> StoreMetadata {
     let store = CanonicalStore::initialize(root, owner()).expect("initialize v2 migration fixture");
     let mut metadata = store.metadata.clone();
     drop(store);
+    remove_v4_layout(root);
     metadata.format_version = crate::metadata::PREVIOUS_STORE_FORMAT_VERSION.to_owned();
     for kind in ["principal", "project", "session", "instance_global"] {
         fs::remove_dir_all(root.join(layout::TOMBSTONES_DIR).join(kind))
@@ -461,6 +563,20 @@ fn make_v1alpha2_store(root: &Path) -> StoreMetadata {
         metadata.canonical_bytes().expect("v2 metadata bytes"),
     )
     .expect("write v2 store metadata");
+    metadata
+}
+
+fn make_v1alpha3_store(root: &Path) -> StoreMetadata {
+    let store = CanonicalStore::initialize(root, owner()).expect("initialize v3 migration fixture");
+    let mut metadata = store.metadata.clone();
+    drop(store);
+    metadata.format_version = crate::metadata::V3_STORE_FORMAT_VERSION.to_owned();
+    remove_v4_layout(root);
+    fs::write(
+        root.join(layout::STORE_METADATA_FILE),
+        metadata.canonical_bytes().expect("v3 metadata bytes"),
+    )
+    .expect("write v3 store metadata");
     metadata
 }
 
@@ -4995,7 +5111,7 @@ fn legacy_receipt_layout_migrates_idempotently_across_create_and_sync_failures()
 }
 
 #[test]
-fn v1alpha1_to_current_v1alpha3_migration_is_restartable_and_gates_old_writers() {
+fn v1alpha1_to_current_v1alpha4_migration_is_restartable_and_gates_old_writers() {
     for &boundary in MIGRATION_PERSISTENCE_BOUNDARIES {
         let directory = TempDir::new().expect("temporary directory");
         let legacy = make_legacy_store(directory.path());
@@ -5033,7 +5149,7 @@ fn v1alpha1_to_current_v1alpha3_migration_is_restartable_and_gates_old_writers()
         let migrated = if published {
             assert_eq!(
                 CanonicalStore::migrate_v1alpha1(directory.path(), owner())
-                    .expect_err("old writer rejects the current v1alpha3 capability gate")
+                    .expect_err("old writer rejects the current v1alpha4 capability gate")
                     .code(),
                 StoreErrorCode::UnsupportedStoreFormat,
                 "{boundary:?}"
@@ -5060,6 +5176,7 @@ fn v1alpha1_to_current_v1alpha3_migration_is_restartable_and_gates_old_writers()
             "{boundary:?}"
         );
         assert!(directory.path().join(layout::AUDIT_GENESIS_FILE).is_file());
+        assert_v4_layout_present(directory.path());
         assert!(
             !directory
                 .path()
@@ -5078,7 +5195,7 @@ fn v1alpha1_to_current_v1alpha3_migration_is_restartable_and_gates_old_writers()
 }
 
 #[test]
-fn v1alpha2_to_v1alpha3_migration_is_metadata_last_restartable_and_preserves_records() {
+fn v1alpha2_to_current_v1alpha4_migration_is_metadata_last_restartable_and_preserves_records() {
     for &boundary in V3_MIGRATION_PERSISTENCE_BOUNDARIES {
         let directory = TempDir::new().expect("temporary directory");
         let previous = make_v1alpha2_store(directory.path());
@@ -5158,6 +5275,7 @@ fn v1alpha2_to_v1alpha3_migration_is_metadata_last_restartable_and_preserves_rec
                 "{boundary:?}: {kind}"
             );
         }
+        assert_v4_layout_present(directory.path());
         assert!(
             !directory
                 .path()
@@ -5168,6 +5286,100 @@ fn v1alpha2_to_v1alpha3_migration_is_metadata_last_restartable_and_preserves_rec
         assert_eq!(
             CanonicalStore::migrate_v1alpha2(directory.path(), owner())
                 .expect_err("v2 migration remains gated after restart")
+                .code(),
+            StoreErrorCode::UnsupportedStoreFormat
+        );
+    }
+}
+
+#[test]
+fn v1alpha3_to_v1alpha4_migration_is_metadata_last_restartable_and_gates_old_writers() {
+    for &boundary in V3_MIGRATION_PERSISTENCE_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let previous = make_v1alpha3_store(directory.path());
+        let scope = MemoryScope::Project {
+            project_id: project_id("prj_v4_migration"),
+        };
+        let header = frontmatter(
+            "mem_v4_migration",
+            scope,
+            "2026-08-24T01:00:00Z",
+            "2026-08-24T01:00:00Z",
+        );
+        let record_path = write_record(directory.path(), &header, "v3 preserved body\n");
+        let record_bytes = fs::read(&record_path).expect("record before v4 migration");
+        let record_mtime = fs::metadata(&record_path)
+            .expect("record metadata")
+            .modified()
+            .expect("record mtime");
+        let before_open = tree_snapshot(directory.path());
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("v4 reader requires explicit v3 migration")
+                .code(),
+            StoreErrorCode::UnsupportedStoreFormat
+        );
+        assert_eq!(tree_snapshot(directory.path()), before_open);
+
+        let injector = FailOnce::at(boundary);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha3_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(injector.clone()),
+            )
+            .expect_err("v4 migration failpoint interrupts readiness")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+        let published = store_metadata(directory.path()).format_version == STORE_FORMAT_VERSION;
+        let migrated = if published {
+            assert_eq!(
+                CanonicalStore::migrate_v1alpha3(directory.path(), owner())
+                    .expect_err("v3 writer rejects published v4 marker")
+                    .code(),
+                StoreErrorCode::UnsupportedStoreFormat,
+                "{boundary:?}"
+            );
+            CanonicalStore::open(directory.path(), owner()).expect("open published v4 migration")
+        } else {
+            CanonicalStore::migrate_v1alpha3(directory.path(), owner())
+                .expect("retry pre-publish v4 migration")
+        };
+        assert_eq!(migrated.store_id(), &previous.store_id, "{boundary:?}");
+        assert_eq!(migrated.watermark().expect("watermark"), StoreRevision(0));
+        assert_eq!(
+            fs::read(&record_path).expect("record after migration"),
+            record_bytes,
+            "{boundary:?}"
+        );
+        assert_eq!(
+            fs::metadata(&record_path)
+                .expect("record metadata after migration")
+                .modified()
+                .expect("record mtime after migration"),
+            record_mtime,
+            "{boundary:?}"
+        );
+        assert_v4_layout_present(directory.path());
+        assert!(
+            !directory
+                .path()
+                .join(layout::STORE_METADATA_MIGRATION_FILE)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(layout::V3_STORE_METADATA_MIGRATION_FILE)
+                .exists()
+        );
+        drop(migrated);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha3(directory.path(), owner())
+                .expect_err("v3 migration stays gated after restart")
                 .code(),
             StoreErrorCode::UnsupportedStoreFormat
         );
@@ -5316,7 +5528,7 @@ fn active_manifest_codec_must_match_the_authoritative_store_capability() {
 }
 
 #[test]
-fn v1alpha3_migration_recovers_and_validates_active_v1alpha2_wal_first() {
+fn current_migration_recovers_and_validates_active_v1alpha2_wal_first() {
     let directory = TempDir::new().expect("temporary directory");
     let base_metadata = make_v1alpha2_store(directory.path());
     let scope = MemoryScope::Principal {
@@ -5424,7 +5636,7 @@ fn v1alpha3_migration_recovers_and_validates_active_v1alpha2_wal_first() {
     drop(root);
 
     let migrated = CanonicalStore::migrate_v1alpha2(directory.path(), owner())
-        .expect("migration recovers v2 WAL before v3 marker");
+        .expect("migration recovers v2 WAL before current v4 marker");
     assert_eq!(migrated.watermark().expect("watermark"), StoreRevision(1));
     assert_eq!(migrated.metadata.audit_sequence, AuditSequence(1));
     assert_eq!(
@@ -5447,7 +5659,7 @@ fn v1alpha3_migration_recovers_and_validates_active_v1alpha2_wal_first() {
 }
 
 #[test]
-fn migration_recovers_a_legacy_record_transaction_before_publishing_current_v1alpha3() {
+fn migration_recovers_a_legacy_record_transaction_before_publishing_current_v1alpha4() {
     let directory = TempDir::new().expect("temporary directory");
     let legacy = make_legacy_store(directory.path());
     let scope = MemoryScope::Principal {
@@ -5620,6 +5832,8 @@ fn every_persistence_boundary_has_a_crash_recovery_scenario() {
     covered.extend(FORGET_RECOVERY_BOUNDARIES.iter().copied());
     covered.extend(MIGRATION_PERSISTENCE_BOUNDARIES.iter().copied());
     covered.extend(PREVIOUS_MIGRATION_RECOVERY_BOUNDARIES.iter().copied());
+    covered.extend(IMPORT_PERSISTENCE_BOUNDARIES.iter().copied());
+    covered.extend(IMPORT_RECOVERY_BOUNDARIES.iter().copied());
     let declared: BTreeSet<_> = PersistenceBoundary::ALL.iter().copied().collect();
     assert_eq!(covered, declared);
 }
@@ -5833,7 +6047,7 @@ fn v1alpha3_forget_fixtures_match_strict_rust_codecs_without_v2_drift() {
     );
     let store_id = StoreId::new("00000000-0000-4000-8000-000000000018").expect("store ID");
     let base_metadata = StoreMetadata {
-        format_version: STORE_FORMAT_VERSION.to_owned(),
+        format_version: crate::metadata::V3_STORE_FORMAT_VERSION.to_owned(),
         store_id: store_id.clone(),
         store_revision: StoreRevision(50),
         audit_sequence: AuditSequence(9),
@@ -5880,26 +6094,28 @@ fn v1alpha3_forget_fixtures_match_strict_rust_codecs_without_v2_drift() {
         &tombstone,
     )
     .expect("forget artifacts");
-    let manifest = crate::transaction::TransactionManifest::for_forget(
+    let manifest = crate::transaction::TransactionManifest {
+        format_version: crate::transaction::V3_TRANSACTION_FORMAT_VERSION.to_owned(),
+        transaction_id: binding.transaction_id.clone(),
         store_id,
-        binding.transaction_id.clone(),
-        crate::transaction::ForgetTransaction {
-            memory_id: binding.memory_id.clone(),
-            scope,
-            revision: binding.target_revision,
-            etag: binding.target_etag.clone(),
-            base_store_metadata: base_metadata,
-            target_store_metadata: target_metadata.clone(),
-            idempotency: crate::idempotency::IdempotencyTransaction {
-                binding,
-                result_digest: artifacts.result_digest.clone(),
-                receipt_digest: artifacts.receipt_digest.clone(),
-                audit_digest: artifacts.audit_digest.clone(),
+        intent: crate::transaction::TransactionIntent::Forget(Box::new(
+            crate::transaction::ForgetTransaction {
+                memory_id: binding.memory_id.clone(),
+                scope,
+                revision: binding.target_revision,
+                etag: binding.target_etag.clone(),
+                base_store_metadata: base_metadata,
+                target_store_metadata: target_metadata.clone(),
+                idempotency: crate::idempotency::IdempotencyTransaction {
+                    binding,
+                    result_digest: artifacts.result_digest.clone(),
+                    receipt_digest: artifacts.receipt_digest.clone(),
+                    audit_digest: artifacts.audit_digest.clone(),
+                },
+                tombstone_digest: crate::idempotency::content_digest(&tombstone_bytes),
             },
-            tombstone_digest: crate::idempotency::content_digest(&tombstone_bytes),
-        },
-    )
-    .expect("forget manifest");
+        )),
+    };
     assert_eq!(
         target_metadata.canonical_bytes().expect("metadata bytes"),
         include_bytes!("../fixtures/v1alpha3/store-metadata.json")
@@ -5923,6 +6139,19 @@ fn v1alpha3_forget_fixtures_match_strict_rust_codecs_without_v2_drift() {
     assert_eq!(
         manifest.canonical_bytes().expect("manifest bytes"),
         include_bytes!("../fixtures/v1alpha3/forget-transaction.json")
+    );
+}
+
+#[test]
+fn v1alpha4_store_metadata_fixture_is_canonical_without_historical_drift() {
+    let bytes = include_bytes!("../fixtures/v1alpha4/store-metadata.json");
+    let metadata: StoreMetadata = serde_json::from_slice(bytes).expect("strict v4 metadata");
+    assert_eq!(metadata.format_version, STORE_FORMAT_VERSION);
+    assert_eq!(metadata.store_revision, StoreRevision(4));
+    assert_eq!(metadata.audit_sequence, AuditSequence(1));
+    assert_eq!(
+        metadata.canonical_bytes().expect("canonical v4 metadata"),
+        bytes
     );
 }
 
@@ -7727,4 +7956,1516 @@ fn tombstone_protection_precedes_body_decode_for_same_and_other_authorized_scope
     ));
     assert!(!opened.load(Ordering::SeqCst));
     layout::run_test_hook(layout::TestHookPoint::RegularOpen, OsStr::new(&file_name));
+}
+
+#[test]
+fn portable_import_plan_is_deterministic_zero_write_and_classifies_fresh_authority() {
+    let directory = TempDir::new().expect("temporary target store");
+    let principal = principal_id("prn_portable_export");
+    let project = project_id("prj_portable_export");
+    let session = session_id("ses_portable_export");
+    let project_scope = MemoryScope::Project {
+        project_id: project.clone(),
+    };
+    let session_scope = MemoryScope::Session {
+        session_id: session.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project)
+        .with_session(session);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &session_scope, MutationOperation::Create),
+        "mem_portable_a_range",
+        "TARGET_CONFLICT_BODY_SENTINEL",
+    )
+    .expect("create conflicting target record");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &project_scope, MutationOperation::Create),
+        "mem_portable_forgotten",
+        "TARGET_FORGOTTEN_BODY_SENTINEL",
+    )
+    .expect("create target record to forget");
+    store
+        .forget(
+            &authorized_mutation(&authority, &project_scope, MutationOperation::Forget),
+            &forget_command(
+                &memory_id("mem_portable_forgotten"),
+                1,
+                "target-plan-forget-key",
+                "TARGET_PRIVATE_REASON_SENTINEL",
+            ),
+            timestamp("2026-08-24T09:00:00Z"),
+        )
+        .expect("protect target ID");
+
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let context = TrustedRequestContext {
+        principal_id: principal.clone(),
+        client_id: ClientId::new("cli_import_plan_tests").expect("valid client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("valid project import grant"),
+            Grant::new("memory:import:session").expect("valid session import grant"),
+        ]),
+    };
+    let before = tree_snapshot(directory.path());
+    let first = store
+        .plan_import(&authority, &context, bundle_bytes)
+        .expect("deterministic dry run");
+    let second = store
+        .plan_import(&authority, &context, bundle_bytes)
+        .expect("repeat deterministic dry run");
+    assert_eq!(first, second);
+    assert_eq!(first.counts.accepted, 1);
+    assert_eq!(first.counts.conflicting, 1);
+    assert_eq!(first.counts.tombstone_protected, 1);
+    assert_eq!(first.counts.unauthorized, 0);
+    assert!(!first.committable);
+    let bytes = first.canonical_bytes().expect("canonical import plan");
+    assert_eq!(
+        ImportDryRunPlan::decode_canonical(&bytes).expect("strict import plan decode"),
+        first
+    );
+    let text = String::from_utf8(bytes).expect("plan is UTF-8");
+    for forbidden in [
+        "TARGET_CONFLICT_BODY_SENTINEL",
+        "TARGET_FORGOTTEN_BODY_SENTINEL",
+        "TARGET_PRIVATE_REASON_SENTINEL",
+        "target-plan-forget-key",
+        directory.path().to_string_lossy().as_ref(),
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+
+    let project_only = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_plan_project_only").expect("valid client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("valid project import grant")
+        ]),
+    };
+    let partial = store
+        .plan_import(&authority, &project_only, bundle_bytes)
+        .expect("unauthorized items are safely classified");
+    assert_eq!(partial.counts.unauthorized, 1);
+    assert_eq!(partial.counts.accepted, 1);
+    assert_eq!(partial.counts.tombstone_protected, 1);
+    assert_eq!(tree_snapshot(directory.path()), before);
+
+    let watermark = store.watermark().expect("pre-commit watermark");
+    assert_eq!(
+        store
+            .import_portable(
+                &authority,
+                &context,
+                bundle_bytes,
+                &first.digest,
+                &IdempotencyKey::new("noncommittable-import-key").expect("key"),
+            )
+            .expect_err("conflict/tombstone plan cannot enter WAL")
+            .code(),
+        StoreErrorCode::ValidationFailed
+    );
+    assert_eq!(tree_snapshot(directory.path()), before);
+    assert_eq!(store.watermark().expect("unchanged watermark"), watermark);
+
+    assert_eq!(
+        store
+            .import_portable(
+                &authority,
+                &project_only,
+                bundle_bytes,
+                &partial.digest,
+                &IdempotencyKey::new("unauthorized-import-key").expect("key"),
+            )
+            .expect_err("missing exact-scope grant exits before WAL")
+            .code(),
+        StoreErrorCode::Forbidden
+    );
+    assert_eq!(tree_snapshot(directory.path()), before);
+    assert_eq!(store.watermark().expect("unchanged watermark"), watermark);
+}
+
+#[test]
+fn portable_import_plan_strict_decode_rejects_semantic_tampering_and_unused_unauthorized_scope_is_not_committable()
+ {
+    let directory = TempDir::new().expect("temporary target store");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_plan_semantics").expect("valid client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("project import grant"),
+            Grant::new("memory:import:session").expect("session import grant"),
+        ]),
+    };
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let plan = store
+        .plan_import(&authority, &context, bundle_bytes)
+        .expect("committable plan");
+    assert!(plan.committable);
+    assert_eq!(plan.counts.accepted, plan.entries.len() as u32);
+
+    let mut missing_scope = plan.clone();
+    missing_scope.entries[0].scope = MemoryScope::InstanceGlobal {};
+    missing_scope.refresh_digest_for_test();
+    assert!(matches!(
+        missing_scope.canonical_bytes(),
+        Err(StoreError::InvalidRequest)
+    ));
+
+    let mut duplicate_id = plan.clone();
+    duplicate_id.entries[1].memory_id = duplicate_id.entries[0].memory_id.clone();
+    duplicate_id.refresh_digest_for_test();
+    assert!(matches!(
+        duplicate_id.canonical_bytes(),
+        Err(StoreError::InvalidRequest)
+    ));
+
+    let mut unauthorized_mismatch = plan.clone();
+    unauthorized_mismatch.entries[0].classification = ImportClassification::Unauthorized;
+    unauthorized_mismatch.counts.accepted -= 1;
+    unauthorized_mismatch.counts.unauthorized += 1;
+    unauthorized_mismatch.committable = false;
+    unauthorized_mismatch.refresh_digest_for_test();
+    assert!(matches!(
+        unauthorized_mismatch.canonical_bytes(),
+        Err(StoreError::InvalidRequest)
+    ));
+
+    let mut invalid_within_batch_bound = plan;
+    invalid_within_batch_bound.entries[0].classification = ImportClassification::Invalid;
+    invalid_within_batch_bound.counts.accepted -= 1;
+    invalid_within_batch_bound.counts.invalid += 1;
+    invalid_within_batch_bound.committable = false;
+    invalid_within_batch_bound.refresh_digest_for_test();
+    assert!(matches!(
+        invalid_within_batch_bound.canonical_bytes(),
+        Err(StoreError::InvalidRequest)
+    ));
+
+    let mut bundle = PortableExportBundle::decode_canonical(bundle_bytes).expect("strict bundle");
+    bundle.scopes.push(MemoryScope::InstanceGlobal {});
+    bundle.refresh_digest_for_test();
+    let bundle_with_unused_scope = bundle.canonical_bytes().expect("strict extended bundle");
+    let before = tree_snapshot(directory.path());
+    let unused_scope_plan = store
+        .plan_import(&authority, &context, &bundle_with_unused_scope)
+        .expect("unused unauthorized scope is represented in the plan");
+    assert!(unused_scope_plan.scopes.iter().any(|decision| matches!(
+        &decision.scope,
+        MemoryScope::InstanceGlobal {}
+    ) && !decision.authorized));
+    assert_eq!(unused_scope_plan.counts.unauthorized, 0);
+    assert!(!unused_scope_plan.committable);
+    assert_eq!(
+        ImportDryRunPlan::decode_canonical(
+            &unused_scope_plan
+                .canonical_bytes()
+                .expect("canonical noncommittable plan")
+        )
+        .expect("strict plan decode"),
+        unused_scope_plan
+    );
+    assert_eq!(tree_snapshot(directory.path()), before);
+}
+
+#[test]
+fn portable_import_plan_rejects_more_than_the_bounded_scope_count_without_writes() {
+    let directory = TempDir::new().expect("temporary target store");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let mut bundle = PortableExportBundle::decode_canonical(include_bytes!(
+        "../fixtures/inspection/v1alpha1/valid/portable-export.json"
+    ))
+    .expect("portable fixture");
+    let mut scopes = (0..99)
+        .map(|index| MemoryScope::Project {
+            project_id: project_id(&format!("prj_import_bound_{index:03}")),
+        })
+        .collect::<Vec<_>>();
+    scopes.push(MemoryScope::Project {
+        project_id: project_id("prj_portable_export"),
+    });
+    scopes.push(MemoryScope::Session {
+        session_id: session_id("ses_portable_export"),
+    });
+    bundle.scopes = scopes;
+    bundle.refresh_digest_for_test();
+    let bundle_bytes = bundle.canonical_bytes().expect("101-scope portable bundle");
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_scope_bound").expect("valid client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("valid project import grant"),
+            Grant::new("memory:import:session").expect("valid session import grant"),
+        ]),
+    };
+    let before = tree_snapshot(directory.path());
+    assert!(matches!(
+        store.plan_import(&authority, &context, &bundle_bytes),
+        Err(StoreError::InvalidRequest)
+    ));
+    assert_eq!(tree_snapshot(directory.path()), before);
+}
+
+#[test]
+fn portable_import_commits_atomically_replays_and_survives_restart() {
+    const RAW_KEY: &str = "raw-import-key-must-not-be-persisted";
+    let directory = TempDir::new().expect("temporary target store");
+    let principal = principal_id("prn_portable_export");
+    let project = project_id("prj_portable_export");
+    let session = session_id("ses_portable_export");
+    let scopes = vec![
+        MemoryScope::Project {
+            project_id: project.clone(),
+        },
+        MemoryScope::Session {
+            session_id: session.clone(),
+        },
+    ];
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project)
+        .with_session(session);
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_commit_tests").expect("valid client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("valid project import grant"),
+            Grant::new("memory:import:session").expect("valid session import grant"),
+        ]),
+    };
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let source = PortableExportBundle::decode_canonical(bundle_bytes).expect("portable fixture");
+    let key = IdempotencyKey::new(RAW_KEY).expect("valid import key");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let plan = store
+        .plan_import(&authority, &context, bundle_bytes)
+        .expect("committable plan");
+    assert!(plan.committable);
+    let first = store
+        .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+        .expect("commit import");
+    assert!(!first.idempotent_replay);
+    assert_eq!(first.result.record_count, 2);
+    assert_eq!(first.result.tombstone_count, 1);
+    assert_eq!(
+        first.result.target_snapshot.store_revision,
+        source.snapshot.store_revision
+    );
+    let committed_watermark = store.watermark().expect("committed watermark");
+    let replay = store
+        .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+        .expect("live exact replay");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.result, first.result);
+    assert_eq!(
+        store.watermark().expect("replay watermark"),
+        committed_watermark
+    );
+    assert!(matches!(
+        store.get(&memory_id("mem_portable_forgotten"), &authority),
+        Err(StoreError::NotFound)
+    ));
+    let exported = store
+        .export_scopes(&authority, &scopes)
+        .expect("export imported state");
+    assert_eq!(exported.records, source.records);
+    assert_eq!(exported.tombstones.len(), source.tombstones.len());
+    let imported_tombstone = &exported.tombstones[0];
+    let source_tombstone = &source.tombstones[0];
+    assert_eq!(imported_tombstone.memory_id, source_tombstone.memory_id);
+    assert_eq!(imported_tombstone.scope, source_tombstone.scope);
+    assert_eq!(imported_tombstone.revision, source_tombstone.revision);
+    assert_eq!(imported_tombstone.etag, source_tombstone.etag);
+    assert_eq!(
+        imported_tombstone.forgotten_at,
+        source_tombstone.forgotten_at
+    );
+    drop(store);
+
+    let mut reopened =
+        CanonicalStore::open(directory.path(), owner()).expect("reopen imported store");
+    let replay = reopened
+        .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+        .expect("restart exact replay");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.result, first.result);
+    let project_scope = scopes[0].clone();
+    let session_scope = scopes[1].clone();
+    reopened
+        .update(
+            &authorized_mutation(&authority, &project_scope, MutationOperation::Update),
+            &update_command(
+                &memory_id("mem_portable_complete"),
+                1,
+                "updated after portable import",
+            ),
+            timestamp("2026-08-24T10:00:00Z"),
+        )
+        .expect("ordinary update after import");
+    reopened
+        .forget(
+            &authorized_mutation(&authority, &session_scope, MutationOperation::Forget),
+            &forget_command(
+                &memory_id("mem_portable_a_range"),
+                1,
+                "forget-imported-record",
+                "ordinary forget after portable import",
+            ),
+            timestamp("2026-08-24T10:01:00Z"),
+        )
+        .expect("ordinary forget after import");
+    drop(reopened);
+
+    let reopened = CanonicalStore::open(directory.path(), owner())
+        .expect("historical import ledger permits later record lifecycle");
+    assert_eq!(
+        reopened
+            .get(&memory_id("mem_portable_complete"), &authority)
+            .expect("updated imported record")
+            .result
+            .revision,
+        Revision::new(2).expect("revision two")
+    );
+    assert!(matches!(
+        reopened.get(&memory_id("mem_portable_a_range"), &authority),
+        Err(StoreError::NotFound)
+    ));
+    for (relative, entry) in tree_snapshot(directory.path()) {
+        let Some(bytes) = entry.bytes else {
+            continue;
+        };
+        if !relative.starts_with("records") {
+            let text = String::from_utf8_lossy(&bytes);
+            for forbidden in [
+                RAW_KEY,
+                "portable range provenance body",
+                "portable body\nwith exact markdown",
+                directory.path().to_string_lossy().as_ref(),
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "secret/body/path sentinel leaked into {}",
+                    relative.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn import_conflicting_key_reuse_is_write_free_and_authorization_precedes_receipt_lookup() {
+    let directory = TempDir::new().expect("temporary target store");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let context = TrustedRequestContext {
+        principal_id: principal.clone(),
+        client_id: ClientId::new("cli_import_conflict").expect("client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("project grant"),
+            Grant::new("memory:import:session").expect("session grant"),
+        ]),
+    };
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let plan = store
+        .plan_import(&authority, &context, bundle_bytes)
+        .expect("plan");
+    let key = IdempotencyKey::new("import-conflicting-key").expect("key");
+    store
+        .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+        .expect("commit initial request");
+
+    let mut different_bundle =
+        PortableExportBundle::decode_canonical(bundle_bytes).expect("portable fixture");
+    different_bundle.source_store_id =
+        StoreId::new("019d2a4a-7b00-7000-8000-000000000099").expect("different source store");
+    different_bundle.refresh_digest_for_test();
+    let different_bytes = different_bundle
+        .canonical_bytes()
+        .expect("different strict bundle");
+    let before_conflict = tree_snapshot(directory.path());
+    assert_eq!(
+        store
+            .import_portable(&authority, &context, &different_bytes, &plan.digest, &key)
+            .expect_err("same key with different canonical input conflicts")
+            .code(),
+        StoreErrorCode::IdempotencyConflict
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_conflict);
+
+    // Corrupt the private receipt after commit. A caller lacking one required
+    // exact-scope import grant must still receive Forbidden before lookup can
+    // observe or decode the private artifact.
+    let receipt = only_regular_file_below(directory.path(), layout::IMPORT_RECEIPTS_DIR);
+    fs::write(&receipt, b"PRIVATE_RECEIPT_CORRUPTION_SENTINEL\n")
+        .expect("inject private receipt corruption");
+    let unauthorized = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_unauthorized_replay").expect("client ID"),
+        grants: BTreeSet::from([Grant::new("memory:import:project").expect("project-only grant")]),
+    };
+    let before_forbidden = tree_snapshot(directory.path());
+    assert_eq!(
+        store
+            .import_portable(&authority, &unauthorized, bundle_bytes, &plan.digest, &key,)
+            .expect_err("authorization precedes receipt lookup")
+            .code(),
+        StoreErrorCode::Forbidden
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_forbidden);
+}
+
+#[test]
+fn committed_import_receipt_hardlink_fails_closed_for_live_replay_and_restart() {
+    let directory = TempDir::new().expect("temporary target store");
+    let external = TempDir::new().expect("external hardlink witness");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_receipt_hardlink").expect("client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("project grant"),
+            Grant::new("memory:import:session").expect("session grant"),
+        ]),
+    };
+    let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let key = IdempotencyKey::new("import-receipt-hardlink").expect("key");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let plan = store
+        .plan_import(&authority, &context, bundle)
+        .expect("plan");
+    store
+        .import_portable(&authority, &context, bundle, &plan.digest, &key)
+        .expect("commit import");
+
+    let receipt = only_regular_file_below(directory.path(), layout::IMPORT_RECEIPTS_DIR);
+    let external_link = external.path().join("receipt-hardlink.json");
+    fs::hard_link(&receipt, &external_link).expect("inject committed receipt hardlink");
+    let receipt_bytes = fs::read(&external_link).expect("hardlink witness bytes");
+    let before_replay = tree_snapshot(directory.path());
+    assert_eq!(
+        store
+            .import_portable(&authority, &context, bundle, &plan.digest, &key)
+            .expect_err("live replay rejects a multi-link receipt")
+            .code(),
+        StoreErrorCode::UnsafePath
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_replay);
+    assert_eq!(
+        fs::read(&external_link).expect("external hardlink survives live rejection"),
+        receipt_bytes
+    );
+    drop(store);
+
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("startup rejects a multi-link committed receipt")
+            .code(),
+        StoreErrorCode::UnsafePath
+    );
+    assert_eq!(
+        fs::read(&external_link).expect("external hardlink survives startup rejection"),
+        receipt_bytes
+    );
+}
+
+#[test]
+fn import_rebuilds_metadata_after_rename_without_directory_sync_and_recovery_is_restartable() {
+    let directory = TempDir::new().expect("temporary target store");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_metadata_recovery").expect("client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("project grant"),
+            Grant::new("memory:import:session").expect("session grant"),
+        ]),
+    };
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let key = IdempotencyKey::new("import-metadata-recovery-key").expect("key");
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let base_metadata_bytes =
+        fs::read(directory.path().join(layout::STORE_METADATA_FILE)).expect("base metadata bytes");
+    drop(store);
+
+    let injector = FailOnce::at(PersistenceBoundary::MetadataRenamed);
+    let mut store = CanonicalStore::open_with_options(
+        directory.path(),
+        owner(),
+        StoreOptions::with_failpoint_injector(injector),
+    )
+    .expect("open with metadata failpoint");
+    let plan = store
+        .plan_import(&authority, &context, bundle_bytes)
+        .expect("plan");
+    assert_eq!(
+        store
+            .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+            .expect_err("stop after metadata rename")
+            .code(),
+        StoreErrorCode::InjectedFailure
+    );
+    drop(store);
+
+    // Model a reboot that retained all preceding durable target/artifact
+    // directory syncs but lost the unsynced metadata rename.
+    fs::write(
+        directory.path().join(layout::STORE_METADATA_FILE),
+        &base_metadata_bytes,
+    )
+    .expect("restore old durable metadata view");
+    assert_eq!(
+        CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(
+                PersistenceBoundary::RecoveryMetadataDirectorySynced,
+            )),
+        )
+        .expect_err("recovery metadata publication remains restartable")
+        .code(),
+        StoreErrorCode::InjectedFailure
+    );
+
+    let mut reopened = CanonicalStore::open(directory.path(), owner())
+        .expect("second recovery observes complete target state");
+    let replay = reopened
+        .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+        .expect("exact receipt replay after recovery");
+    assert!(replay.idempotent_replay);
+    assert_eq!(
+        fs::read_dir(directory.path().join("transactions"))
+            .expect("transaction directory")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn prepublication_incomplete_import_temps_roll_back_to_a_serviceable_old_store() {
+    let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    for boundary in [
+        PersistenceBoundary::RecordTempWritten,
+        PersistenceBoundary::BackupMetadataTempWritten,
+        PersistenceBoundary::MetadataTempWritten,
+    ] {
+        let directory = TempDir::new().expect("target store");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new(format!("cli_incomplete_{boundary:?}")).expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(boundary)),
+        )
+        .expect("open failpoint store");
+        let plan = store
+            .plan_import(&authority, &context, bundle)
+            .expect("plan");
+        let key = IdempotencyKey::new(format!("incomplete-{boundary:?}")).expect("idempotency key");
+        assert_eq!(
+            store
+                .import_portable(&authority, &context, bundle, &plan.digest, &key)
+                .expect_err("leave pre-publication temp")
+                .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        drop(store);
+
+        let staged = match boundary {
+            PersistenceBoundary::RecordTempWritten => {
+                regular_files_below(directory.path(), "records")
+                    .into_iter()
+                    .find(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with(".import-record-")
+                        })
+                    })
+                    .map(|path| directory.path().join(path))
+                    .expect("staged import record")
+            }
+            PersistenceBoundary::BackupMetadataTempWritten => {
+                only_regular_file_below(directory.path(), layout::IMPORT_BACKUPS_DIR)
+            }
+            PersistenceBoundary::MetadataTempWritten => {
+                let manifest = only_regular_file_below(directory.path(), "transactions");
+                let transaction_id = manifest
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .expect("manifest transaction ID");
+                directory
+                    .path()
+                    .join(format!(".store-{transaction_id}.tmp"))
+            }
+            _ => unreachable!(),
+        };
+        assert!(staged.is_file(), "staged file exists for {boundary:?}");
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&staged)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"INCOMPLETE_IMPORT_TEMP"))
+            .expect("truncate safe single-link staging file");
+
+        let mut reopened = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("rollback incomplete {boundary:?}: {error:?}"));
+        assert_eq!(
+            reopened.watermark().expect("old watermark"),
+            StoreRevision(0)
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .expect("transaction directory")
+                .count(),
+            0,
+            "{boundary:?}"
+        );
+        assert!(!staged.exists(), "incomplete temp removed: {boundary:?}");
+        let retry = reopened
+            .import_portable(&authority, &context, bundle, &plan.digest, &key)
+            .unwrap_or_else(|error| panic!("retry after rollback {boundary:?}: {error:?}"));
+        assert!(!retry.idempotent_replay, "{boundary:?}");
+        assert_eq!(retry.result.record_count, 2, "{boundary:?}");
+        assert_eq!(retry.result.tombstone_count, 1, "{boundary:?}");
+    }
+}
+
+#[test]
+fn maximum_hundred_item_import_has_a_bounded_v4_manifest_and_commits() {
+    let fixture = PortableExportBundle::decode_canonical(include_bytes!(
+        "../fixtures/inspection/v1alpha1/valid/portable-export.json"
+    ))
+    .expect("portable fixture");
+    let template: jiandu_core::MemoryRecord = fixture.records[0].clone().into();
+    let long_project = project_id(&format!("prj_{}", "p".repeat(120)));
+    let scope = MemoryScope::Project {
+        project_id: long_project.clone(),
+    };
+    let mut records = Vec::new();
+    for index in 0..101 {
+        let mut record = template.clone();
+        record.id = memory_id(&format!("mem_{index:03}_{}", "m".repeat(112)));
+        record.scope = scope.clone();
+        record.title = format!("Bounded import record {index:03}");
+        record.summary = None;
+        record.relations.clear();
+        let bytes = encode_canonical_document(
+            &MemoryFrontmatterV1Alpha1::from_record(&record),
+            &record.body,
+        )
+        .expect("encode bounded record");
+        let canonical = decode_canonical_document(&bytes, Some(&record.id))
+            .expect("decode bounded record")
+            .record;
+        records.push(PortableMemoryRecord::from(canonical));
+    }
+    let mut bundle = fixture;
+    bundle.source_store_format = STORE_FORMAT_VERSION.to_owned();
+    bundle.source_store_id =
+        StoreId::new("019d2a4a-7b00-7000-8000-000000000020").expect("source store ID");
+    bundle.snapshot = SnapshotWatermark {
+        store_revision: StoreRevision(101),
+        audit_sequence: AuditSequence(101),
+    };
+    bundle.scopes = vec![scope.clone()];
+    bundle.records = records;
+    bundle.tombstones.clear();
+    let directory = TempDir::new().expect("target store");
+    let principal = principal_id("prn_import_hundred");
+    let authority = AuthorizedScopes::new(principal.clone()).with_project(long_project);
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_import_hundred").expect("client ID"),
+        grants: BTreeSet::from([Grant::new("memory:import:project").expect("import grant")]),
+    };
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    bundle.refresh_digest_for_test();
+    let oversized_bytes = bundle.canonical_bytes().expect("101 item bundle");
+    let oversized_plan = store
+        .plan_import(&authority, &context, &oversized_bytes)
+        .expect("bounded dry run classifies an oversized batch");
+    assert_eq!(oversized_plan.counts.invalid, 101);
+    assert!(!oversized_plan.committable);
+    assert_eq!(
+        ImportDryRunPlan::decode_canonical(
+            &oversized_plan
+                .canonical_bytes()
+                .expect("canonical invalid-category plan")
+        )
+        .expect("strict invalid-category plan"),
+        oversized_plan
+    );
+    let mut contradictory_oversized_plan = oversized_plan.clone();
+    contradictory_oversized_plan.entries[0].classification = ImportClassification::Accepted;
+    contradictory_oversized_plan.counts.invalid -= 1;
+    contradictory_oversized_plan.counts.accepted += 1;
+    contradictory_oversized_plan.refresh_digest_for_test();
+    assert!(matches!(
+        contradictory_oversized_plan.canonical_bytes(),
+        Err(StoreError::InvalidRequest)
+    ));
+    let before_oversized_commit = tree_snapshot(directory.path());
+    let before_oversized_watermark = store.watermark().expect("base watermark");
+    assert_eq!(
+        store
+            .import_portable(
+                &authority,
+                &context,
+                &oversized_bytes,
+                &oversized_plan.digest,
+                &IdempotencyKey::new("import-oversized-fresh-key").expect("key"),
+            )
+            .expect_err("invalid oversized plan cannot enter WAL")
+            .code(),
+        StoreErrorCode::ValidationFailed
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_oversized_commit);
+    assert_eq!(
+        store.watermark().expect("unchanged watermark"),
+        before_oversized_watermark
+    );
+    bundle.records.pop();
+    bundle.refresh_digest_for_test();
+    let bundle_bytes = bundle.canonical_bytes().expect("hundred item bundle");
+    drop(store);
+    let mut store = CanonicalStore::open_with_options(
+        directory.path(),
+        owner(),
+        StoreOptions::with_failpoint_injector(FailOnce::at(
+            PersistenceBoundary::ManifestDirectorySynced,
+        )),
+    )
+    .expect("open with manifest failpoint");
+    let plan = store
+        .plan_import(&authority, &context, &bundle_bytes)
+        .expect("hundred item plan");
+    let key = IdempotencyKey::new("import-hundred-key").expect("key");
+    assert_eq!(
+        store
+            .import_portable(&authority, &context, &bundle_bytes, &plan.digest, &key)
+            .expect_err("inspect persisted maximum manifest")
+            .code(),
+        StoreErrorCode::InjectedFailure
+    );
+    let manifest = only_regular_file_below(directory.path(), "transactions");
+    let manifest_len = fs::metadata(&manifest).expect("manifest metadata").len();
+    assert!(
+        manifest_len > 65_536,
+        "test must exercise the v4-only bound"
+    );
+    assert!(manifest_len <= 262_144, "v4 batch WAL remains bounded");
+    drop(store);
+
+    let mut reopened = CanonicalStore::open(directory.path(), owner()).expect("rollback staging");
+    let committed = reopened
+        .import_portable(&authority, &context, &bundle_bytes, &plan.digest, &key)
+        .expect("commit maximum batch");
+    assert_eq!(committed.result.record_count, 100);
+    assert_eq!(
+        reopened.watermark().expect("target watermark"),
+        StoreRevision(101)
+    );
+    assert_eq!(
+        reopened
+            .list(&list_request(vec![scope_selector(&scope)], 100), &authority)
+            .expect("list imported batch")
+            .result
+            .memories
+            .len(),
+        100
+    );
+}
+
+#[test]
+fn import_persistence_boundaries_recover_old_or_complete_new_and_replay_exactly() {
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    for &boundary in IMPORT_PERSISTENCE_BOUNDARIES {
+        let directory = TempDir::new().expect("target store");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new("cli_import_failpoints").expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let injector = FailOnce::at(boundary);
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(injector.clone()),
+        )
+        .expect("open failpoint store");
+        let plan = store
+            .plan_import(&authority, &context, bundle_bytes)
+            .expect("plan import");
+        let key =
+            IdempotencyKey::new(format!("import-fail-{boundary:?}")).expect("valid boundary key");
+        let error = store
+            .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+            .expect_err("boundary injects import failure");
+        assert_eq!(
+            error.code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+        assert_eq!(
+            store
+                .watermark()
+                .expect_err("failed import poisons handle")
+                .code(),
+            StoreErrorCode::RecoveryRequired,
+            "{boundary:?}"
+        );
+        drop(store);
+
+        let mut reopened = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("recover {boundary:?}: {error:?}"));
+        let completion = reopened
+            .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+            .unwrap_or_else(|error| panic!("complete/replay {boundary:?}: {error:?}"));
+        assert_eq!(
+            completion.idempotent_replay,
+            import_target_was_published(boundary),
+            "{boundary:?}"
+        );
+        assert_eq!(completion.result.record_count, 2, "{boundary:?}");
+        assert_eq!(completion.result.tombstone_count, 1, "{boundary:?}");
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .expect("transaction directory")
+                .count(),
+            0,
+            "{boundary:?}"
+        );
+    }
+}
+
+#[test]
+fn import_recovery_boundaries_are_restartable_and_finish_the_same_batch() {
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    for &recovery_boundary in IMPORT_RECOVERY_BOUNDARIES {
+        let directory = TempDir::new().expect("target store");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new("cli_import_recovery_failpoints").expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(PersistenceBoundary::RecordRenamed)),
+        )
+        .expect("open live failure store");
+        let plan = store
+            .plan_import(&authority, &context, bundle_bytes)
+            .expect("plan import");
+        let key = IdempotencyKey::new(format!("import-recovery-{recovery_boundary:?}"))
+            .expect("valid recovery key");
+        store
+            .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+            .expect_err("leave partially published batch");
+        drop(store);
+
+        assert_eq!(
+            CanonicalStore::open_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(FailOnce::at(recovery_boundary)),
+            )
+            .expect_err("recovery boundary blocks readiness")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{recovery_boundary:?}"
+        );
+        let mut reopened = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("retry {recovery_boundary:?}: {error:?}"));
+        let replay = reopened
+            .import_portable(&authority, &context, bundle_bytes, &plan.digest, &key)
+            .expect("recovered import replays");
+        assert!(replay.idempotent_replay, "{recovery_boundary:?}");
+        assert_eq!(replay.result.record_count, 2, "{recovery_boundary:?}");
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .expect("transaction directory")
+                .count(),
+            0,
+            "{recovery_boundary:?}"
+        );
+    }
+}
+
+#[test]
+fn wal_backup_metadata_is_returned_and_independently_authorized_for_strict_readback() {
+    let directory = TempDir::new().expect("import target");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let import_context = TrustedRequestContext {
+        principal_id: principal.clone(),
+        client_id: ClientId::new("cli_backup_import").expect("client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("project import grant"),
+            Grant::new("memory:import:session").expect("session import grant"),
+        ]),
+    };
+    let bundle_bytes = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let plan = store
+        .plan_import(&authority, &import_context, bundle_bytes)
+        .expect("plan");
+    let commit = store
+        .import_portable(
+            &authority,
+            &import_context,
+            bundle_bytes,
+            &plan.digest,
+            &IdempotencyKey::new("import-with-backup-metadata").expect("key"),
+        )
+        .expect("commit import and backup in one WAL");
+    assert_eq!(
+        BackupMetadata::decode_canonical(
+            &commit
+                .backup_metadata
+                .canonical_bytes()
+                .expect("canonical backup metadata")
+        )
+        .expect("strict backup decode"),
+        commit.backup_metadata
+    );
+    assert_eq!(
+        commit.backup_metadata.transaction_id,
+        commit.result.transaction_id
+    );
+    assert_eq!(
+        commit.backup_metadata.target_snapshot,
+        commit.result.target_snapshot
+    );
+
+    let write_only = TrustedRequestContext {
+        principal_id: principal.clone(),
+        client_id: ClientId::new("cli_backup_write_only").expect("client ID"),
+        grants: BTreeSet::from([Grant::new("memory:write:project").expect("ordinary write grant")]),
+    };
+    assert!(matches!(
+        authority.authorize_backup_metadata(&write_only),
+        Err(StoreError::Forbidden)
+    ));
+    let backup_context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_backup_metadata").expect("client ID"),
+        grants: BTreeSet::from([Grant::new("memory:admin:backup_metadata").expect("backup grant")]),
+    };
+    let authorization = authority
+        .authorize_backup_metadata(&backup_context)
+        .expect("backup metadata capability");
+    assert_eq!(
+        store
+            .read_backup_metadata(&authorization, "not-a-canonical-transaction-id")
+            .expect_err("malformed transaction ID is caller input, not authorization")
+            .code(),
+        StoreErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        store
+            .read_backup_metadata(&authorization, &commit.result.transaction_id)
+            .expect("authorized strict readback"),
+        commit.backup_metadata
+    );
+    drop(store);
+    let reopened = CanonicalStore::open(directory.path(), owner()).expect("restart");
+    assert_eq!(
+        reopened
+            .read_backup_metadata(&authorization, &commit.result.transaction_id)
+            .expect("restart strict readback"),
+        commit.backup_metadata
+    );
+}
+
+#[test]
+fn committed_backup_tamper_missing_and_orphan_states_fail_closed_without_repair() {
+    for mode in ["tamper", "missing", "orphan"] {
+        let directory = TempDir::new().expect("import target");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new(format!("cli_backup_corruption_{mode}")).expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+        let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+        let plan = store
+            .plan_import(&authority, &context, bundle)
+            .expect("plan");
+        store
+            .import_portable(
+                &authority,
+                &context,
+                bundle,
+                &plan.digest,
+                &IdempotencyKey::new(format!("backup-corruption-{mode}")).expect("key"),
+            )
+            .expect("commit import");
+        drop(store);
+
+        let backup = only_regular_file_below(directory.path(), layout::IMPORT_BACKUPS_DIR);
+        match mode {
+            "tamper" => {
+                fs::write(&backup, b"MALFORMED_BACKUP_METADATA_SENTINEL\n")
+                    .expect("tamper committed backup");
+            }
+            "missing" => fs::remove_file(&backup).expect("remove committed backup"),
+            "orphan" => {
+                let orphan = directory
+                    .path()
+                    .join(layout::IMPORT_BACKUPS_DIR)
+                    .join("00000000-0000-4000-8000-000000000099.json");
+                fs::copy(&backup, &orphan).expect("copy orphan backup");
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .open(&orphan)
+                    .expect("open orphan backup");
+                layout::StoreDirectory::set_private_file(&file).expect("private orphan backup");
+            }
+            _ => unreachable!(),
+        }
+        let backup_tree_before = tree_snapshot(&directory.path().join(layout::IMPORT_BACKUPS_DIR));
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("backup ledger corruption fails before readiness")
+                .code(),
+            StoreErrorCode::InvalidTransaction,
+            "{mode}"
+        );
+        assert_eq!(
+            tree_snapshot(&directory.path().join(layout::IMPORT_BACKUPS_DIR)),
+            backup_tree_before,
+            "startup must not repair or rewrite {mode} backup state"
+        );
+    }
+}
+
+#[test]
+fn import_ledger_rejects_forged_empty_scope_binding() {
+    let directory = TempDir::new().expect("import target");
+    let principal = principal_id("prn_portable_export");
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project_id("prj_portable_export"))
+        .with_session(session_id("ses_portable_export"));
+    let context = TrustedRequestContext {
+        principal_id: principal,
+        client_id: ClientId::new("cli_empty_scope_binding").expect("client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:import:project").expect("project import grant"),
+            Grant::new("memory:import:session").expect("session import grant"),
+        ]),
+    };
+    let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let plan = store
+        .plan_import(&authority, &context, bundle)
+        .expect("plan");
+    store
+        .import_portable(
+            &authority,
+            &context,
+            bundle,
+            &plan.digest,
+            &IdempotencyKey::new("import-empty-scope-binding").expect("key"),
+        )
+        .expect("commit import");
+    drop(store);
+
+    let receipt = only_regular_file_below(directory.path(), layout::IMPORT_RECEIPTS_DIR);
+    let mut canonical = String::from_utf8(fs::read(&receipt).expect("receipt bytes"))
+        .expect("receipt is canonical UTF-8");
+    let marker = "\"scopes\": [";
+    let marker_offset = canonical.find(marker).expect("binding scopes field");
+    let array_start = marker_offset + "\"scopes\": ".len();
+    let mut depth = 0_u32;
+    let mut array_end = None;
+    for (offset, byte) in canonical.as_bytes()[array_start..].iter().enumerate() {
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    array_end = Some(array_start + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    canonical.replace_range(
+        array_start..=array_end.expect("matching scopes array delimiter"),
+        "[]",
+    );
+    fs::write(&receipt, canonical.as_bytes()).expect("write canonical forged receipt");
+
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("empty-scope durable binding fails before readiness")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+}
+
+#[test]
+fn import_recovery_rejects_hardlinked_record_and_body_free_artifact_temps() {
+    for (boundary, subtree) in [
+        (PersistenceBoundary::RecordTempDirectorySynced, "records"),
+        (
+            PersistenceBoundary::BackupMetadataTempDirectorySynced,
+            layout::IMPORT_BACKUPS_DIR,
+        ),
+    ] {
+        let directory = TempDir::new().expect("target store");
+        let external = TempDir::new().expect("external witness");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new("cli_import_hardlink_recovery").expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(boundary)),
+        )
+        .expect("open failure store");
+        let plan = store
+            .plan_import(&authority, &context, bundle)
+            .expect("plan");
+        store
+            .import_portable(
+                &authority,
+                &context,
+                bundle,
+                &plan.digest,
+                &IdempotencyKey::new(format!("import-hardlink-{boundary:?}")).expect("key"),
+            )
+            .expect_err("leave strict staged file");
+        drop(store);
+
+        let staged = only_regular_file_below(directory.path(), subtree);
+        let expected = fs::read(&staged).expect("staged bytes");
+        let outside = external.path().join("outside-inode");
+        fs::write(&outside, &expected).expect("copy staged bytes outside store");
+        let outside_file = fs::OpenOptions::new()
+            .read(true)
+            .open(&outside)
+            .expect("open outside inode");
+        layout::StoreDirectory::set_private_file(&outside_file).expect("private outside inode");
+        fs::remove_file(&staged).expect("remove original staged name");
+        fs::hard_link(&outside, &staged).expect("inject hardlinked staged file");
+
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("hardlinked import staging fails closed")
+                .code(),
+            StoreErrorCode::UnsafePath,
+            "{boundary:?}"
+        );
+        assert_eq!(fs::read(&outside).expect("outside bytes remain"), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn import_recovery_rechecks_published_record_and_artifact_targets_before_commit_or_cleanup() {
+    for (boundary, kind) in [
+        (
+            PersistenceBoundary::RecordDirectorySynced,
+            "record-roll-forward",
+        ),
+        (
+            PersistenceBoundary::MetadataDirectorySynced,
+            "backup-metadata-target-cleanup",
+        ),
+    ] {
+        let directory = TempDir::new().expect("target store");
+        let external = TempDir::new().expect("external hardlink witness");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new(format!("cli_import_target_recheck_{kind}"))
+                .expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(boundary)),
+        )
+        .expect("open failure store");
+        let plan = store
+            .plan_import(&authority, &context, bundle)
+            .expect("plan");
+        store
+            .import_portable(
+                &authority,
+                &context,
+                bundle,
+                &plan.digest,
+                &IdempotencyKey::new(format!("import-target-recheck-{kind}"))
+                    .expect("idempotency key"),
+            )
+            .expect_err("leave a published target with an active manifest");
+        drop(store);
+
+        let (target, later_inspection) = match kind {
+            "record-roll-forward" => {
+                let target = regular_files_below(directory.path(), "records")
+                    .into_iter()
+                    .find(|relative| {
+                        relative.file_name().is_some_and(|name| {
+                            !name.to_string_lossy().starts_with(".import-record-")
+                        })
+                    })
+                    .map(|relative| directory.path().join(relative))
+                    .expect("published record target");
+                (
+                    target,
+                    only_regular_file_below(directory.path(), layout::IMPORT_BACKUPS_DIR),
+                )
+            }
+            "backup-metadata-target-cleanup" => (
+                only_regular_file_below(directory.path(), layout::IMPORT_BACKUPS_DIR),
+                only_regular_file_below(directory.path(), layout::IMPORT_RESULTS_DIR),
+            ),
+            _ => unreachable!(),
+        };
+        let target_bytes = fs::read(&target).expect("published target bytes");
+        let outside_link = external.path().join(format!("{kind}.json"));
+        let hook_target = target.clone();
+        let hook_outside = outside_link.clone();
+        let trigger_name = later_inspection
+            .file_name()
+            .expect("later inspected file name")
+            .to_os_string();
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let fired_by_hook = Arc::clone(&hook_fired);
+        layout::install_test_hook(
+            layout::TestHookPoint::RegularOpen,
+            trigger_name,
+            move || {
+                fs::hard_link(&hook_target, &hook_outside)
+                    .expect("add external hardlink after target classification");
+                fired_by_hook.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("raced target identity fails closed before readiness")
+                .code(),
+            StoreErrorCode::UnsafePath,
+            "{kind}"
+        );
+        assert!(hook_fired.load(Ordering::SeqCst), "{kind}");
+        assert_eq!(
+            fs::read(&outside_link).expect("external hardlink remains untouched"),
+            target_bytes,
+            "{kind}"
+        );
+        assert_eq!(
+            regular_files_below(directory.path(), "transactions").len(),
+            1,
+            "active manifest must remain for {kind}"
+        );
+    }
+}
+
+#[test]
+fn orphan_import_record_tombstone_and_private_artifact_temps_fail_before_readiness() {
+    for kind in ["record", "tombstone", "artifact"] {
+        let directory = TempDir::new().expect("target store");
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let id = memory_id("mem_orphan_import_temp");
+        let scope = MemoryScope::Project {
+            project_id: project_id("prj_orphan_import_temp"),
+        };
+        let transaction_id = "00000000-0000-4000-8000-000000000020";
+        let relative = match kind {
+            "record" => {
+                let target = layout::record_relative_path(&scope, &id);
+                target.parent().expect("record parent").join(format!(
+                    ".import-record-{}-{transaction_id}.tmp",
+                    layout::record_storage_key(&id)
+                ))
+            }
+            "tombstone" => {
+                let target = layout::tombstone_relative_path(&scope, &id);
+                target.parent().expect("tombstone parent").join(format!(
+                    ".import-tombstone-{}-{transaction_id}.tmp",
+                    layout::record_storage_key(&id)
+                ))
+            }
+            "artifact" => PathBuf::from(layout::IMPORT_BACKUPS_DIR)
+                .join(format!(".backup-{transaction_id}.tmp")),
+            _ => unreachable!(),
+        };
+        let path = directory.path().join(&relative);
+        fs::create_dir_all(path.parent().expect("orphan parent")).expect("create orphan parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for ancestor in path
+                .parent()
+                .expect("parent")
+                .ancestors()
+                .take_while(|ancestor| *ancestor != directory.path())
+            {
+                fs::set_permissions(ancestor, fs::Permissions::from_mode(0o700))
+                    .expect("private orphan ancestor");
+            }
+        }
+        fs::write(&path, b"orphan import temp\n").expect("write orphan import temp");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open orphan temp");
+        layout::StoreDirectory::set_private_file(&file).expect("private orphan temp");
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("orphan import temp fails closed")
+                .code(),
+            StoreErrorCode::InvalidTransaction,
+            "{kind}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn import_recovery_never_follows_symlinked_record_or_body_free_artifact_temps() {
+    use std::os::unix::fs::symlink;
+
+    for (boundary, subtree) in [
+        (PersistenceBoundary::RecordTempDirectorySynced, "records"),
+        (
+            PersistenceBoundary::BackupMetadataTempDirectorySynced,
+            layout::IMPORT_BACKUPS_DIR,
+        ),
+    ] {
+        let directory = TempDir::new().expect("target store");
+        let external = TempDir::new().expect("external witness");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new("cli_import_symlink_recovery").expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(boundary)),
+        )
+        .expect("open failure store");
+        let plan = store
+            .plan_import(&authority, &context, bundle)
+            .expect("plan");
+        store
+            .import_portable(
+                &authority,
+                &context,
+                bundle,
+                &plan.digest,
+                &IdempotencyKey::new(format!("import-symlink-{boundary:?}")).expect("key"),
+            )
+            .expect_err("leave strict staged file");
+        drop(store);
+
+        let staged = only_regular_file_below(directory.path(), subtree);
+        let expected = fs::read(&staged).expect("staged bytes");
+        let outside = external.path().join("outside-inode");
+        fs::write(&outside, &expected).expect("copy staged bytes outside store");
+        fs::remove_file(&staged).expect("remove original staged name");
+        symlink(&outside, &staged).expect("inject symlinked staged file");
+
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("symlinked import staging fails closed")
+                .code(),
+            StoreErrorCode::UnsafePath,
+            "{boundary:?}"
+        );
+        assert_eq!(fs::read(&outside).expect("outside bytes remain"), expected);
+    }
 }

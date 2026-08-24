@@ -14,7 +14,7 @@
       "type": "string",
       "minLength": 21,
       "maxLength": 21,
-      "pattern": "^jiandu\\.store/v1alpha3$"
+      "pattern": "^jiandu\\.store/v1alpha[34]$"
     },
     "sourceStoreId": {
       "$ref": "#/$defs/StoreId"
@@ -95,7 +95,7 @@
       "minimum": 0
     },
     "AuditSequence": {
-      "description": "Independent monotonic address of the private mutation audit ledger.\n\nZero is the genesis watermark. Each committed create/update advances this\nvalue exactly once; idempotent replay never advances it.",
+      "description": "Independent monotonic address of the private mutation audit ledger.\n\nZero is the genesis watermark. Each committed audited mutation or portable\nimport advances this value exactly once; idempotent replay never advances\nit.",
       "type": "integer",
       "format": "uint64",
       "minimum": 0
