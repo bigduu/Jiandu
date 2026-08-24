@@ -108,6 +108,8 @@ pub(crate) enum TestHookPoint {
     RegularOpen,
     Rename,
     EraseWitness,
+    InspectionRecordRecheck,
+    InspectionTombstoneRescan,
 }
 
 #[cfg(test)]
@@ -441,6 +443,18 @@ impl StoreDirectory {
         Ok(FileIdentity::from_file(&file)? == expected)
     }
 
+    pub(crate) fn file_identity_matches_in(
+        directory: &Dir,
+        name: &OsStr,
+        expected: FileIdentity,
+    ) -> Result<bool, StoreError> {
+        let Some(file) = Self::try_open_regular_in(directory, name)? else {
+            return Ok(false);
+        };
+        Self::validate_private_open_file(&file)?;
+        Ok(FileIdentity::from_file(&file)? == expected)
+    }
+
     pub(crate) fn validate_private_file(&self, relative: &Path) -> Result<File, StoreError> {
         let file = self
             .try_open_regular(relative, false)?
@@ -463,6 +477,10 @@ impl StoreDirectory {
         validate_private_file_permissions(file)
     }
 
+    pub(crate) fn validate_private_open_directory(directory: &Dir) -> Result<(), StoreError> {
+        validate_private_directory_handle(directory, StoreError::InvalidLayout)
+    }
+
     pub(crate) fn validate_private_root(&self) -> Result<(), StoreError> {
         validate_private_directory_handle(&self.root, StoreError::InvalidDataDirectory)
     }
@@ -482,6 +500,33 @@ impl StoreDirectory {
     ) -> Result<Option<File>, StoreError> {
         validate_normal_name(name)?;
         try_open_regular_at(directory, name, false)
+    }
+
+    /// Validate an entry's filesystem safety without opening or reading it.
+    /// Callers that use a name as a deny/protection key can therefore fail
+    /// closed on links or special files without crossing a content boundary.
+    pub(crate) fn validate_private_regular_entry_in(
+        directory: &Dir,
+        name: &OsStr,
+    ) -> Result<(), StoreError> {
+        validate_normal_name(name)?;
+        let metadata = directory
+            .symlink_metadata(name)
+            .map_err(|source| StoreError::io("inspect private store entry", source))?;
+        if metadata.is_symlink() || IdentityMetadataExt::nlink(&metadata) != 1 {
+            return Err(StoreError::UnsafePath);
+        }
+        if !metadata.is_file() {
+            return Err(StoreError::InvalidLayout);
+        }
+        #[cfg(unix)]
+        {
+            use cap_std::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o7777 != 0o600 {
+                return Err(StoreError::InvalidLayout);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn open_child_directory(directory: &Dir, name: &OsStr) -> Result<Dir, StoreError> {

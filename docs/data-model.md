@@ -253,6 +253,36 @@ A later opt-in watcher may import external edits by parsing the full record, pre
 - Future receipt GC/hard purge must atomically retire the strict receipt/result/audit ledger and its logical-erasure witness before deleting replay bytes; external backups are outside local deletion guarantees.
 - Import cannot recreate an ID still protected by a tombstone unless an operator performs an explicit restore workflow.
 
+## Validation and portable projection
+
+The side-effect-free inspector emits a strict validation report and, only for a
+stable finding-free snapshot, a strict portable export bundle. The portable
+record projection preserves every public record field: opaque ID, revision,
+ETag, exact scope, type/status, title/summary/body, timestamps, tags, relations,
+and complete portable provenance including the mutually exclusive committed
+`messageIds` or `messageRange` representations. Decode converts the closed
+projection back to `MemoryRecord`, runs the complete domain validator, and
+requires an exact canonical Markdown/frontmatter and ETag round trip.
+
+A forgotten identity is represented only by a body-free portable tombstone
+projection containing its opaque ID, exact scope, forgotten revision/ETag/time,
+and committed store/audit watermarks. Forgotten bodies, private replay results,
+receipts, audits, WAL, logical-erasure witness bytes, paths, and hashed storage
+keys are not portable data. Record revisions cannot exceed the export snapshot;
+a tombstone revision/audit sequence cannot exceed its own store revision, and
+its watermarks cannot exceed the bundle snapshot.
+
+Scoped traversal opens and decodes only explicitly authorized owner segments.
+Before an authorized `.md` candidate is opened, a separate bounded global pass
+collects only hashed tombstone storage keys without opening or decoding other
+scopes' tombstones. It validates only strict directory-entry names and
+filesystem type/link/permission metadata. This namespace-only protection check
+is required to prevent cross-scope ambient
+resurrection and does not make foreign tombstone metadata, counts, or identity
+part of the report or bundle. See
+[Validation Report and Portable Export `v1alpha1`](portable-export-v1alpha1.md)
+for canonical ordering, strict formats, bounds, and authorization.
+
 ## Derived data
 
 Lexical indexes, embeddings, caches, ranking statistics, previews, and materialized lineage views are derived. Every derived format declares the store revision and index version from which it was built. `jiandu rebuild-index` can discard and recreate it without losing canonical records or policy state.

@@ -892,6 +892,26 @@ pub(crate) fn record_id_exists_anywhere(
     root: &layout::StoreDirectory,
     id: &MemoryId,
 ) -> Result<bool, StoreError> {
+    record_id_exists_anywhere_inner(root, id, &mut || true)
+}
+
+/// Bounded variant used by read-only whole-store inspection. Startup and live
+/// mutation callers retain the same unlimited semantic through
+/// [`record_id_exists_anywhere`], while hostile owner fan-out is charged to the
+/// inspector's single shared traversal budget.
+pub(crate) fn record_id_exists_anywhere_bounded(
+    root: &layout::StoreDirectory,
+    id: &MemoryId,
+    budget: &mut impl crate::idempotency::LedgerScanBudget,
+) -> Result<bool, StoreError> {
+    record_id_exists_anywhere_inner(root, id, &mut || budget.consume_entry())
+}
+
+fn record_id_exists_anywhere_inner(
+    root: &layout::StoreDirectory,
+    id: &MemoryId,
+    consume_owner_entry: &mut impl FnMut() -> bool,
+) -> Result<bool, StoreError> {
     let shard_name = layout::record_shard(id);
     let file_name = layout::record_file_name(id);
     for kind in ["principal", "project", "session"] {
@@ -901,6 +921,9 @@ pub(crate) fn record_id_exists_anywhere(
             .entries()
             .map_err(|source| StoreError::io("scan memory owner keys", source))?;
         for owner in owners {
+            if !consume_owner_entry() {
+                return Err(StoreError::InvalidRequest);
+            }
             let owner = owner.map_err(|source| StoreError::io("read memory owner key", source))?;
             let owner_name = owner.file_name();
             layout::validate_owner_entry_name(&owner_name)?;

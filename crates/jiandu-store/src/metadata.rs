@@ -1,6 +1,7 @@
 //! Store identity, format version, and canonical watermark metadata.
 
 use jiandu_core::{StoreRevision, Timestamp};
+use schemars::JsonSchema;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -18,14 +19,22 @@ pub(crate) const LEGACY_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha1";
 ///
 /// Zero is the genesis watermark. Each committed create/update advances this
 /// value exactly once; idempotent replay never advances it.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(transparent)]
 pub struct AuditSequence(pub u64);
 
 /// Opaque UUID-backed store identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct StoreId(String);
+pub struct StoreId(
+    #[schemars(
+        length(min = 36, max = 36),
+        regex(pattern = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    )]
+    String,
+);
 
 impl StoreId {
     pub fn new(value: impl Into<String>) -> Result<Self, crate::StoreError> {

@@ -2,10 +2,12 @@ use super::*;
 use crate::document::{decode_canonical_document, encode_canonical_document};
 use crate::layout;
 use jiandu_core::{
-    ClientId, CreationActor, ForgetMemoryCommand, FrontmatterProvenance, FrontmatterScope, Grant,
-    IdempotencyKey, ListSort, MemoryFrontmatterV1Alpha1, MemoryId, MemoryListRequest, MemoryPatch,
-    MemorySchema, MemoryScope, MemoryStatus, MemoryType, PageCursor, PageLimit, PrincipalId,
-    ProjectId, ProvenanceInput, RememberMemoryCommand, Revision, ScopeSelector, SessionId,
+    AgentId, BranchId, ClientId, CommittedMessageRange, Confidence, ContentDigest, CreationActor,
+    ExtractionMethod, ExtractionProvenance, ForgetMemoryCommand, FrontmatterProvenance,
+    FrontmatterScope, Grant, IdempotencyKey, ListSort, MemoryFrontmatterV1Alpha1, MemoryId,
+    MemoryListRequest, MemoryPatch, MemoryRelation, MemorySchema, MemoryScope, MemoryStatus,
+    MemoryType, MessageId, PageCursor, PageLimit, PrincipalId, ProjectId, ProvenanceInput,
+    RelationKind, RememberMemoryCommand, Revision, ScopeSelector, SessionId, SourceUri,
     StoreRevision, Tag, TagPatch, Timestamp, TrustedRequestContext, UpdateMemoryCommand,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -87,17 +89,29 @@ fn frontmatter(
 
 fn write_record(root: &Path, frontmatter: &MemoryFrontmatterV1Alpha1, body: &str) -> PathBuf {
     let scope: MemoryScope = frontmatter.scope.clone().into();
-    let path = layout::record_path(root, &scope, &frontmatter.id).expect("safe record path");
-    fs::create_dir_all(path.parent().expect("record has parent")).expect("create record shard");
     let bytes = encode_canonical_document(frontmatter, body).expect("canonical record");
-    fs::write(&path, bytes).expect("write test record");
-    path
+    write_raw_record(root, &scope, &frontmatter.id, &bytes)
 }
 
 fn write_raw_record(root: &Path, scope: &MemoryScope, id: &MemoryId, bytes: &[u8]) -> PathBuf {
     let path = layout::record_path(root, scope, id).expect("safe record path");
     fs::create_dir_all(path.parent().expect("record has parent")).expect("create record shard");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let shard = path.parent().expect("record shard");
+        let owner = shard.parent().expect("record owner");
+        fs::set_permissions(owner, fs::Permissions::from_mode(0o700))
+            .expect("harden raw record owner");
+        fs::set_permissions(shard, fs::Permissions::from_mode(0o700))
+            .expect("harden raw record shard");
+    }
     fs::write(&path, bytes).expect("write raw test record");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("open raw test record");
+    layout::StoreDirectory::set_private_file(&file).expect("harden raw test record");
     path
 }
 
@@ -5910,4 +5924,1807 @@ fn v1alpha3_forget_fixtures_match_strict_rust_codecs_without_v2_drift() {
         manifest.canonical_bytes().expect("manifest bytes"),
         include_bytes!("../fixtures/v1alpha3/forget-transaction.json")
     );
+}
+
+fn inspection_context(principal: &PrincipalId, grant: &str) -> TrustedRequestContext {
+    TrustedRequestContext {
+        principal_id: principal.clone(),
+        client_id: ClientId::new("cli_inspection_tests").expect("valid client ID"),
+        grants: BTreeSet::from([Grant::new(grant).expect("valid inspection grant")]),
+    }
+}
+
+fn assert_full_validation_finding(
+    directory: &TempDir,
+    principal: &PrincipalId,
+    expected: ValidationCode,
+) {
+    let authority = AuthorizedScopes::new(principal.clone());
+    let authorization = authority
+        .authorize_store_validation(&inspection_context(
+            principal,
+            "memory:admin:validate_store",
+        ))
+        .expect("full validation grant");
+    let inspector = ReadOnlyStoreInspector::open(directory.path()).expect("offline inspector");
+    let report = inspector
+        .validate_all(&authorization)
+        .expect("invalid store still produces safe validation report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == expected),
+        "expected {expected:?}, got {:?}",
+        report.findings
+    );
+    report
+        .canonical_bytes()
+        .expect("invalid-store report remains canonical");
+}
+
+#[test]
+fn inspection_admin_grants_are_distinct_authenticated_and_principal_bound() {
+    let principal = principal_id("prn_inspection_admin");
+    let foreign = principal_id("prn_inspection_foreign");
+    let authority = AuthorizedScopes::new(principal.clone());
+
+    let write_only = inspection_context(&principal, "memory:write:principal");
+    assert!(matches!(
+        authority.authorize_all_scope_export(&write_only),
+        Err(StoreError::Forbidden)
+    ));
+    assert!(matches!(
+        authority.authorize_store_validation(&write_only),
+        Err(StoreError::Forbidden)
+    ));
+
+    let export_only = inspection_context(&principal, "memory:admin:export_all");
+    let _export = authority
+        .authorize_all_scope_export(&export_only)
+        .expect("independent all-scope export grant");
+    assert!(matches!(
+        authority.authorize_store_validation(&export_only),
+        Err(StoreError::Forbidden)
+    ));
+
+    let validation_only = inspection_context(&principal, "memory:admin:validate_store");
+    let _validation = authority
+        .authorize_store_validation(&validation_only)
+        .expect("independent validation grant");
+    assert!(matches!(
+        authority.authorize_all_scope_export(&validation_only),
+        Err(StoreError::Forbidden)
+    ));
+
+    let foreign_admin = inspection_context(&foreign, "memory:admin:export_all");
+    assert!(matches!(
+        authority.authorize_all_scope_export(&foreign_admin),
+        Err(StoreError::Forbidden)
+    ));
+}
+
+#[test]
+fn all_scope_export_requires_admin_and_is_sorted_without_private_ledger_bytes() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal_a = principal_id("prn_all_export_a");
+    let principal_b = principal_id("prn_all_export_b");
+    let scope_a = MemoryScope::Principal {
+        principal_id: principal_a.clone(),
+    };
+    let scope_b = MemoryScope::Principal {
+        principal_id: principal_b.clone(),
+    };
+    let authority_a = AuthorizedScopes::new(principal_a.clone());
+    let authority_b = AuthorizedScopes::new(principal_b);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority_b, &scope_b, MutationOperation::Create),
+        "mem_all_export_z",
+        "SECOND_PRINCIPAL_PORTABLE_BODY",
+    )
+    .expect("create second-principal record");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority_a, &scope_a, MutationOperation::Create),
+        "mem_all_export_a",
+        "FIRST_PRINCIPAL_PORTABLE_BODY",
+    )
+    .expect("create first-principal record");
+
+    let export_authorization = authority_a
+        .authorize_all_scope_export(&inspection_context(&principal_a, "memory:admin:export_all"))
+        .expect("all-scope export authorization");
+    let validation_authorization = authority_a
+        .authorize_store_validation(&inspection_context(
+            &principal_a,
+            "memory:admin:validate_store",
+        ))
+        .expect("all-scope validation authorization");
+    let report = store
+        .validate_all(&validation_authorization)
+        .expect("full validation");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    let bundle = store
+        .export_all(&export_authorization)
+        .expect("all-scope export");
+    assert_eq!(bundle.records.len(), 2);
+    assert_eq!(
+        bundle
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mem_all_export_a", "mem_all_export_z"]
+    );
+    let text = String::from_utf8(bundle.canonical_bytes().expect("bundle bytes"))
+        .expect("bundle is UTF-8");
+    let ambient = directory.path().to_string_lossy().into_owned();
+    for forbidden in [
+        "receipts/idempotency",
+        "results/private",
+        "mutation-audit",
+        ".forgotten-",
+        "create-mem_all_export_a",
+        "create-mem_all_export_z",
+        "requestFingerprint",
+        "principalDigest",
+        "keyDigest",
+        "resultDigest",
+        "transactionId",
+        ambient.as_str(),
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+}
+
+#[test]
+fn full_validation_uses_startup_ledger_authority_with_stage_specific_codes() {
+    let principal = principal_id("prn_artifact_fixture");
+
+    let missing_receipt = committed_idempotency_fixture();
+    fs::remove_file(only_regular_file_below(
+        missing_receipt.path(),
+        layout::IDEMPOTENCY_RECEIPTS_DIR,
+    ))
+    .expect("remove receipt");
+    assert_full_validation_finding(
+        &missing_receipt,
+        &principal,
+        ValidationCode::ReceiptInconsistent,
+    );
+    assert_eq!(
+        CanonicalStore::open(missing_receipt.path(), owner())
+            .expect_err("startup rejects missing receipt")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+
+    let missing_result = committed_idempotency_fixture();
+    fs::remove_file(only_regular_file_below(
+        missing_result.path(),
+        layout::IDEMPOTENCY_RESULTS_DIR,
+    ))
+    .expect("remove result");
+    assert_full_validation_finding(
+        &missing_result,
+        &principal,
+        ValidationCode::ResultInconsistent,
+    );
+
+    let missing_audit = committed_idempotency_fixture();
+    fs::remove_file(only_regular_file_below(
+        missing_audit.path(),
+        layout::MUTATION_AUDIT_DIR,
+    ))
+    .expect("remove audit");
+    assert_full_validation_finding(
+        &missing_audit,
+        &principal,
+        ValidationCode::AuditInconsistent,
+    );
+
+    let forget_principal = principal_id("prn_witness_fixture");
+    let missing_tombstone = committed_forget_fixture();
+    fs::remove_file(only_regular_file_below(
+        missing_tombstone.path(),
+        layout::TOMBSTONES_DIR,
+    ))
+    .expect("remove tombstone");
+    assert_full_validation_finding(
+        &missing_tombstone,
+        &forget_principal,
+        ValidationCode::TombstoneInconsistent,
+    );
+
+    let invalid_witness = committed_forget_fixture();
+    fs::write(
+        only_erasure_witness(invalid_witness.path()),
+        b"NONZERO_WITNESS_BODY_SENTINEL",
+    )
+    .expect("make witness invalid");
+    assert_full_validation_finding(
+        &invalid_witness,
+        &forget_principal,
+        ValidationCode::WitnessInconsistent,
+    );
+}
+
+#[test]
+fn portable_export_is_strict_deterministic_complete_and_read_only_across_restart() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_portable_export");
+    let project = project_id("prj_portable_export");
+    let session = session_id("ses_portable_export");
+    let scope = MemoryScope::Project {
+        project_id: project.clone(),
+    };
+    let range_scope = MemoryScope::Session {
+        session_id: session.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal.clone())
+        .with_project(project)
+        .with_session(session.clone());
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let mut command = remember_command(
+        &scope,
+        "mem_portable_complete",
+        "portable body\nwith exact markdown\n",
+    );
+    command.provenance = ProvenanceInput {
+        agent_id: Some(AgentId::new("agent:portable").expect("agent ID")),
+        session_id: Some(session.clone()),
+        branch_id: Some(BranchId::new("br_portable").expect("branch ID")),
+        message_ids: vec![MessageId::new("msg_portable_1").expect("message ID")],
+        message_range: None,
+        source_uri: Some(SourceUri::new("https://example.invalid/source").expect("source URI")),
+        content_digest: Some(
+            ContentDigest::new(format!("sha256:{}", "a".repeat(64))).expect("content digest"),
+        ),
+        extraction: Some(ExtractionProvenance {
+            method: ExtractionMethod::Explicit,
+            extractor_version: Some("extractor-v1".to_owned()),
+        }),
+        confidence: Some(Confidence::new(0.75).expect("confidence")),
+    };
+    command.relations = vec![MemoryRelation {
+        kind: RelationKind::RelatedTo,
+        target_memory_id: memory_id("mem_portable_related"),
+    }];
+
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let fixture_store_id = StoreId::new("019d2a4a-7b00-7000-8000-000000000019")
+        .expect("fixed portable fixture store ID");
+    store.metadata.store_id = fixture_store_id.clone();
+    fs::write(
+        directory.path().join(layout::STORE_METADATA_FILE),
+        store
+            .metadata
+            .canonical_bytes()
+            .expect("fixed portable fixture metadata"),
+    )
+    .expect("publish fixed portable fixture metadata");
+    fs::write(
+        directory.path().join(layout::AUDIT_GENESIS_FILE),
+        crate::idempotency::AuditGenesis::new(fixture_store_id, StoreRevision(0))
+            .canonical_bytes()
+            .expect("fixed portable fixture audit genesis"),
+    )
+    .expect("publish fixed portable fixture audit genesis");
+    let committed = store
+        .create(
+            &create_authorization,
+            &command,
+            memory_id("mem_portable_complete"),
+            CreationActor::Host,
+            timestamp("2026-08-24T06:00:00Z"),
+        )
+        .expect("create portable record");
+    create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_portable_forgotten",
+        "FORGOTTEN_BODY_MUST_NOT_BE_PORTABLE",
+    )
+    .expect("create record that will become a portable tombstone");
+    store
+        .forget(
+            &authorized_mutation(&authority, &scope, MutationOperation::Forget),
+            &forget_command(
+                &memory_id("mem_portable_forgotten"),
+                1,
+                "portable-forget-key",
+                "PRIVATE_FORGET_REASON_MUST_NOT_BE_PORTABLE",
+            ),
+            timestamp("2026-08-24T06:01:00Z"),
+        )
+        .expect("forget portable fixture record");
+    let mut range_command = remember_command(
+        &range_scope,
+        "mem_portable_a_range",
+        "portable range provenance body",
+    );
+    range_command.provenance = ProvenanceInput {
+        agent_id: Some(AgentId::new("agent:portable-range").expect("range agent ID")),
+        session_id: Some(session),
+        branch_id: Some(BranchId::new("br_portable_range").expect("range branch ID")),
+        message_ids: Vec::new(),
+        message_range: Some(CommittedMessageRange {
+            first_message_id: MessageId::new("msg_portable_range_1")
+                .expect("range first message ID"),
+            last_message_id: MessageId::new("msg_portable_range_9").expect("range last message ID"),
+        }),
+        source_uri: Some(
+            SourceUri::new("https://example.invalid/range").expect("range source URI"),
+        ),
+        content_digest: Some(
+            ContentDigest::new(format!("sha256:{}", "b".repeat(64))).expect("range content digest"),
+        ),
+        extraction: Some(ExtractionProvenance {
+            method: ExtractionMethod::HostRule,
+            extractor_version: Some("extractor-range-v1".to_owned()),
+        }),
+        confidence: Some(Confidence::new(0.8).expect("range confidence")),
+    };
+    let range_authorization =
+        authorized_mutation(&authority, &range_scope, MutationOperation::Create);
+    let range_committed = store
+        .create(
+            &range_authorization,
+            &range_command,
+            memory_id("mem_portable_a_range"),
+            CreationActor::Host,
+            timestamp("2026-08-24T06:02:00Z"),
+        )
+        .expect("create portable range record");
+    let requested_scopes = vec![range_scope.clone(), scope.clone()];
+    let before_live = tree_snapshot(directory.path());
+    let report = store
+        .validate_scopes(&authority, &requested_scopes)
+        .expect("live validation");
+    assert!(report.findings.is_empty());
+    let report_bytes = report.canonical_bytes().expect("canonical report");
+    assert_eq!(
+        ValidationReport::decode_canonical(&report_bytes).expect("strict report decode"),
+        report
+    );
+    let bundle = store
+        .export_scopes(&authority, &requested_scopes)
+        .expect("live portable export");
+    assert_eq!(bundle.scopes, vec![scope.clone(), range_scope.clone()]);
+    assert_eq!(bundle.records.len(), 2);
+    assert_eq!(bundle.tombstones.len(), 1);
+    assert_eq!(
+        bundle
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mem_portable_a_range", "mem_portable_complete"]
+    );
+    let exported_complete: jiandu_core::MemoryRecord = bundle.records[1].clone().into();
+    let exported_range: jiandu_core::MemoryRecord = bundle.records[0].clone().into();
+    assert_eq!(exported_complete, committed.record);
+    assert_eq!(exported_range, range_committed.record);
+    let bytes = bundle.canonical_bytes().expect("canonical export");
+    assert_eq!(
+        PortableExportBundle::decode_canonical(&bytes).expect("strict bundle decode"),
+        bundle
+    );
+    assert!(!String::from_utf8_lossy(&bytes).contains("receipts/idempotency"));
+    assert!(!String::from_utf8_lossy(&bytes).contains("FORGOTTEN_BODY_MUST_NOT_BE_PORTABLE"));
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("PRIVATE_FORGET_REASON_MUST_NOT_BE_PORTABLE")
+    );
+    if std::env::var_os("JIANDU_UPDATE_INSPECTION_FIXTURES").is_some() {
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/inspection/v1alpha1/valid");
+        fs::create_dir_all(&fixture_root).expect("create inspection fixture directory");
+        fs::write(fixture_root.join("validation-report.json"), &report_bytes)
+            .expect("write validation report fixture");
+        fs::write(fixture_root.join("portable-export.json"), &bytes)
+            .expect("write portable export fixture");
+    }
+    assert_eq!(tree_snapshot(directory.path()), before_live);
+
+    let locked_before = tree_snapshot(directory.path());
+    assert!(matches!(
+        ReadOnlyStoreInspector::open(directory.path()),
+        Err(StoreError::StoreLocked { .. })
+    ));
+    assert_eq!(tree_snapshot(directory.path()), locked_before);
+    drop(store);
+
+    let before_offline = tree_snapshot(directory.path());
+    let inspector = ReadOnlyStoreInspector::open(directory.path()).expect("offline inspector");
+    let offline_report = inspector
+        .validate_scopes(&authority, &requested_scopes)
+        .expect("offline validation");
+    let offline_bundle = inspector
+        .export_scopes(&authority, &requested_scopes)
+        .expect("offline export");
+    assert_eq!(
+        offline_report.canonical_bytes().expect("report bytes"),
+        report_bytes
+    );
+    assert_eq!(
+        offline_bundle.canonical_bytes().expect("bundle bytes"),
+        bytes
+    );
+    assert!(matches!(
+        CanonicalStore::open(directory.path(), owner()),
+        Err(StoreError::StoreLocked { .. })
+    ));
+    drop(inspector);
+    assert_eq!(tree_snapshot(directory.path()), before_offline);
+}
+
+#[test]
+fn portable_bundle_rejects_unknown_fields_duplicates_digest_tampering_and_noncanonical_json() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_portable_strict");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_portable_strict",
+        "strict body",
+    )
+    .expect("create record");
+    let bundle = store
+        .export_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("export");
+    let bytes = bundle.canonical_bytes().expect("canonical bytes");
+
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("bundle JSON");
+    value["records"][0]["ambientPath"] = serde_json::Value::String("/secret/path".to_owned());
+    let mut unknown = serde_json::to_vec_pretty(&value).expect("unknown-field JSON");
+    unknown.push(b'\n');
+    assert!(PortableExportBundle::decode_canonical(&unknown).is_err());
+
+    let mut duplicate = bundle.clone();
+    duplicate.records.push(duplicate.records[0].clone());
+    assert!(duplicate.canonical_bytes().is_err());
+
+    let mut wrong_digest: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("bundle JSON for digest tampering");
+    wrong_digest["digest"] = serde_json::Value::String(format!("sha256:{}", "0".repeat(64)));
+    let mut wrong_digest = serde_json::to_vec_pretty(&wrong_digest).expect("digest JSON");
+    wrong_digest.push(b'\n');
+    assert!(PortableExportBundle::decode_canonical(&wrong_digest).is_err());
+
+    let compact = serde_json::to_vec(&bundle).expect("compact bundle");
+    assert!(PortableExportBundle::decode_canonical(&compact).is_err());
+}
+
+#[test]
+fn strict_report_codec_rejects_digest_self_consistent_impossible_states() {
+    let fixture = ValidationReport::decode_canonical(include_bytes!(
+        "../fixtures/inspection/v1alpha1/valid/validation-report.json"
+    ))
+    .expect("valid report fixture");
+
+    let mut unknown: serde_json::Value = serde_json::from_slice(
+        &fixture
+            .canonical_bytes()
+            .expect("canonical report fixture bytes"),
+    )
+    .expect("report fixture JSON");
+    unknown["ambientPath"] = serde_json::Value::String("/private/store".to_owned());
+    let mut unknown = serde_json::to_vec_pretty(&unknown).expect("unknown-field report JSON");
+    unknown.push(b'\n');
+    assert!(ValidationReport::decode_canonical(&unknown).is_err());
+
+    let mut wrong_digest: serde_json::Value = serde_json::from_slice(
+        &fixture
+            .canonical_bytes()
+            .expect("canonical report fixture bytes"),
+    )
+    .expect("report fixture JSON");
+    wrong_digest["digest"] = serde_json::Value::String(format!("sha256:{}", "0".repeat(64)));
+    let mut wrong_digest =
+        serde_json::to_vec_pretty(&wrong_digest).expect("wrong-digest report JSON");
+    wrong_digest.push(b'\n');
+    assert!(ValidationReport::decode_canonical(&wrong_digest).is_err());
+
+    let compact = serde_json::to_vec(&fixture).expect("compact report JSON");
+    assert!(ValidationReport::decode_canonical(&compact).is_err());
+
+    let mut empty_scoped = fixture.clone();
+    empty_scoped.inspected_scopes.clear();
+    empty_scoped.refresh_digest_for_test();
+    assert!(empty_scoped.canonical_bytes().is_err());
+
+    let mut unpaired_identity = fixture.clone();
+    unpaired_identity.source_store_id = None;
+    unpaired_identity.refresh_digest_for_test();
+    assert!(unpaired_identity.canonical_bytes().is_err());
+
+    let mut impossible_snapshot = fixture.clone();
+    impossible_snapshot.snapshot = Some(SnapshotWatermark {
+        store_revision: StoreRevision(1),
+        audit_sequence: AuditSequence(2),
+    });
+    impossible_snapshot.refresh_digest_for_test();
+    assert!(impossible_snapshot.canonical_bytes().is_err());
+
+    let mut unscoped_finding = fixture.clone();
+    unscoped_finding.findings.push(ValidationFinding {
+        code: ValidationCode::RecordMalformed,
+        artifact: ValidationArtifact::Record,
+        scope: Some(MemoryScope::Principal {
+            principal_id: principal_id("prn_outside_report_scope"),
+        }),
+        memory_id: None,
+    });
+    unscoped_finding.findings.sort_by_key(|finding| {
+        (
+            finding.code,
+            finding.artifact,
+            format!("{:?}", finding.scope),
+        )
+    });
+    unscoped_finding.refresh_digest_for_test();
+    assert!(unscoped_finding.canonical_bytes().is_err());
+
+    let mut missing_limit_marker = fixture.clone();
+    missing_limit_marker.truncated = true;
+    missing_limit_marker.refresh_digest_for_test();
+    assert!(missing_limit_marker.canonical_bytes().is_err());
+
+    let mut unexpected_limit_marker = fixture;
+    unexpected_limit_marker.findings.push(ValidationFinding {
+        code: ValidationCode::FindingLimitReached,
+        artifact: ValidationArtifact::Snapshot,
+        scope: None,
+        memory_id: None,
+    });
+    unexpected_limit_marker.refresh_digest_for_test();
+    assert!(unexpected_limit_marker.canonical_bytes().is_err());
+}
+
+#[test]
+fn strict_export_codec_rejects_digest_self_consistent_impossible_states() {
+    let fixture = PortableExportBundle::decode_canonical(include_bytes!(
+        "../fixtures/inspection/v1alpha1/valid/portable-export.json"
+    ))
+    .expect("valid portable export fixture");
+
+    let mut impossible_snapshot = fixture.clone();
+    impossible_snapshot.snapshot = SnapshotWatermark {
+        store_revision: StoreRevision(1),
+        audit_sequence: AuditSequence(2),
+    };
+    impossible_snapshot.refresh_digest_for_test();
+    assert!(impossible_snapshot.canonical_bytes().is_err());
+
+    let mut zero_tombstone_store = fixture.clone();
+    zero_tombstone_store.tombstones[0].store_revision = StoreRevision(0);
+    zero_tombstone_store.refresh_digest_for_test();
+    assert!(zero_tombstone_store.canonical_bytes().is_err());
+
+    let mut tombstone_audit_after_store = fixture.clone();
+    tombstone_audit_after_store.tombstones[0].audit_sequence =
+        AuditSequence(tombstone_audit_after_store.tombstones[0].store_revision.0 + 1);
+    tombstone_audit_after_store.refresh_digest_for_test();
+    assert!(tombstone_audit_after_store.canonical_bytes().is_err());
+
+    let mut tombstone_after_snapshot = fixture.clone();
+    tombstone_after_snapshot.tombstones[0].store_revision =
+        StoreRevision(tombstone_after_snapshot.snapshot.store_revision.0 + 1);
+    tombstone_after_snapshot.refresh_digest_for_test();
+    assert!(tombstone_after_snapshot.canonical_bytes().is_err());
+
+    let mut record_revision_after_snapshot = fixture.clone();
+    record_revision_after_snapshot.records[0].revision =
+        Revision::new(record_revision_after_snapshot.snapshot.store_revision.0 + 1)
+            .expect("positive impossible record revision");
+    record_revision_after_snapshot.refresh_digest_for_test();
+    assert!(record_revision_after_snapshot.canonical_bytes().is_err());
+
+    let mut tombstone_revision_after_store = fixture.clone();
+    tombstone_revision_after_store.tombstones[0].revision = Revision::new(
+        tombstone_revision_after_store.tombstones[0]
+            .store_revision
+            .0
+            + 1,
+    )
+    .expect("positive impossible tombstone revision");
+    tombstone_revision_after_store.refresh_digest_for_test();
+    assert!(tombstone_revision_after_store.canonical_bytes().is_err());
+
+    let mut record_outside_scopes = fixture;
+    record_outside_scopes.scopes.remove(0);
+    record_outside_scopes.refresh_digest_for_test();
+    assert!(record_outside_scopes.canonical_bytes().is_err());
+}
+
+#[test]
+fn scoped_export_never_scans_unauthorized_records_or_leaks_their_contents() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal_a = principal_id("prn_export_a");
+    let principal_b = principal_id("prn_export_b");
+    let scope_a = MemoryScope::Principal {
+        principal_id: principal_a.clone(),
+    };
+    let scope_b = MemoryScope::Principal {
+        principal_id: principal_b.clone(),
+    };
+    let authority_a = AuthorizedScopes::new(principal_a);
+    let authority_b = AuthorizedScopes::new(principal_b);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority_a, &scope_a, MutationOperation::Create),
+        "mem_export_visible",
+        "visible body",
+    )
+    .expect("create visible record");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority_b, &scope_b, MutationOperation::Create),
+        "mem_export_hidden",
+        "UNAUTHORIZED_BODY_SENTINEL",
+    )
+    .expect("create hidden record");
+
+    let unauthorized_owner = layout::scope_relative_directory(&scope_b)
+        .file_name()
+        .expect("owner key")
+        .to_os_string();
+    let opened = Arc::new(AtomicBool::new(false));
+    let opened_by_hook = Arc::clone(&opened);
+    layout::install_test_hook(
+        layout::TestHookPoint::DirectoryOpen,
+        unauthorized_owner.clone(),
+        move || opened_by_hook.store(true, Ordering::SeqCst),
+    );
+    let bundle = store
+        .export_scopes(&authority_a, std::slice::from_ref(&scope_a))
+        .expect("scoped export");
+    assert!(!opened.load(Ordering::SeqCst));
+    let bytes = bundle.canonical_bytes().expect("bundle bytes");
+    assert!(!String::from_utf8_lossy(&bytes).contains("UNAUTHORIZED_BODY_SENTINEL"));
+    assert_eq!(bundle.records.len(), 1);
+    layout::run_test_hook(layout::TestHookPoint::DirectoryOpen, &unauthorized_owner);
+
+    assert!(matches!(
+        store.export_scopes(&authority_a, std::slice::from_ref(&scope_b)),
+        Err(StoreError::Forbidden)
+    ));
+}
+
+#[test]
+fn scoped_inspection_never_opens_foreign_private_replay_ledger() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal_a = principal_id("prn_scoped_ledger_a");
+    let principal_b = principal_id("prn_scoped_ledger_b");
+    let scope_a = MemoryScope::Principal {
+        principal_id: principal_a.clone(),
+    };
+    let scope_b = MemoryScope::Principal {
+        principal_id: principal_b.clone(),
+    };
+    let authority_a = AuthorizedScopes::new(principal_a);
+    let authority_b = AuthorizedScopes::new(principal_b);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority_b, &scope_b, MutationOperation::Create),
+        "mem_scoped_foreign_ledger",
+        "FOREIGN_PRIVATE_REPLAY_BODY_SENTINEL",
+    )
+    .expect("create foreign-scope record and private replay result");
+
+    let foreign_result = only_regular_file_below(directory.path(), layout::IDEMPOTENCY_RESULTS_DIR);
+    let foreign_result_name = foreign_result
+        .file_name()
+        .expect("foreign result file name")
+        .to_os_string();
+    let result_opened = Arc::new(AtomicBool::new(false));
+    let opened_by_hook = Arc::clone(&result_opened);
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        foreign_result_name.clone(),
+        move || opened_by_hook.store(true, Ordering::SeqCst),
+    );
+
+    let report = store
+        .validate_scopes(&authority_a, std::slice::from_ref(&scope_a))
+        .expect("authorized scoped validation");
+    assert!(report.findings.is_empty());
+    let bundle = store
+        .export_scopes(&authority_a, std::slice::from_ref(&scope_a))
+        .expect("authorized scoped export");
+    assert!(bundle.records.is_empty());
+    assert!(!result_opened.load(Ordering::SeqCst));
+    assert!(
+        !String::from_utf8_lossy(&bundle.canonical_bytes().expect("bundle bytes"))
+            .contains("FOREIGN_PRIVATE_REPLAY_BODY_SENTINEL")
+    );
+    layout::run_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        OsStr::new(&foreign_result_name),
+    );
+}
+
+#[test]
+fn cross_scope_tombstone_filters_before_body_open_and_export_fails_closed() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal_a = principal_id("prn_export_tombstone_a");
+    let principal_b = principal_id("prn_export_tombstone_b");
+    let scope_a = MemoryScope::Principal {
+        principal_id: principal_a.clone(),
+    };
+    let scope_b = MemoryScope::Principal {
+        principal_id: principal_b.clone(),
+    };
+    let authority_a = AuthorizedScopes::new(principal_a);
+    let authority_b = AuthorizedScopes::new(principal_b);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let id = memory_id("mem_cross_scope_tombstone_export");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority_b, &scope_b, MutationOperation::Create),
+        id.as_str(),
+        "body that must be forgotten",
+    )
+    .expect("create forgotten record");
+    store
+        .forget(
+            &authorized_mutation(&authority_b, &scope_b, MutationOperation::Forget),
+            &forget_command(&id, 1, "forget-export-cross-scope", "private reason"),
+            timestamp("2026-08-24T07:00:00Z"),
+        )
+        .expect("forget record");
+    let foreign_tombstone_name = layout::tombstone_file_name(&id);
+    let foreign_tombstone_opened = Arc::new(AtomicBool::new(false));
+    let opened_by_tombstone_hook = Arc::clone(&foreign_tombstone_opened);
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        foreign_tombstone_name.clone(),
+        move || opened_by_tombstone_hook.store(true, Ordering::SeqCst),
+    );
+    let empty_authorized_report = store
+        .validate_scopes(&authority_a, std::slice::from_ref(&scope_a))
+        .expect("authorized empty-scope validation");
+    assert!(empty_authorized_report.findings.is_empty());
+    assert!(!foreign_tombstone_opened.load(Ordering::SeqCst));
+    layout::run_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        OsStr::new(&foreign_tombstone_name),
+    );
+    write_raw_record(
+        directory.path(),
+        &scope_a,
+        &id,
+        b"MALFORMED_BODY_THAT_MUST_NOT_BE_OPENED",
+    );
+    let file_name = layout::record_file_name(&id);
+    let opened = Arc::new(AtomicBool::new(false));
+    let opened_by_hook = Arc::clone(&opened);
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        file_name.clone(),
+        move || opened_by_hook.store(true, Ordering::SeqCst),
+    );
+    let report = store
+        .validate_scopes(&authority_a, std::slice::from_ref(&scope_a))
+        .expect("scoped validation report");
+    assert!(!opened.load(Ordering::SeqCst));
+    assert!(report.findings.iter().any(|finding| {
+        finding.code == ValidationCode::RecordTombstoneConflict
+            && finding.scope.as_ref() == Some(&scope_a)
+            && finding.memory_id.is_none()
+    }));
+    assert!(matches!(
+        store.export_scopes(&authority_a, std::slice::from_ref(&scope_a)),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert!(!opened.load(Ordering::SeqCst));
+    layout::run_test_hook(layout::TestHookPoint::RegularOpen, OsStr::new(&file_name));
+}
+
+#[test]
+fn scoped_mismatch_findings_never_echo_forged_scope_or_unbound_identity() {
+    let directory = TempDir::new().expect("temporary store");
+    let expected_principal = principal_id("prn_expected_diagnostic");
+    let forged_principal = principal_id("prn_forged_diagnostic");
+    let expected_scope = MemoryScope::Principal {
+        principal_id: expected_principal.clone(),
+    };
+    let forged_scope = MemoryScope::Principal {
+        principal_id: forged_principal,
+    };
+    let authority = AuthorizedScopes::new(expected_principal);
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let forged = frontmatter(
+        "mem_forged_scope_diagnostic",
+        forged_scope,
+        "2026-08-24T00:00:00Z",
+        "2026-08-24T00:00:00Z",
+    );
+    let bytes = encode_canonical_document(&forged, "forged body").expect("canonical forged body");
+    write_raw_record(directory.path(), &expected_scope, &forged.id, &bytes);
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&expected_scope))
+        .expect("validation report");
+    let mismatch = report
+        .findings
+        .iter()
+        .find(|finding| finding.code == ValidationCode::ScopePathMismatch)
+        .expect("scope mismatch finding");
+    assert_eq!(mismatch.scope.as_ref(), Some(&expected_scope));
+    assert!(mismatch.memory_id.is_none());
+    let report_text =
+        String::from_utf8(report.canonical_bytes().expect("report bytes")).expect("report UTF-8");
+    assert!(!report_text.contains("prn_forged_diagnostic"));
+}
+
+#[test]
+fn scoped_validation_classifies_filename_and_shard_mismatches_without_reading_paths() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_record_layout_diagnostics");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+
+    let filename_id = memory_id("mem_filename_identity_expected");
+    let decoded = frontmatter(
+        "mem_filename_identity_forged",
+        scope.clone(),
+        "2026-08-24T00:00:00Z",
+        "2026-08-24T00:00:00Z",
+    );
+    let filename_bytes = encode_canonical_document(&decoded, "FILENAME_MISMATCH_BODY_SENTINEL")
+        .expect("canonical mismatched record");
+    write_raw_record(directory.path(), &scope, &filename_id, &filename_bytes);
+
+    let shard_header = frontmatter(
+        "mem_wrong_shard_diagnostic",
+        scope.clone(),
+        "2026-08-24T00:00:00Z",
+        "2026-08-24T00:00:00Z",
+    );
+    let correct_path = write_record(
+        directory.path(),
+        &shard_header,
+        "SHARD_MISMATCH_BODY_SENTINEL",
+    );
+    let correct_shard = layout::record_shard(&shard_header.id);
+    let wrong_shard = if correct_shard == "00" { "ff" } else { "00" };
+    let wrong_directory = correct_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("record owner")
+        .join(wrong_shard);
+    fs::create_dir(&wrong_directory).expect("create wrong shard");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&wrong_directory, fs::Permissions::from_mode(0o700))
+            .expect("harden wrong shard");
+    }
+    let wrong_path = wrong_directory.join(correct_path.file_name().expect("record file name"));
+    fs::rename(&correct_path, &wrong_path).expect("move record into wrong shard");
+
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("layout mismatch report");
+    for code in [
+        ValidationCode::RecordIdMismatch,
+        ValidationCode::ShardMismatch,
+    ] {
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == code)
+            .expect("closed layout finding");
+        assert_eq!(finding.scope.as_ref(), Some(&scope));
+        assert!(finding.memory_id.is_none());
+    }
+    let text = String::from_utf8(report.canonical_bytes().expect("canonical report"))
+        .expect("report UTF-8");
+    let ambient = directory.path().to_string_lossy().into_owned();
+    for forbidden in [
+        "FILENAME_MISMATCH_BODY_SENTINEL",
+        "SHARD_MISMATCH_BODY_SENTINEL",
+        ambient.as_str(),
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+    assert!(matches!(
+        store.export_scopes(&authority, std::slice::from_ref(&scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+}
+
+#[test]
+fn validation_reports_malformed_and_duplicate_records_without_body_or_path_disclosure() {
+    let malformed_directory = TempDir::new().expect("malformed validation store");
+    let principal = principal_id("prn_validation_malformed");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let malformed_store =
+        CanonicalStore::initialize(malformed_directory.path(), owner()).expect("initialize");
+    write_raw_record(
+        malformed_directory.path(),
+        &scope,
+        &memory_id("mem_validation_malformed"),
+        b"MALFORMED_REPORT_BODY_SENTINEL",
+    );
+    let malformed_report = malformed_store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("malformed record report");
+    assert!(
+        malformed_report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::RecordMalformed)
+    );
+    let malformed_bytes = malformed_report
+        .canonical_bytes()
+        .expect("canonical malformed report");
+    assert!(!String::from_utf8_lossy(&malformed_bytes).contains("MALFORMED_REPORT_BODY_SENTINEL"));
+    assert!(
+        !String::from_utf8_lossy(&malformed_bytes)
+            .contains(&malformed_directory.path().display().to_string())
+    );
+
+    let duplicate_directory = TempDir::new().expect("duplicate validation store");
+    let operator = principal_id("prn_validation_duplicate_operator");
+    let project_a = project_id("prj_validation_duplicate_a");
+    let project_b = project_id("prj_validation_duplicate_b");
+    let scope_a = MemoryScope::Project {
+        project_id: project_a.clone(),
+    };
+    let scope_b = MemoryScope::Project {
+        project_id: project_b.clone(),
+    };
+    let duplicate_authority = AuthorizedScopes::new(operator.clone())
+        .with_project(project_a)
+        .with_project(project_b);
+    let mut duplicate_store =
+        CanonicalStore::initialize(duplicate_directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut duplicate_store,
+        &authorized_mutation(&duplicate_authority, &scope_a, MutationOperation::Create),
+        "mem_validation_duplicate",
+        "DUPLICATE_REPORT_BODY_SENTINEL",
+    )
+    .expect("create first duplicate");
+    let mut duplicate_record = created.record;
+    duplicate_record.scope = scope_b;
+    let duplicate_bytes = encode_canonical_document(
+        &MemoryFrontmatterV1Alpha1::from_record(&duplicate_record),
+        &duplicate_record.body,
+    )
+    .expect("canonical second duplicate");
+    write_raw_record(
+        duplicate_directory.path(),
+        &duplicate_record.scope,
+        &duplicate_record.id,
+        &duplicate_bytes,
+    );
+    let validation_authorization = duplicate_authority
+        .authorize_store_validation(&inspection_context(
+            &operator,
+            "memory:admin:validate_store",
+        ))
+        .expect("full validation authorization");
+    let duplicate_report = duplicate_store
+        .validate_all(&validation_authorization)
+        .expect("duplicate report");
+    assert!(
+        duplicate_report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::DuplicateMemoryId)
+    );
+    let duplicate_report_bytes = duplicate_report
+        .canonical_bytes()
+        .expect("canonical duplicate report");
+    let duplicate_report_text = String::from_utf8_lossy(&duplicate_report_bytes);
+    assert!(!duplicate_report_text.contains("DUPLICATE_REPORT_BODY_SENTINEL"));
+    assert!(!duplicate_report_text.contains(&duplicate_directory.path().display().to_string()));
+}
+
+#[test]
+fn validation_rejects_record_and_tombstone_revisions_ahead_of_committed_watermarks() {
+    let record_directory = TempDir::new().expect("future record revision store");
+    let record_principal = principal_id("prn_future_record_revision");
+    let record_scope = MemoryScope::Principal {
+        principal_id: record_principal.clone(),
+    };
+    let record_authority = AuthorizedScopes::new(record_principal);
+    let record_store =
+        CanonicalStore::initialize(record_directory.path(), owner()).expect("initialize");
+    let mut future_record = frontmatter(
+        "mem_future_record_revision",
+        record_scope.clone(),
+        "2026-08-24T08:00:00Z",
+        "2026-08-24T08:00:00Z",
+    );
+    future_record.revision = Revision::new(record_store.metadata.store_revision.0 + 1)
+        .expect("revision ahead of the empty store watermark");
+    write_record(
+        record_directory.path(),
+        &future_record,
+        "FUTURE_RECORD_REVISION_BODY_SENTINEL",
+    );
+    let record_before = tree_snapshot(record_directory.path());
+    let record_report = record_store
+        .validate_scopes(&record_authority, std::slice::from_ref(&record_scope))
+        .expect("future record revision report");
+    let record_finding = record_report
+        .findings
+        .iter()
+        .find(|finding| finding.code == ValidationCode::RecordMalformed)
+        .expect("future record revision finding");
+    assert_eq!(record_finding.scope.as_ref(), Some(&record_scope));
+    assert!(record_finding.memory_id.is_none());
+    let record_report_text = String::from_utf8_lossy(
+        &record_report
+            .canonical_bytes()
+            .expect("canonical future record report"),
+    )
+    .into_owned();
+    assert!(!record_report_text.contains("FUTURE_RECORD_REVISION_BODY_SENTINEL"));
+    assert!(!record_report_text.contains(&record_directory.path().display().to_string()));
+    assert!(matches!(
+        record_store.export_scopes(&record_authority, std::slice::from_ref(&record_scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert_eq!(tree_snapshot(record_directory.path()), record_before);
+
+    let tombstone_directory = TempDir::new().expect("future tombstone revision store");
+    let tombstone_principal = principal_id("prn_future_tombstone_revision");
+    let tombstone_scope = MemoryScope::Principal {
+        principal_id: tombstone_principal.clone(),
+    };
+    let tombstone_authority = AuthorizedScopes::new(tombstone_principal);
+    let mut tombstone_store =
+        CanonicalStore::initialize(tombstone_directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut tombstone_store,
+        &authorized_mutation(
+            &tombstone_authority,
+            &tombstone_scope,
+            MutationOperation::Create,
+        ),
+        "mem_future_tombstone_revision",
+        "body that must remain forgotten",
+    )
+    .expect("create record to forget");
+    tombstone_store
+        .forget(
+            &authorized_mutation(
+                &tombstone_authority,
+                &tombstone_scope,
+                MutationOperation::Forget,
+            ),
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "future-tombstone-revision",
+                "private reason",
+            ),
+            timestamp("2026-08-24T08:01:00Z"),
+        )
+        .expect("forget record");
+    let tombstone_path = tombstone_directory
+        .path()
+        .join(layout::tombstone_relative_path(
+            &tombstone_scope,
+            &created.record.id,
+        ));
+    let mut future_tombstone: crate::tombstone::ProtectedTombstone =
+        serde_json::from_slice(&fs::read(&tombstone_path).expect("read protected tombstone"))
+            .expect("decode protected tombstone");
+    future_tombstone.revision = Revision::new(future_tombstone.store_revision.0 + 1)
+        .expect("revision ahead of tombstone store watermark");
+    assert!(future_tombstone.canonical_bytes().is_err());
+    let mut future_tombstone_bytes =
+        serde_json::to_vec_pretty(&future_tombstone).expect("serialize hostile tombstone");
+    future_tombstone_bytes.push(b'\n');
+    fs::write(&tombstone_path, future_tombstone_bytes).expect("inject hostile tombstone");
+    let tombstone_before = tree_snapshot(tombstone_directory.path());
+    let tombstone_report = tombstone_store
+        .validate_scopes(&tombstone_authority, std::slice::from_ref(&tombstone_scope))
+        .expect("future tombstone revision report");
+    let tombstone_finding = tombstone_report
+        .findings
+        .iter()
+        .find(|finding| finding.code == ValidationCode::TombstoneInconsistent)
+        .expect("future tombstone revision finding");
+    assert_eq!(tombstone_finding.scope.as_ref(), Some(&tombstone_scope));
+    assert!(tombstone_finding.memory_id.is_none());
+    assert!(matches!(
+        tombstone_store.export_scopes(&tombstone_authority, std::slice::from_ref(&tombstone_scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert_eq!(tree_snapshot(tombstone_directory.path()), tombstone_before);
+}
+
+#[test]
+fn metadata_change_during_export_is_a_safe_failure_not_a_mixed_bundle() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_snapshot_change");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &scope, MutationOperation::Create),
+        "mem_snapshot_change",
+        "snapshot body",
+    )
+    .expect("create record");
+    let metadata_path = directory.path().join(layout::STORE_METADATA_FILE);
+    let mut replacement = store.metadata.clone();
+    replacement.store_revision = StoreRevision(replacement.store_revision.0 + 1);
+    let replacement_bytes = replacement.canonical_bytes().expect("replacement metadata");
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        layout::record_file_name(&memory_id("mem_snapshot_change")),
+        move || fs::write(metadata_path, replacement_bytes).expect("race metadata replacement"),
+    );
+    assert!(matches!(
+        store.export_scopes(&authority, std::slice::from_ref(&scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+}
+
+#[test]
+fn active_wal_and_unsupported_metadata_are_reported_without_recovery_or_mutation() {
+    let active = TempDir::new().expect("active transaction store");
+    let principal = principal_id("prn_active_inspection");
+    let authority = AuthorizedScopes::new(principal.clone());
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let store = CanonicalStore::initialize(active.path(), owner()).expect("initialize");
+    let manifest = active.path().join("transactions/active-inspection.json");
+    fs::write(&manifest, b"ACTIVE_WAL_BODY_SENTINEL").expect("inject active WAL marker");
+    let before = tree_snapshot(active.path());
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("active WAL validation report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::ActiveTransaction)
+    );
+    assert!(matches!(
+        store.export_scopes(&authority, std::slice::from_ref(&scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert_eq!(tree_snapshot(active.path()), before);
+    assert_eq!(
+        fs::read(&manifest).expect("WAL remains exact"),
+        b"ACTIVE_WAL_BODY_SENTINEL"
+    );
+    drop(store);
+
+    let future = TempDir::new().expect("future-version store");
+    let initialized = CanonicalStore::initialize(future.path(), owner()).expect("initialize");
+    let mut metadata = initialized.metadata.clone();
+    drop(initialized);
+    metadata.format_version = "jiandu.store/v9alpha9".to_owned();
+    fs::write(
+        future.path().join(layout::STORE_METADATA_FILE),
+        metadata.canonical_bytes().expect("future metadata bytes"),
+    )
+    .expect("inject future metadata");
+    let future_record_id = memory_id("mem_future_format_must_not_be_opened");
+    write_raw_record(
+        future.path(),
+        &scope,
+        &future_record_id,
+        b"FUTURE_FORMAT_BODY_MUST_NOT_BE_OPENED",
+    );
+    let future_record_name = layout::record_file_name(&future_record_id);
+    let future_record_opened = Arc::new(AtomicBool::new(false));
+    let opened_by_hook = Arc::clone(&future_record_opened);
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        future_record_name.clone(),
+        move || opened_by_hook.store(true, Ordering::SeqCst),
+    );
+    let before = tree_snapshot(future.path());
+    let validation_authorization = authority
+        .authorize_store_validation(&inspection_context(
+            &principal,
+            "memory:admin:validate_store",
+        ))
+        .expect("validation admin");
+    let export_authorization = authority
+        .authorize_all_scope_export(&inspection_context(&principal, "memory:admin:export_all"))
+        .expect("export admin");
+    let inspector = ReadOnlyStoreInspector::open(future.path()).expect("offline inspector");
+    let report = inspector
+        .validate_all(&validation_authorization)
+        .expect("future store report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::UnsupportedStoreVersion)
+    );
+    assert!(report.source_store_id.is_none());
+    assert!(report.snapshot.is_none());
+    let future_report_bytes = report
+        .canonical_bytes()
+        .expect("unsupported-version report is canonical");
+    let future_report_text = String::from_utf8_lossy(&future_report_bytes);
+    assert!(!future_report_text.contains(&future.path().display().to_string()));
+    assert!(!future_report_text.contains("ACTIVE_WAL_BODY_SENTINEL"));
+    assert!(!future_report_text.contains("FUTURE_FORMAT_BODY_MUST_NOT_BE_OPENED"));
+    assert!(!future_record_opened.load(Ordering::SeqCst));
+    assert!(matches!(
+        inspector.export_all(&export_authorization),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert!(!future_record_opened.load(Ordering::SeqCst));
+    layout::run_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        OsStr::new(&future_record_name),
+    );
+    drop(inspector);
+    assert_eq!(tree_snapshot(future.path()), before);
+}
+
+#[test]
+fn impossible_or_huge_metadata_watermarks_produce_a_canonical_bounded_report() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_impossible_watermark");
+    let authority = AuthorizedScopes::new(principal.clone());
+    let initialized = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let mut metadata = initialized.metadata.clone();
+    drop(initialized);
+    metadata.store_revision = StoreRevision(1);
+    metadata.audit_sequence = AuditSequence(u64::MAX);
+    fs::write(
+        directory.path().join(layout::STORE_METADATA_FILE),
+        metadata
+            .canonical_bytes()
+            .expect("canonical hostile metadata"),
+    )
+    .expect("inject hostile watermark");
+    let before = tree_snapshot(directory.path());
+    let authorization = authority
+        .authorize_store_validation(&inspection_context(
+            &principal,
+            "memory:admin:validate_store",
+        ))
+        .expect("validation admin");
+    let inspector = ReadOnlyStoreInspector::open(directory.path()).expect("offline inspector");
+    let report = inspector
+        .validate_all(&authorization)
+        .expect("bounded invalid metadata report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::StoreMetadataInconsistent)
+    );
+    assert!(report.source_store_id.is_none());
+    assert!(report.snapshot.is_none());
+    let bytes = report.canonical_bytes().expect("canonical hostile report");
+    assert_eq!(
+        ValidationReport::decode_canonical(&bytes).expect("strict hostile report"),
+        report
+    );
+    drop(inspector);
+    assert_eq!(tree_snapshot(directory.path()), before);
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("writer startup rejects impossible watermark")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+}
+
+#[test]
+fn maximum_consistent_watermarks_exercise_bounded_ledger_continuity_validation() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_maximum_ledger_watermark");
+    let authority = AuthorizedScopes::new(principal.clone());
+    let initialized = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let mut metadata = initialized.metadata.clone();
+    drop(initialized);
+    metadata.store_revision = StoreRevision(u64::MAX);
+    metadata.audit_sequence = AuditSequence(u64::MAX);
+    fs::write(
+        directory.path().join(layout::STORE_METADATA_FILE),
+        metadata
+            .canonical_bytes()
+            .expect("canonical maximum watermark metadata"),
+    )
+    .expect("inject maximum consistent watermarks");
+    let before = tree_snapshot(directory.path());
+    let authorization = authority
+        .authorize_store_validation(&inspection_context(
+            &principal,
+            "memory:admin:validate_store",
+        ))
+        .expect("validation admin");
+    let inspector = ReadOnlyStoreInspector::open(directory.path()).expect("offline inspector");
+    let report = inspector
+        .validate_all(&authorization)
+        .expect("bounded maximum-watermark report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::ReceiptInconsistent)
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::AuditInconsistent)
+    );
+    let bytes = report
+        .canonical_bytes()
+        .expect("maximum-watermark report stays canonical");
+    assert_eq!(
+        ValidationReport::decode_canonical(&bytes).expect("strict maximum-watermark report"),
+        report
+    );
+    drop(inspector);
+    assert_eq!(tree_snapshot(directory.path()), before);
+}
+
+#[test]
+fn bounded_scanner_stops_before_reading_an_oversized_record() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_scan_budget");
+    let authority = AuthorizedScopes::new(principal.clone());
+    let scope = MemoryScope::Principal {
+        principal_id: principal,
+    };
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &authorization,
+        "mem_scan_budget",
+        "small canonical body",
+    )
+    .expect("create bounded scan record");
+    let path =
+        layout::record_path(directory.path(), &scope, &created.record.id).expect("record path");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open record for sparse extension");
+    file.set_len(67_108_865)
+        .expect("create sparse record beyond inspection budget");
+    file.sync_all().expect("sync sparse record");
+    let modified = fs::metadata(&path)
+        .expect("oversized record metadata")
+        .modified()
+        .expect("oversized record mtime");
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("bounded validation report");
+    assert!(report.truncated);
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.code == ValidationCode::FindingLimitReached)
+            .count(),
+        1
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::ScanLimitExceeded)
+    );
+    report
+        .canonical_bytes()
+        .expect("bounded report remains self-consistent");
+    assert!(matches!(
+        store.export_scopes(&authority, std::slice::from_ref(&scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+    let after = fs::metadata(&path).expect("oversized record remains");
+    assert_eq!(after.len(), 67_108_865);
+    assert_eq!(after.modified().expect("after mtime"), modified);
+}
+
+#[test]
+fn inspection_record_open_race_rejects_hardlink_replacement_without_reading_body() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_inspection_hardlink_race");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &scope, MutationOperation::Create),
+        "mem_inspection_hardlink_race",
+        "original canonical body",
+    )
+    .expect("create record");
+    let record_path =
+        layout::record_path(directory.path(), &scope, &created.record.id).expect("record path");
+    let saved_path = record_path.with_extension("saved");
+    let outside = TempDir::new().expect("outside directory");
+    let outside_path = outside.path().join("outside.md");
+    fs::write(&outside_path, b"HARDLINK_OUTSIDE_BODY_SENTINEL\n").expect("write outside body");
+    let outside_file = fs::OpenOptions::new()
+        .read(true)
+        .open(&outside_path)
+        .expect("open outside file");
+    layout::StoreDirectory::set_private_file(&outside_file).expect("harden outside file");
+    let outside_before = fs::read(&outside_path).expect("outside bytes before race");
+    let hook_record = record_path.clone();
+    let hook_saved = saved_path.clone();
+    let hook_outside = outside_path.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        layout::record_file_name(&created.record.id),
+        move || {
+            fs::rename(&hook_record, &hook_saved).expect("move checked record");
+            fs::hard_link(&hook_outside, &hook_record).expect("replace checked name with hardlink");
+        },
+    );
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("hardlink race validation report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::UnsafeEntry)
+    );
+    let text = String::from_utf8(report.canonical_bytes().expect("canonical report"))
+        .expect("report UTF-8");
+    assert!(!text.contains("HARDLINK_OUTSIDE_BODY_SENTINEL"));
+    assert!(!text.contains(&outside.path().display().to_string()));
+    assert_eq!(
+        fs::read(&outside_path).expect("outside bytes after race"),
+        outside_before
+    );
+}
+
+#[test]
+fn inspection_identity_recheck_rejects_a_hardlink_added_after_the_initial_open() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_inspection_hardlink_recheck");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &scope, MutationOperation::Create),
+        "mem_inspection_hardlink_recheck",
+        "authorized body that must never enter a failed bundle",
+    )
+    .expect("create record");
+    let record_path =
+        layout::record_path(directory.path(), &scope, &created.record.id).expect("record path");
+    let late_link = directory.path().join("late-record-hardlink");
+    let hook_record = record_path.clone();
+    let hook_link = late_link.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::InspectionRecordRecheck,
+        layout::record_file_name(&created.record.id),
+        move || fs::hard_link(&hook_record, &hook_link).expect("add raced hardlink"),
+    );
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("hardlink recheck report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::SnapshotChanged)
+    );
+    assert!(late_link.is_file());
+    assert!(matches!(
+        store.export_scopes(&authority, std::slice::from_ref(&scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_record_open_races_never_follow_symlinks_or_block_on_fifos() {
+    use std::os::unix::fs::symlink;
+
+    let symlink_directory = TempDir::new().expect("temporary symlink-race store");
+    let symlink_principal = principal_id("prn_inspection_symlink_race");
+    let symlink_scope = MemoryScope::Principal {
+        principal_id: symlink_principal.clone(),
+    };
+    let symlink_authority = AuthorizedScopes::new(symlink_principal);
+    let mut symlink_store =
+        CanonicalStore::initialize(symlink_directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut symlink_store,
+        &authorized_mutation(
+            &symlink_authority,
+            &symlink_scope,
+            MutationOperation::Create,
+        ),
+        "mem_inspection_symlink_race",
+        "original symlink-race body",
+    )
+    .expect("create symlink-race record");
+    let record_path =
+        layout::record_path(symlink_directory.path(), &symlink_scope, &created.record.id)
+            .expect("symlink-race record path");
+    let saved_path = record_path.with_extension("saved");
+    let outside = TempDir::new().expect("outside directory");
+    let outside_path = outside.path().join("outside.md");
+    fs::write(&outside_path, b"SYMLINK_OUTSIDE_BODY_SENTINEL\n").expect("write outside body");
+    let outside_before = fs::read(&outside_path).expect("outside bytes before race");
+    let hook_record = record_path.clone();
+    let hook_saved = saved_path.clone();
+    let hook_outside = outside_path.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        layout::record_file_name(&created.record.id),
+        move || {
+            fs::rename(&hook_record, &hook_saved).expect("move checked record");
+            symlink(&hook_outside, &hook_record).expect("replace checked name with symlink");
+        },
+    );
+    let report = symlink_store
+        .validate_scopes(&symlink_authority, std::slice::from_ref(&symlink_scope))
+        .expect("symlink-race validation report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::UnsafeEntry)
+    );
+    let text = String::from_utf8(report.canonical_bytes().expect("canonical report"))
+        .expect("report UTF-8");
+    assert!(!text.contains("SYMLINK_OUTSIDE_BODY_SENTINEL"));
+    assert!(!text.contains(&outside.path().display().to_string()));
+    assert_eq!(
+        fs::read(&outside_path).expect("outside bytes after race"),
+        outside_before
+    );
+
+    let fifo_directory = TempDir::new().expect("temporary FIFO-race store");
+    let fifo_principal = principal_id("prn_inspection_fifo_race");
+    let fifo_scope = MemoryScope::Principal {
+        principal_id: fifo_principal.clone(),
+    };
+    let fifo_authority = AuthorizedScopes::new(fifo_principal);
+    let mut fifo_store =
+        CanonicalStore::initialize(fifo_directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut fifo_store,
+        &authorized_mutation(&fifo_authority, &fifo_scope, MutationOperation::Create),
+        "mem_inspection_fifo_race",
+        "original FIFO-race body",
+    )
+    .expect("create FIFO-race record");
+    let record_path = layout::record_path(fifo_directory.path(), &fifo_scope, &created.record.id)
+        .expect("FIFO-race record path");
+    let saved_path = record_path.with_extension("saved");
+    let hook_record = record_path.clone();
+    let hook_saved = saved_path;
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        layout::record_file_name(&created.record.id),
+        move || {
+            fs::rename(&hook_record, &hook_saved).expect("move checked record");
+            let status = std::process::Command::new("mkfifo")
+                .arg(&hook_record)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo failed");
+        },
+    );
+    let report = fifo_store
+        .validate_scopes(&fifo_authority, std::slice::from_ref(&fifo_scope))
+        .expect("FIFO-race validation report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::LayoutInconsistent)
+    );
+}
+
+#[test]
+fn second_tombstone_protection_scan_failure_is_never_silently_ignored() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_tombstone_rescan");
+    let authority = AuthorizedScopes::new(principal.clone());
+    let scope = MemoryScope::Principal {
+        principal_id: principal,
+    };
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let tombstones = directory.path().join(layout::TOMBSTONES_DIR);
+    let saved = directory.path().join("tombstones-rescan-saved");
+    layout::install_test_hook(
+        layout::TestHookPoint::InspectionTombstoneRescan,
+        layout::TOMBSTONES_DIR,
+        move || {
+            fs::rename(&tombstones, &saved).expect("move tombstone namespace during rescan");
+            fs::write(&tombstones, b"replacement is not a directory")
+                .expect("replace tombstone namespace");
+        },
+    );
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("rescan failure report");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::TombstoneInconsistent)
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == ValidationCode::SnapshotChanged)
+    );
+    assert!(matches!(
+        store.export_scopes(&authority, std::slice::from_ref(&scope)),
+        Err(StoreError::ValidationFailed | StoreError::InvalidLayout)
+    ));
+}
+
+#[test]
+fn scoped_tombstone_mismatch_never_echoes_forged_identity() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_tombstone_expected");
+    let forged_principal = principal_id("prn_tombstone_forged");
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &scope, MutationOperation::Create),
+        "mem_tombstone_forged_scope",
+        "forgotten body",
+    )
+    .expect("create record");
+    store
+        .forget(
+            &authorized_mutation(&authority, &scope, MutationOperation::Forget),
+            &forget_command(
+                &created.record.id,
+                1,
+                "forged-tombstone-scope",
+                "private reason",
+            ),
+            timestamp("2026-08-24T08:00:00Z"),
+        )
+        .expect("forget record");
+    let path = layout::tombstone_relative_path(&scope, &created.record.id);
+    let mut tombstone: crate::tombstone::ProtectedTombstone =
+        serde_json::from_slice(&fs::read(directory.path().join(&path)).expect("tombstone bytes"))
+            .expect("decode tombstone fixture");
+    tombstone.scope = MemoryScope::Principal {
+        principal_id: forged_principal,
+    };
+    fs::write(
+        directory.path().join(&path),
+        tombstone
+            .canonical_bytes()
+            .expect("forged canonical tombstone"),
+    )
+    .expect("inject forged tombstone scope");
+    let report = store
+        .validate_scopes(&authority, std::slice::from_ref(&scope))
+        .expect("scoped tombstone report");
+    let mismatch = report
+        .findings
+        .iter()
+        .find(|finding| finding.code == ValidationCode::TombstoneInconsistent)
+        .expect("tombstone mismatch finding");
+    assert_eq!(mismatch.scope.as_ref(), Some(&scope));
+    assert!(mismatch.memory_id.is_none());
+    let text =
+        String::from_utf8(report.canonical_bytes().expect("report bytes")).expect("report UTF-8");
+    assert!(!text.contains("prn_tombstone_forged"));
+}
+
+#[test]
+fn tombstone_protection_precedes_body_decode_for_same_and_other_authorized_scopes() {
+    let directory = TempDir::new().expect("temporary store");
+    let principal = principal_id("prn_authorized_cross_scope");
+    let project_a = project_id("prj_authorized_cross_a");
+    let project_b = project_id("prj_authorized_cross_b");
+    let scope_a = MemoryScope::Project {
+        project_id: project_a.clone(),
+    };
+    let scope_b = MemoryScope::Project {
+        project_id: project_b.clone(),
+    };
+    let authority = AuthorizedScopes::new(principal)
+        .with_project(project_a)
+        .with_project(project_b);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let id = memory_id("mem_authorized_cross_scope_tombstone");
+    create_memory(
+        &mut store,
+        &authorized_mutation(&authority, &scope_b, MutationOperation::Create),
+        id.as_str(),
+        "body that becomes forgotten",
+    )
+    .expect("create record");
+    store
+        .forget(
+            &authorized_mutation(&authority, &scope_b, MutationOperation::Forget),
+            &forget_command(&id, 1, "authorized-cross-forget", "private reason"),
+            timestamp("2026-08-24T08:10:00Z"),
+        )
+        .expect("forget record");
+    let only_b = store
+        .export_scopes(&authority, std::slice::from_ref(&scope_b))
+        .expect("authorized tombstone-only scope exports");
+    assert!(only_b.records.is_empty());
+    assert_eq!(only_b.tombstones.len(), 1);
+
+    write_raw_record(
+        directory.path(),
+        &scope_a,
+        &id,
+        b"MALFORMED_OTHER_SCOPE_BODY_SENTINEL",
+    );
+    write_raw_record(
+        directory.path(),
+        &scope_b,
+        &id,
+        b"MALFORMED_SAME_SCOPE_BODY_SENTINEL",
+    );
+    let opened = Arc::new(AtomicBool::new(false));
+    let opened_by_hook = Arc::clone(&opened);
+    let file_name = layout::record_file_name(&id);
+    layout::install_test_hook(
+        layout::TestHookPoint::RegularOpen,
+        file_name.clone(),
+        move || opened_by_hook.store(true, Ordering::SeqCst),
+    );
+    let report = store
+        .validate_scopes(&authority, &[scope_b.clone(), scope_a.clone()])
+        .expect("cross-scope validation");
+    assert!(!opened.load(Ordering::SeqCst));
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.code == ValidationCode::RecordTombstoneConflict)
+            .count(),
+        2
+    );
+    assert!(matches!(
+        store.export_scopes(&authority, &[scope_a, scope_b]),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert!(!opened.load(Ordering::SeqCst));
+    layout::run_test_hook(layout::TestHookPoint::RegularOpen, OsStr::new(&file_name));
 }

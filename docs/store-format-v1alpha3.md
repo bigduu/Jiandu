@@ -213,9 +213,41 @@ never migrates an old or unknown format.
 receipt/audit and current tombstone layouts, writes audit genesis, and then
 publishes the current v3 marker metadata-last.
 
+## Read-only validation and portable export
+
+Side-effect-free validation and portable export use independent
+`jiandu.validation-report/v1alpha1`, `jiandu.portable-export/v1alpha1`, and
+`jiandu.portable-tombstone/v1alpha1` format domains. They do not change the
+`jiandu.store/v1alpha3` capability marker or historical fixtures. Inspection
+does not initialize, migrate, recover, quarantine, rewrite, or advance this
+store; active WAL, an inconsistent private ledger in admin whole-store mode, an
+unstable snapshot, or an unsupported source refuses export. Scoped mode does
+not traverse the principal-global private ledger because it cannot be safely
+partitioned by a requested memory scope.
+
+Scoped inspection opens and decodes records and tombstone metadata only under
+explicitly authorized owner segments. It preserves this format's global
+non-resurrection rule with one bounded namespace-only pass over tombstone
+storage keys before opening an authorized record candidate. That pass validates
+strict entry names and filesystem type/link/permission metadata, but does not
+open or decode
+an unauthorized tombstone or expose its scope, ID, metadata, or count. A match
+is a record/tombstone conflict and export fails closed; it is never silently
+normalized into a valid bundle.
+
+Portable tombstones contain body-free protection metadata only. The bundle
+adds no canonical path/internal key fields, private receipts/results/audits/WAL,
+erasure-witness bytes, raw keys/reasons/queries, host/store credential fields,
+or forgotten bodies. Authorized public record fields remain exact user content
+and are not a path- or credential-redaction boundary. Full coordination,
+authorization, strict-codec, ordering, digest, schema, bound, and compatibility
+rules are specified in
+[Validation Report and Portable Export `v1alpha1`](portable-export-v1alpha1.md).
+
 ## Non-goals
 
 This format does not implement restore/hard-purge execution, receipt GC,
-retention scheduling, remote backup deletion, validation/export/import,
-backup metadata, search/indexing, MCP/CLI transport, Bamboo integration,
-prompt construction, or model calls.
+retention scheduling, remote backup deletion, committed import, backup
+metadata, search/indexing, MCP/CLI transport, Bamboo integration, prompt
+construction, or model calls. Validation/export are separate read-only output
+formats, not new `v1alpha3` mutation capabilities.

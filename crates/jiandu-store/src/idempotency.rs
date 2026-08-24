@@ -696,12 +696,24 @@ pub(crate) fn read_result(
     binding: &MutationBinding,
     expected_digest: &str,
 ) -> Result<DurableMutationResult, StoreError> {
+    let mut budget = UnlimitedLedgerBudget;
+    read_result_inner(root, store_id, binding, expected_digest, &mut budget)
+}
+
+fn read_result_inner(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    binding: &MutationBinding,
+    expected_digest: &str,
+    budget: &mut impl LedgerScanBudget,
+) -> Result<DurableMutationResult, StoreError> {
     if !transaction::valid_content_digest(expected_digest) {
         return Err(StoreError::InvalidTransaction);
     }
     let file = root
         .try_open_regular(&result_relative(&binding.receipt_id)?, false)?
         .ok_or(StoreError::InvalidTransaction)?;
+    charge_file(&file, budget)?;
     StoreDirectory::validate_private_open_file(&file)?;
     let read_file = file
         .try_clone()
@@ -718,9 +730,21 @@ pub(crate) fn verify_audit(
     binding: &MutationBinding,
     expected_result_digest: &str,
 ) -> Result<(), StoreError> {
+    let mut budget = UnlimitedLedgerBudget;
+    verify_audit_inner(root, store_id, binding, expected_result_digest, &mut budget)
+}
+
+fn verify_audit_inner(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    binding: &MutationBinding,
+    expected_result_digest: &str,
+    budget: &mut impl LedgerScanBudget,
+) -> Result<(), StoreError> {
     let file = root
         .try_open_regular(&audit_relative(binding.audit_sequence)?, false)?
         .ok_or(StoreError::InvalidTransaction)?;
+    charge_file(&file, budget)?;
     StoreDirectory::validate_private_open_file(&file)?;
     let audit = DurableAuditEvent::decode(file, store_id, binding.audit_sequence)?;
     if audit.binding != *binding || audit.result_digest != expected_result_digest {
@@ -736,11 +760,75 @@ pub(crate) fn validate_ledger(
     root: &StoreDirectory,
     metadata: &StoreMetadata,
 ) -> Result<(), StoreError> {
-    let receipts = read_all_receipts(root, metadata)?;
-    let expected_count =
-        usize::try_from(metadata.audit_sequence.0).map_err(|_| StoreError::InvalidTransaction)?;
+    let mut budget = UnlimitedLedgerBudget;
+    let issues = inspect_ledger(root, metadata, &mut budget);
+    if issues.is_empty() {
+        Ok(())
+    } else if issues.contains(&LedgerIssue::Unsafe) {
+        Err(StoreError::UnsafePath)
+    } else {
+        Err(StoreError::InvalidTransaction)
+    }
+}
+
+/// Stage-specific view over the exact same ledger invariant used by startup.
+/// The set is intentionally closed and carries no artifact names or contents.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum LedgerIssue {
+    Receipt,
+    Result,
+    Audit,
+    Tombstone,
+    Witness,
+    Limit,
+    Unsafe,
+}
+
+pub(crate) trait LedgerScanBudget {
+    fn consume_entry(&mut self) -> bool;
+    fn consume_bytes(&mut self, bytes: u64) -> bool;
+    fn exceeded(&self) -> bool;
+}
+
+struct UnlimitedLedgerBudget;
+
+impl LedgerScanBudget for UnlimitedLedgerBudget {
+    fn consume_entry(&mut self) -> bool {
+        true
+    }
+
+    fn consume_bytes(&mut self, _bytes: u64) -> bool {
+        true
+    }
+
+    fn exceeded(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) fn inspect_ledger(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+    budget: &mut impl LedgerScanBudget,
+) -> BTreeSet<LedgerIssue> {
+    let mut issues = BTreeSet::new();
+    if metadata.audit_sequence.0 > metadata.store_revision.0 {
+        issues.insert(LedgerIssue::Audit);
+    }
+    let receipts = match read_all_receipts(root, metadata, budget) {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            issues.insert(LedgerIssue::Receipt);
+            record_unsafe_issue(&mut issues, &error);
+            if budget.exceeded() {
+                issues.insert(LedgerIssue::Limit);
+            }
+            return issues;
+        }
+    };
+    let expected_count = usize::try_from(metadata.audit_sequence.0).unwrap_or(usize::MAX);
     if receipts.len() != expected_count {
-        return Err(StoreError::InvalidTransaction);
+        issues.insert(LedgerIssue::Receipt);
     }
 
     let mut expected_results = BTreeSet::new();
@@ -755,72 +843,162 @@ pub(crate) fn validate_ledger(
                 .insert(binding.audit_sequence, receipt.clone())
                 .is_some()
         {
-            return Err(StoreError::InvalidTransaction);
+            issues.insert(LedgerIssue::Receipt);
         }
-        let result_path = result_relative(&binding.receipt_id)?;
-        let result = read_result(root, &metadata.store_id, binding, &receipt.result_digest)?;
-        verify_audit(root, &metadata.store_id, binding, &receipt.result_digest)?;
+        let result_path = match result_relative(&binding.receipt_id) {
+            Ok(path) => path,
+            Err(_) => {
+                issues.insert(LedgerIssue::Result);
+                continue;
+            }
+        };
+        let result = match read_result_inner(
+            root,
+            &metadata.store_id,
+            binding,
+            &receipt.result_digest,
+            budget,
+        ) {
+            Ok(result) => Some(result),
+            Err(error) => {
+                issues.insert(LedgerIssue::Result);
+                record_unsafe_issue(&mut issues, &error);
+                None
+            }
+        };
+        if let Err(error) = verify_audit_inner(
+            root,
+            &metadata.store_id,
+            binding,
+            &receipt.result_digest,
+            budget,
+        ) {
+            issues.insert(LedgerIssue::Audit);
+            record_unsafe_issue(&mut issues, &error);
+        }
         match (binding.operation, result) {
             (
                 MutationOperation::Create | MutationOperation::Update,
-                DurableMutationResult::Record(_),
+                Some(DurableMutationResult::Record(_)),
             ) => {}
-            (MutationOperation::Forget, DurableMutationResult::Forget(result))
+            (MutationOperation::Forget, Some(DurableMutationResult::Forget(result)))
                 if metadata.format_version == crate::STORE_FORMAT_VERSION =>
             {
-                let tombstone = crate::tombstone::read_exact(
+                let tombstone = match crate::tombstone::read_exact_bounded(
                     root,
                     &metadata.store_id,
                     &binding.scope,
                     &binding.memory_id,
-                )?
-                .ok_or(StoreError::InvalidTransaction)?;
+                    budget,
+                ) {
+                    Ok(Some(tombstone)) => Some(tombstone),
+                    Ok(None) => {
+                        issues.insert(LedgerIssue::Tombstone);
+                        None
+                    }
+                    Err(error) => {
+                        issues.insert(LedgerIssue::Tombstone);
+                        record_unsafe_issue(&mut issues, &error);
+                        None
+                    }
+                };
+                let Some(tombstone) = tombstone else {
+                    expected_results.insert(result_path);
+                    continue;
+                };
+                let record_exists = match crate::mutation::record_id_exists_anywhere_bounded(
+                    root,
+                    &binding.memory_id,
+                    budget,
+                ) {
+                    Ok(exists) => exists,
+                    Err(error) => {
+                        record_unsafe_issue(&mut issues, &error);
+                        true
+                    }
+                };
                 if tombstone.transaction_id != binding.transaction_id
                     || tombstone.revision != binding.target_revision
                     || tombstone.etag != binding.target_etag
                     || tombstone.forgotten_at != result.forgotten_at
                     || tombstone.store_revision != binding.store_revision
                     || tombstone.audit_sequence != binding.audit_sequence
-                    || crate::mutation::record_id_exists_anywhere(root, &binding.memory_id)?
+                    || record_exists
                     || !expected_tombstones.insert(tombstone.relative_path())
-                    || !expected_witnesses.insert(transaction::erasure_witness_relative_for(
-                        &binding.scope,
-                        &binding.memory_id,
-                        &binding.transaction_id,
-                    )?)
                 {
-                    return Err(StoreError::InvalidTransaction);
+                    issues.insert(LedgerIssue::Tombstone);
+                }
+                match transaction::erasure_witness_relative_for(
+                    &binding.scope,
+                    &binding.memory_id,
+                    &binding.transaction_id,
+                ) {
+                    Ok(path) => {
+                        if !expected_witnesses.insert(path) {
+                            issues.insert(LedgerIssue::Witness);
+                        }
+                    }
+                    Err(_) => {
+                        issues.insert(LedgerIssue::Witness);
+                    }
                 }
             }
-            _ => return Err(StoreError::InvalidTransaction),
+            (_, None) => {}
+            _ => {
+                issues.insert(LedgerIssue::Result);
+            }
         }
         expected_results.insert(result_path);
     }
 
-    validate_result_namespace(root, &expected_results)?;
-    validate_audit_namespace(root, metadata, &receipts_by_sequence)?;
-    if metadata.format_version == crate::STORE_FORMAT_VERSION {
-        validate_tombstone_namespace(root, metadata, &expected_tombstones)?;
+    if let Err(error) = validate_result_namespace(root, &expected_results, budget) {
+        issues.insert(LedgerIssue::Result);
+        record_unsafe_issue(&mut issues, &error);
     }
-    validate_erasure_witness_namespace(root, &expected_witnesses)?;
-    Ok(())
+    if let Err(error) = validate_audit_namespace(root, metadata, &receipts_by_sequence, budget) {
+        issues.insert(LedgerIssue::Audit);
+        record_unsafe_issue(&mut issues, &error);
+    }
+    if metadata.format_version == crate::STORE_FORMAT_VERSION
+        && let Err(error) =
+            validate_tombstone_namespace(root, metadata, &expected_tombstones, budget)
+    {
+        issues.insert(LedgerIssue::Tombstone);
+        record_unsafe_issue(&mut issues, &error);
+    }
+    if let Err(error) = validate_erasure_witness_namespace(root, &expected_witnesses, budget) {
+        issues.insert(LedgerIssue::Witness);
+        record_unsafe_issue(&mut issues, &error);
+    }
+    if budget.exceeded() {
+        issues.insert(LedgerIssue::Limit);
+    }
+    issues
+}
+
+fn record_unsafe_issue(issues: &mut BTreeSet<LedgerIssue>, error: &StoreError) {
+    if matches!(error, StoreError::UnsafePath) {
+        issues.insert(LedgerIssue::Unsafe);
+    }
 }
 
 fn read_all_receipts(
     root: &StoreDirectory,
     metadata: &StoreMetadata,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<Vec<DurableIdempotencyReceipt>, StoreError> {
     let root_relative = Path::new(layout::IDEMPOTENCY_RECEIPTS_DIR);
     let principal_directories = root.open_directory(root_relative)?;
     let mut receipts = Vec::new();
-    for principal_name in entry_names(&principal_directories, "list receipt principals")? {
+    for principal_name in entry_names(&principal_directories, "list receipt principals", budget)? {
         let principal = principal_name
             .to_str()
             .filter(|value| valid_hex(value, 64))
             .ok_or(StoreError::InvalidTransaction)?;
         let principal_directory =
             StoreDirectory::open_child_directory(&principal_directories, &principal_name)?;
-        for operation_name in entry_names(&principal_directory, "list receipt operations")? {
+        for operation_name in entry_names(&principal_directory, "list receipt operations", budget)?
+        {
             let operation = match operation_name.to_str() {
                 Some("create") => MutationOperation::Create,
                 Some("update") => MutationOperation::Update,
@@ -831,20 +1009,21 @@ fn read_all_receipts(
             };
             let operation_directory =
                 StoreDirectory::open_child_directory(&principal_directory, &operation_name)?;
-            for shard_name in entry_names(&operation_directory, "list receipt shards")? {
+            for shard_name in entry_names(&operation_directory, "list receipt shards", budget)? {
                 let shard = shard_name
                     .to_str()
                     .filter(|value| valid_hex(value, 2))
                     .ok_or(StoreError::InvalidTransaction)?;
                 let shard_directory =
                     StoreDirectory::open_child_directory(&operation_directory, &shard_name)?;
-                for file_name in entry_names(&shard_directory, "list receipt artifacts")? {
+                for file_name in entry_names(&shard_directory, "list receipt artifacts", budget)? {
                     let receipt_id = json_hex_name(&file_name, 64)?;
                     if !receipt_id.starts_with(shard) {
                         return Err(StoreError::InvalidTransaction);
                     }
                     let file = StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
                         .ok_or(StoreError::InvalidTransaction)?;
+                    charge_file(&file, budget)?;
                     StoreDirectory::validate_private_open_file(&file)?;
                     let receipt =
                         DurableIdempotencyReceipt::decode(file, &metadata.store_id, receipt_id)?;
@@ -871,10 +1050,11 @@ fn validate_tombstone_namespace(
     root: &StoreDirectory,
     metadata: &StoreMetadata,
     expected: &BTreeSet<PathBuf>,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<(), StoreError> {
     let tombstones = root.open_directory(Path::new(layout::TOMBSTONES_DIR))?;
     let mut observed = BTreeSet::new();
-    let kinds = entry_names(&tombstones, "list tombstone scope kinds")?;
+    let kinds = entry_names(&tombstones, "list tombstone scope kinds", budget)?;
     let expected_kinds: BTreeSet<_> = ["instance_global", "principal", "project", "session"]
         .into_iter()
         .collect();
@@ -895,9 +1075,10 @@ fn validate_tombstone_namespace(
                 &kind_directory,
                 Path::new(layout::TOMBSTONES_DIR).join(kind),
                 &mut observed,
+                budget,
             )?;
         } else {
-            for owner_name in entry_names(&kind_directory, "list tombstone owners")? {
+            for owner_name in entry_names(&kind_directory, "list tombstone owners", budget)? {
                 layout::validate_owner_entry_name(&owner_name)?;
                 let owner_directory =
                     StoreDirectory::open_child_directory(&kind_directory, &owner_name)?;
@@ -909,6 +1090,7 @@ fn validate_tombstone_namespace(
                         .join(kind)
                         .join(&owner_name),
                     &mut observed,
+                    budget,
                 )?;
             }
         }
@@ -923,6 +1105,7 @@ fn validate_tombstone_namespace(
 fn validate_erasure_witness_namespace(
     root: &StoreDirectory,
     expected: &BTreeSet<PathBuf>,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<(), StoreError> {
     let records = root.open_directory(Path::new("records"))?;
     let mut observed = BTreeSet::new();
@@ -932,6 +1115,7 @@ fn validate_erasure_witness_namespace(
         0,
         expected,
         &mut observed,
+        budget,
     )?;
     if &observed == expected {
         Ok(())
@@ -946,11 +1130,12 @@ fn collect_erasure_witnesses(
     depth: usize,
     expected: &BTreeSet<PathBuf>,
     observed: &mut BTreeSet<PathBuf>,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<(), StoreError> {
     if depth > 4 {
         return Err(StoreError::InvalidTransaction);
     }
-    for name in entry_names(directory, "list forget erasure witnesses")? {
+    for name in entry_names(directory, "list forget erasure witnesses", budget)? {
         let metadata = directory
             .symlink_metadata(&name)
             .map_err(|source| StoreError::io("inspect forget erasure witness", source))?;
@@ -969,12 +1154,20 @@ fn collect_erasure_witnesses(
                 return Err(StoreError::InvalidTransaction);
             }
             let child = StoreDirectory::open_child_directory(directory, &name)?;
-            collect_erasure_witnesses(&child, relative.join(&name), depth + 1, expected, observed)?;
+            collect_erasure_witnesses(
+                &child,
+                relative.join(&name),
+                depth + 1,
+                expected,
+                observed,
+                budget,
+            )?;
             continue;
         }
         if transaction_id.is_some() {
             let file = StoreDirectory::try_open_regular_in(directory, &name)?
                 .ok_or(StoreError::InvalidTransaction)?;
+            charge_file(&file, budget)?;
             StoreDirectory::validate_private_open_file(&file)?;
             if file
                 .metadata()
@@ -1001,20 +1194,22 @@ fn collect_tombstone_shards(
     owner_directory: &cap_std::fs::Dir,
     owner_relative: PathBuf,
     observed: &mut BTreeSet<PathBuf>,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<(), StoreError> {
-    for shard_name in entry_names(owner_directory, "list tombstone shards")? {
+    for shard_name in entry_names(owner_directory, "list tombstone shards", budget)? {
         let shard = shard_name
             .to_str()
             .filter(|value| valid_hex(value, 2))
             .ok_or(StoreError::InvalidTransaction)?;
         let shard_directory = StoreDirectory::open_child_directory(owner_directory, &shard_name)?;
-        for file_name in entry_names(&shard_directory, "list protected tombstones")? {
+        for file_name in entry_names(&shard_directory, "list protected tombstones", budget)? {
             let storage_key = layout::validate_tombstone_entry_name(&file_name)?;
             if !storage_key.starts_with(shard) {
                 return Err(StoreError::InvalidTransaction);
             }
             let file = StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
                 .ok_or(StoreError::InvalidTransaction)?;
+            charge_file(&file, budget)?;
             StoreDirectory::validate_private_open_file(&file)?;
             let tombstone = crate::tombstone::ProtectedTombstone::decode(file, &metadata.store_id)?;
             let relative = owner_relative.join(shard).join(&file_name);
@@ -1035,23 +1230,25 @@ fn collect_tombstone_shards(
 fn validate_result_namespace(
     root: &StoreDirectory,
     expected: &BTreeSet<PathBuf>,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<(), StoreError> {
     let root_relative = Path::new(layout::IDEMPOTENCY_RESULTS_DIR);
     let results = root.open_directory(root_relative)?;
     let mut observed = BTreeSet::new();
-    for shard_name in entry_names(&results, "list result shards")? {
+    for shard_name in entry_names(&results, "list result shards", budget)? {
         let shard = shard_name
             .to_str()
             .filter(|value| valid_hex(value, 2))
             .ok_or(StoreError::InvalidTransaction)?;
         let shard_directory = StoreDirectory::open_child_directory(&results, &shard_name)?;
-        for file_name in entry_names(&shard_directory, "list result artifacts")? {
+        for file_name in entry_names(&shard_directory, "list result artifacts", budget)? {
             let receipt_id = json_hex_name(&file_name, 64)?;
             if !receipt_id.starts_with(shard) {
                 return Err(StoreError::InvalidTransaction);
             }
             let file = StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
                 .ok_or(StoreError::InvalidTransaction)?;
+            charge_file(&file, budget)?;
             StoreDirectory::validate_private_open_file(&file)?;
             let relative = root_relative.join(shard).join(&file_name);
             if !expected.contains(&relative) || !observed.insert(relative) {
@@ -1070,10 +1267,11 @@ fn validate_audit_namespace(
     root: &StoreDirectory,
     metadata: &StoreMetadata,
     receipts: &BTreeMap<AuditSequence, DurableIdempotencyReceipt>,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<(), StoreError> {
     let audits = root.open_directory(Path::new(layout::MUTATION_AUDIT_DIR))?;
     let mut observed = BTreeSet::new();
-    for file_name in entry_names(&audits, "list mutation audit events")? {
+    for file_name in entry_names(&audits, "list mutation audit events", budget)? {
         let name = file_name.to_str().ok_or(StoreError::InvalidTransaction)?;
         let digits = name
             .strip_suffix(".json")
@@ -1093,29 +1291,45 @@ fn validate_audit_namespace(
             .ok_or(StoreError::InvalidTransaction)?;
         let file = StoreDirectory::try_open_regular_in(&audits, &file_name)?
             .ok_or(StoreError::InvalidTransaction)?;
+        charge_file(&file, budget)?;
         StoreDirectory::validate_private_open_file(&file)?;
         let event = DurableAuditEvent::decode(file, &metadata.store_id, sequence)?;
         if event.binding != receipt.binding || event.result_digest != receipt.result_digest {
             return Err(StoreError::InvalidTransaction);
         }
     }
-    let expected: BTreeSet<_> = (1..=metadata.audit_sequence.0).map(AuditSequence).collect();
-    if observed == expected {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidTransaction)
+    let expected_len =
+        usize::try_from(metadata.audit_sequence.0).map_err(|_| StoreError::InvalidTransaction)?;
+    if observed.len() != expected_len {
+        return Err(StoreError::InvalidTransaction);
     }
+    let mut previous = 0_u64;
+    for sequence in observed {
+        if sequence.0 != previous.saturating_add(1) {
+            return Err(StoreError::InvalidTransaction);
+        }
+        previous = sequence.0;
+    }
+    if previous != metadata.audit_sequence.0 {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(())
 }
 
 fn entry_names(
     directory: &cap_std::fs::Dir,
     operation: &'static str,
+    budget: &mut impl LedgerScanBudget,
 ) -> Result<Vec<std::ffi::OsString>, StoreError> {
+    StoreDirectory::validate_private_open_directory(directory)?;
     let entries = directory
         .entries()
         .map_err(|source| StoreError::io(operation, source))?;
     let mut names = Vec::new();
     for entry in entries {
+        if !budget.consume_entry() {
+            return Err(StoreError::InvalidRequest);
+        }
         names.push(
             entry
                 .map_err(|source| StoreError::io(operation, source))?
@@ -1124,6 +1338,18 @@ fn entry_names(
     }
     names.sort();
     Ok(names)
+}
+
+fn charge_file(file: &File, budget: &mut impl LedgerScanBudget) -> Result<(), StoreError> {
+    let length = file
+        .metadata()
+        .map_err(|source| StoreError::io("inspect bounded ledger artifact", source))?
+        .len();
+    if budget.consume_bytes(length) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidRequest)
+    }
 }
 
 fn json_hex_name(name: &OsStr, length: usize) -> Result<&str, StoreError> {

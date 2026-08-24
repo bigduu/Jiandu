@@ -29,6 +29,7 @@ pub enum StoreErrorCode {
     RevisionConflict,
     RevisionOverflow,
     IdempotencyConflict,
+    ValidationFailed,
     RecoveryRequired,
     InvalidTransaction,
     UnsupportedDurability,
@@ -90,6 +91,7 @@ pub enum StoreError {
     },
     RevisionOverflow,
     IdempotencyConflict,
+    ValidationFailed,
     RecoveryRequired,
     InvalidTransaction,
     UnsupportedDurability {
@@ -129,6 +131,7 @@ impl StoreError {
             Self::RevisionConflict { .. } => StoreErrorCode::RevisionConflict,
             Self::RevisionOverflow => StoreErrorCode::RevisionOverflow,
             Self::IdempotencyConflict => StoreErrorCode::IdempotencyConflict,
+            Self::ValidationFailed => StoreErrorCode::ValidationFailed,
             Self::RecoveryRequired => StoreErrorCode::RecoveryRequired,
             Self::InvalidTransaction => StoreErrorCode::InvalidTransaction,
             Self::UnsupportedDurability { .. } => StoreErrorCode::UnsupportedDurability,
@@ -193,6 +196,9 @@ impl fmt::Display for StoreError {
             Self::RevisionOverflow => formatter.write_str("memory or store revision overflow"),
             Self::IdempotencyConflict => {
                 formatter.write_str("idempotency key was reused for different input")
+            }
+            Self::ValidationFailed => {
+                formatter.write_str("store validation failed; portable export was not produced")
             }
             Self::RecoveryRequired => formatter.write_str("store handle requires restart recovery"),
             Self::InvalidTransaction => formatter.write_str("invalid or ambiguous transaction"),
