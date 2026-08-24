@@ -2670,9 +2670,10 @@ fn forget_descriptor_erasure_preserves_a_last_moment_witness_replacement() {
         .expect("list replacement witness")
         .map(|entry| entry.expect("replacement entry").path())
         .find(|path| {
-            path.file_name().is_some_and(|name| {
-                transaction::transaction_id_from_erasure_witness_name(name).is_some()
-            })
+            path != &saved_original
+                && path.file_name().is_some_and(|name| {
+                    transaction::transaction_id_from_erasure_witness_name(name).is_some()
+                })
         })
         .expect("replacement witness remains named");
     assert_eq!(
