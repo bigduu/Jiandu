@@ -117,6 +117,7 @@ impl ProtectedTombstone {
             || !transaction::valid_content_digest(self.etag.as_str())
             || self.store_revision.0 == 0
             || self.audit_sequence.0 == 0
+            || self.revision.get() > self.store_revision.0
             || self.audit_sequence.0 > self.store_revision.0
         {
             return Err(StoreError::InvalidTransaction);

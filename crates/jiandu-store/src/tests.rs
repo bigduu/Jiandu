@@ -6940,6 +6940,123 @@ fn validation_reports_malformed_and_duplicate_records_without_body_or_path_discl
 }
 
 #[test]
+fn validation_rejects_record_and_tombstone_revisions_ahead_of_committed_watermarks() {
+    let record_directory = TempDir::new().expect("future record revision store");
+    let record_principal = principal_id("prn_future_record_revision");
+    let record_scope = MemoryScope::Principal {
+        principal_id: record_principal.clone(),
+    };
+    let record_authority = AuthorizedScopes::new(record_principal);
+    let record_store =
+        CanonicalStore::initialize(record_directory.path(), owner()).expect("initialize");
+    let mut future_record = frontmatter(
+        "mem_future_record_revision",
+        record_scope.clone(),
+        "2026-08-24T08:00:00Z",
+        "2026-08-24T08:00:00Z",
+    );
+    future_record.revision = Revision::new(record_store.metadata.store_revision.0 + 1)
+        .expect("revision ahead of the empty store watermark");
+    write_record(
+        record_directory.path(),
+        &future_record,
+        "FUTURE_RECORD_REVISION_BODY_SENTINEL",
+    );
+    let record_before = tree_snapshot(record_directory.path());
+    let record_report = record_store
+        .validate_scopes(&record_authority, std::slice::from_ref(&record_scope))
+        .expect("future record revision report");
+    let record_finding = record_report
+        .findings
+        .iter()
+        .find(|finding| finding.code == ValidationCode::RecordMalformed)
+        .expect("future record revision finding");
+    assert_eq!(record_finding.scope.as_ref(), Some(&record_scope));
+    assert!(record_finding.memory_id.is_none());
+    let record_report_text = String::from_utf8_lossy(
+        &record_report
+            .canonical_bytes()
+            .expect("canonical future record report"),
+    )
+    .into_owned();
+    assert!(!record_report_text.contains("FUTURE_RECORD_REVISION_BODY_SENTINEL"));
+    assert!(!record_report_text.contains(&record_directory.path().display().to_string()));
+    assert!(matches!(
+        record_store.export_scopes(&record_authority, std::slice::from_ref(&record_scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert_eq!(tree_snapshot(record_directory.path()), record_before);
+
+    let tombstone_directory = TempDir::new().expect("future tombstone revision store");
+    let tombstone_principal = principal_id("prn_future_tombstone_revision");
+    let tombstone_scope = MemoryScope::Principal {
+        principal_id: tombstone_principal.clone(),
+    };
+    let tombstone_authority = AuthorizedScopes::new(tombstone_principal);
+    let mut tombstone_store =
+        CanonicalStore::initialize(tombstone_directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut tombstone_store,
+        &authorized_mutation(
+            &tombstone_authority,
+            &tombstone_scope,
+            MutationOperation::Create,
+        ),
+        "mem_future_tombstone_revision",
+        "body that must remain forgotten",
+    )
+    .expect("create record to forget");
+    tombstone_store
+        .forget(
+            &authorized_mutation(
+                &tombstone_authority,
+                &tombstone_scope,
+                MutationOperation::Forget,
+            ),
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "future-tombstone-revision",
+                "private reason",
+            ),
+            timestamp("2026-08-24T08:01:00Z"),
+        )
+        .expect("forget record");
+    let tombstone_path = tombstone_directory
+        .path()
+        .join(layout::tombstone_relative_path(
+            &tombstone_scope,
+            &created.record.id,
+        ));
+    let mut future_tombstone: crate::tombstone::ProtectedTombstone =
+        serde_json::from_slice(&fs::read(&tombstone_path).expect("read protected tombstone"))
+            .expect("decode protected tombstone");
+    future_tombstone.revision = Revision::new(future_tombstone.store_revision.0 + 1)
+        .expect("revision ahead of tombstone store watermark");
+    assert!(future_tombstone.canonical_bytes().is_err());
+    let mut future_tombstone_bytes =
+        serde_json::to_vec_pretty(&future_tombstone).expect("serialize hostile tombstone");
+    future_tombstone_bytes.push(b'\n');
+    fs::write(&tombstone_path, future_tombstone_bytes).expect("inject hostile tombstone");
+    let tombstone_before = tree_snapshot(tombstone_directory.path());
+    let tombstone_report = tombstone_store
+        .validate_scopes(&tombstone_authority, std::slice::from_ref(&tombstone_scope))
+        .expect("future tombstone revision report");
+    let tombstone_finding = tombstone_report
+        .findings
+        .iter()
+        .find(|finding| finding.code == ValidationCode::TombstoneInconsistent)
+        .expect("future tombstone revision finding");
+    assert_eq!(tombstone_finding.scope.as_ref(), Some(&tombstone_scope));
+    assert!(tombstone_finding.memory_id.is_none());
+    assert!(matches!(
+        tombstone_store.export_scopes(&tombstone_authority, std::slice::from_ref(&tombstone_scope)),
+        Err(StoreError::ValidationFailed)
+    ));
+    assert_eq!(tree_snapshot(tombstone_directory.path()), tombstone_before);
+}
+
+#[test]
 fn metadata_change_during_export_is_a_safe_failure_not_a_mixed_bundle() {
     let directory = TempDir::new().expect("temporary store");
     let principal = principal_id("prn_snapshot_change");

@@ -664,9 +664,11 @@ fn inspect(
         Selection::Scoped(scopes) => {
             for scope in scopes {
                 observed_scopes.insert(scope_key(scope), scope.clone());
-                if let Some(tombstoned_keys) = &tombstoned_keys {
+                if let (Some(metadata), Some(tombstoned_keys)) = (&begin.metadata, &tombstoned_keys)
+                {
                     scan_record_scope(
                         root,
+                        metadata,
                         scope,
                         tombstoned_keys,
                         &mut records,
@@ -687,9 +689,10 @@ fn inspect(
             }
         }
         Selection::All => {
-            if let Some(tombstoned_keys) = &tombstoned_keys {
+            if let (Some(metadata), Some(tombstoned_keys)) = (&begin.metadata, &tombstoned_keys) {
                 scan_all_records(
                     root,
+                    metadata,
                     tombstoned_keys,
                     &mut records,
                     &mut observed_scopes,
@@ -1379,6 +1382,7 @@ fn inspect_quarantine_receipts(
 
 fn scan_record_scope(
     root: &StoreDirectory,
+    metadata: &StoreMetadata,
     scope: &MemoryScope,
     tombstoned_keys: &BTreeSet<String>,
     records: &mut Vec<PortableMemoryRecord>,
@@ -1402,6 +1406,7 @@ fn scan_record_scope(
     scan_record_owner(
         &directory,
         &relative,
+        metadata,
         Some(scope),
         tombstoned_keys,
         false,
@@ -1447,6 +1452,7 @@ fn scan_tombstone_scope(
 
 fn scan_all_records(
     root: &StoreDirectory,
+    metadata: &StoreMetadata,
     tombstoned_keys: &BTreeSet<String>,
     records: &mut Vec<PortableMemoryRecord>,
     scopes: &mut BTreeMap<String, MemoryScope>,
@@ -1494,6 +1500,7 @@ fn scan_all_records(
             scan_record_owner(
                 &owner_directory,
                 &kind_relative.join(owner_name),
+                metadata,
                 None,
                 tombstoned_keys,
                 true,
@@ -1523,6 +1530,7 @@ fn scan_all_records(
         Ok(directory) => scan_record_owner(
             &directory,
             &global_relative,
+            metadata,
             Some(&MemoryScope::InstanceGlobal {}),
             tombstoned_keys,
             true,
@@ -1640,6 +1648,7 @@ fn scan_all_tombstones(
 fn scan_record_owner(
     owner_directory: &cap_std::fs::Dir,
     owner_relative: &Path,
+    metadata: &StoreMetadata,
     expected_scope: Option<&MemoryScope>,
     tombstoned_keys: &BTreeSet<String>,
     reveal_decoded_identity: bool,
@@ -1836,6 +1845,19 @@ fn scan_record_owner(
             {
                 findings.push(
                     ValidationCode::ScopePathMismatch,
+                    ValidationArtifact::Record,
+                    if reveal_decoded_identity {
+                        Some(record.scope)
+                    } else {
+                        expected_scope.cloned()
+                    },
+                    reveal_decoded_identity.then_some(record.id),
+                );
+                continue;
+            }
+            if record.revision.get() > metadata.store_revision.0 {
+                findings.push(
+                    ValidationCode::RecordMalformed,
                     ValidationArtifact::Record,
                     if reveal_decoded_identity {
                         Some(record.scope)
@@ -2081,6 +2103,7 @@ fn scan_tombstone_owner(
                 || layout::record_shard(&tombstone.memory_id) != shard
                 || tombstone.relative_path() != relative
                 || expected_scope.is_some_and(|scope| scope != &tombstone.scope)
+                || tombstone.revision.get() > tombstone.store_revision.0
                 || tombstone.audit_sequence.0 > tombstone.store_revision.0
                 || tombstone.store_revision.0 > metadata.store_revision.0
                 || tombstone.audit_sequence.0 > metadata.audit_sequence.0
