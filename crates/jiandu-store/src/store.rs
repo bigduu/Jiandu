@@ -103,6 +103,36 @@ impl AuthorizedScopes {
         })
     }
 
+    /// Authenticate and authorize a read-only administrative lifecycle plan
+    /// for one exact scope. The returned capability cannot execute a restore
+    /// or purge and cannot be constructed from model-visible input.
+    pub fn authorize_admin_plan(
+        &self,
+        context: &TrustedRequestContext,
+        scope: &MemoryScope,
+        action: crate::AdminAction,
+    ) -> Result<AuthorizedAdmin, StoreError> {
+        context
+            .validate()
+            .map_err(|_| StoreError::Unauthenticated)?;
+        if context.principal_id != self.principal_id {
+            return Err(StoreError::Forbidden);
+        }
+        let exact = self.authorize_exact(scope).ok_or(StoreError::Forbidden)?;
+        if !context
+            .grants
+            .iter()
+            .any(|grant| grant.as_str() == action.required_grant())
+        {
+            return Err(StoreError::Forbidden);
+        }
+        Ok(AuthorizedAdmin {
+            principal_id: context.principal_id.clone(),
+            scope: exact.0,
+            action,
+        })
+    }
+
     fn all_scopes(&self) -> Vec<MemoryScope> {
         let mut scopes = Vec::with_capacity(
             1 + self.project_ids.len() + self.session_ids.len() + usize::from(self.instance_global),
@@ -188,6 +218,31 @@ impl AuthorizedMutation {
     #[must_use]
     pub const fn operation(&self) -> crate::MutationOperation {
         self.operation
+    }
+}
+
+/// Fresh exact-scope administrative capability for deterministic dry-runs.
+/// It carries no execution authority and has private fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedAdmin {
+    principal_id: PrincipalId,
+    scope: MemoryScope,
+    action: crate::AdminAction,
+}
+
+impl AuthorizedAdmin {
+    #[must_use]
+    pub fn as_scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+
+    pub(crate) fn principal_id(&self) -> &PrincipalId {
+        &self.principal_id
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> crate::AdminAction {
+        self.action
     }
 }
 
@@ -338,13 +393,16 @@ impl CanonicalStore {
         }
         root.validate_ambient_identity()?;
         lock.publish_owner(&root, &owner)?;
+        if root.regular_file_exists(Path::new(layout::STORE_METADATA_MIGRATION_FILE))?
+            || root
+                .regular_file_exists(Path::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE))?
+        {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
         layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
         let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
         validate_audit_genesis(&root, &recovered.metadata)?;
         crate::idempotency::validate_ledger(&root, &recovered.metadata)?;
-        if root.regular_file_exists(Path::new(layout::STORE_METADATA_MIGRATION_FILE))? {
-            return Err(StoreError::InvalidStoreMetadata);
-        }
         crate::durability::probe(
             &root,
             &options.failpoints,
@@ -361,8 +419,9 @@ impl CanonicalStore {
         })
     }
 
-    /// Explicitly migrate a locked v1alpha1 store into the receipt/audit-gated
-    /// v1alpha2 format. An older writer rejects the final format marker.
+    /// Explicitly migrate a locked v1alpha1 store through the historical
+    /// receipt/audit layout into the current tombstone-gated format. An older
+    /// writer rejects the final capability marker.
     pub fn migrate_v1alpha1(
         data_dir: impl AsRef<Path>,
         owner: crate::LockOwner,
@@ -392,6 +451,12 @@ impl CanonicalStore {
         root.validate_ambient_identity()?;
         lock.publish_owner(&root, &owner)?;
 
+        // A pre-v1alpha3 binary used this exact private staging name while
+        // upgrading a v1 store. Validate and remove only a matching staged v2
+        // marker before legacy WAL recovery; arbitrary or linked bytes fail
+        // closed instead of being swept as migration debris.
+        cleanup_previous_migration_metadata(&root, &locked_metadata, &options.failpoints)?;
+
         // Legacy recovery must run while the legacy format marker is still
         // authoritative. Only after it removes the old WAL do we create v2
         // namespaces or publish the capability gate.
@@ -402,11 +467,84 @@ impl CanonicalStore {
         }
 
         layout::ensure_v2_layout(&root)?;
+        layout::ensure_v3_layout(&root)?;
         options
             .failpoints
             .check(crate::PersistenceBoundary::MigrationLayoutSynced)?;
-        let target_metadata = recovered.metadata.clone().upgraded_from_legacy()?;
+        let target_metadata = recovered
+            .metadata
+            .clone()
+            .upgraded_to_current(crate::metadata::LEGACY_STORE_FORMAT_VERSION)?;
         ensure_audit_genesis(&root, &target_metadata, &options.failpoints, true)?;
+        publish_migrated_metadata(&root, &target_metadata, &options.failpoints)?;
+        layout::validate_layout(&root)?;
+        validate_audit_genesis(&root, &target_metadata)?;
+        crate::idempotency::validate_ledger(&root, &target_metadata)?;
+        crate::durability::probe(
+            &root,
+            &options.failpoints,
+            options.forced_unsupported_durability,
+        )?;
+        Ok(Self {
+            root,
+            metadata: target_metadata,
+            lock,
+            failpoints: options.failpoints,
+            poisoned: false,
+            quarantine_receipts: recovered.quarantine_receipts,
+            forced_unsupported_durability: options.forced_unsupported_durability,
+        })
+    }
+
+    /// Explicitly migrate a root-locked v1alpha2 store to the v1alpha3
+    /// tombstone capability. Any active v1alpha2 WAL is recovered and the
+    /// complete historical ledger is validated before a v3 directory or
+    /// metadata marker is published.
+    pub fn migrate_v1alpha2(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+    ) -> Result<Self, StoreError> {
+        Self::migrate_v1alpha2_with_options(data_dir, owner, StoreOptions::default())
+    }
+
+    pub fn migrate_v1alpha2_with_options(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+        options: StoreOptions,
+    ) -> Result<Self, StoreError> {
+        let root = layout::StoreDirectory::open(data_dir.as_ref(), false)?;
+        root.validate_private_root()?;
+        let (metadata, original_metadata_bytes) = read_previous_store_metadata(&root)?;
+        layout::validate_v2_layout(&root)?;
+        if !root.regular_file_exists(Path::new(layout::STORE_LOCK_FILE))? {
+            return Err(StoreError::InvalidLayout);
+        }
+        let _lock_file = root.validate_private_file(Path::new(layout::STORE_LOCK_FILE))?;
+
+        let mut lock = crate::lock::StoreLock::acquire(&root, false)?;
+        let (locked_metadata, locked_metadata_bytes) = read_previous_store_metadata(&root)?;
+        if locked_metadata != metadata || locked_metadata_bytes != original_metadata_bytes {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        root.validate_ambient_identity()?;
+        lock.publish_owner(&root, &owner)?;
+
+        layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
+        let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
+        if recovered.metadata.format_version != crate::metadata::PREVIOUS_STORE_FORMAT_VERSION {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        validate_audit_genesis(&root, &recovered.metadata)?;
+        crate::idempotency::validate_ledger(&root, &recovered.metadata)?;
+
+        layout::ensure_v3_layout(&root)?;
+        options
+            .failpoints
+            .check(crate::PersistenceBoundary::MigrationLayoutSynced)?;
+        let target_metadata = recovered
+            .metadata
+            .clone()
+            .upgraded_to_current(crate::metadata::PREVIOUS_STORE_FORMAT_VERSION)?;
         publish_migrated_metadata(&root, &target_metadata, &options.failpoints)?;
         layout::validate_layout(&root)?;
         validate_audit_genesis(&root, &target_metadata)?;
@@ -451,6 +589,61 @@ impl CanonicalStore {
         )
     }
 
+    /// Produce an all-or-error, non-executing administrative plan for a
+    /// bounded explicit set of tombstoned IDs in one exact authorized scope.
+    /// Input duplicates are invalid and accepted targets are sorted by opaque
+    /// ID.
+    pub fn plan_admin_action(
+        &self,
+        authorization: &AuthorizedAdmin,
+        memory_ids: &[MemoryId],
+    ) -> Result<crate::AdminActionPlan, StoreError> {
+        const MAX_TARGETS: usize = 100;
+
+        self.validate_ownership()?;
+        if memory_ids.is_empty() || memory_ids.len() > MAX_TARGETS {
+            return Err(StoreError::InvalidRequest);
+        }
+        let unique: BTreeSet<_> = memory_ids.iter().cloned().collect();
+        if unique.len() != memory_ids.len() {
+            return Err(StoreError::InvalidRequest);
+        }
+        let mut targets = Vec::with_capacity(unique.len());
+        let mut tombstones = Vec::with_capacity(unique.len());
+        for memory_id in unique {
+            let tombstone = crate::tombstone::read_exact(
+                &self.root,
+                &self.metadata.store_id,
+                authorization.as_scope(),
+                &memory_id,
+            )?
+            .ok_or(StoreError::NotFound)?;
+            targets.push(crate::AdminPlanTarget {
+                memory_id: tombstone.memory_id.clone(),
+                scope: tombstone.scope.clone(),
+                revision: tombstone.revision,
+                etag: tombstone.etag.clone(),
+            });
+            tombstones.push(tombstone);
+        }
+        let store_revision = self.watermark()?;
+        let confirmation_digest = crate::tombstone::confirmation_digest(
+            &self.metadata.store_id,
+            authorization.principal_id(),
+            authorization.action(),
+            authorization.as_scope(),
+            store_revision,
+            &tombstones,
+        )?;
+        Ok(crate::AdminActionPlan {
+            action: authorization.action(),
+            count: targets.len(),
+            targets,
+            store_revision,
+            confirmation_digest,
+        })
+    }
+
     /// Read exactly one record visible in `authorized`.
     ///
     /// Invisible and absent IDs deliberately produce the same `NotFound`
@@ -461,6 +654,9 @@ impl CanonicalStore {
         authorized: &AuthorizedScopes,
     ) -> Result<StoreRead<MemoryRecord>, StoreError> {
         self.validate_ownership()?;
+        if crate::tombstone::id_exists_anywhere(&self.root, id)? {
+            return Err(StoreError::NotFound);
+        }
         let mut candidate = None;
         for scope in authorized.all_scopes() {
             let relative = layout::record_relative_path(&scope, id);
@@ -508,8 +704,9 @@ impl CanonicalStore {
 
         let mut seen = HashSet::new();
         let mut records = Vec::new();
+        let tombstoned_storage_keys = crate::tombstone::storage_keys(&self.root)?;
         for scope in &selected_scopes {
-            for record in self.scan_scope(scope)? {
+            for record in self.scan_scope(scope, &tombstoned_storage_keys)? {
                 if !seen.insert(record.id.clone()) {
                     return Err(StoreError::DuplicateMemoryId {
                         id: record.id.clone(),
@@ -607,7 +804,8 @@ impl CanonicalStore {
             crate::transaction::TransactionIntent::Quarantine(quarantine) => {
                 crate::transaction::quarantine_relative(quarantine)?
             }
-            crate::transaction::TransactionIntent::Record(_) => {
+            crate::transaction::TransactionIntent::Record(_)
+            | crate::transaction::TransactionIntent::Forget(_) => {
                 return Err(StoreError::InvalidTransaction);
             }
         };
@@ -784,12 +982,16 @@ impl CanonicalStore {
         Ok(())
     }
 
-    fn scan_scope(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>, StoreError> {
+    fn scan_scope(
+        &self,
+        scope: &MemoryScope,
+        tombstoned_storage_keys: &BTreeSet<String>,
+    ) -> Result<Vec<MemoryRecord>, StoreError> {
         let scope_relative = layout::scope_relative_directory(scope);
         let Some(scope_directory) = self.root.try_open_directory(&scope_relative)? else {
             return Ok(Vec::new());
         };
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         layout::run_test_hook(
             layout::TestHookPoint::DirectoryEntries,
             scope_relative.file_name().ok_or(StoreError::UnsafePath)?,
@@ -818,7 +1020,27 @@ impl CanonicalStore {
                 let record_entry = record_entry
                     .map_err(|source| StoreError::io("read shard record entry", source))?;
                 let file_name = record_entry.file_name();
+                if crate::transaction::transaction_id_from_erasure_witness_name(&file_name)
+                    .is_some()
+                {
+                    let witness =
+                        layout::StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
+                            .ok_or(StoreError::InvalidLayout)?;
+                    layout::StoreDirectory::validate_private_open_file(&witness)?;
+                    if witness
+                        .metadata()
+                        .map_err(|source| StoreError::io("inspect forget erasure witness", source))?
+                        .len()
+                        != 0
+                    {
+                        return Err(StoreError::InvalidTransaction);
+                    }
+                    continue;
+                }
                 let storage_key = layout::validate_record_entry_name(&file_name)?;
+                if tombstoned_storage_keys.contains(&storage_key) {
+                    continue;
+                }
                 if !storage_key.starts_with(&shard) {
                     return Err(StoreError::InvalidRecord {
                         id: None,
@@ -964,6 +1186,16 @@ fn read_legacy_store_metadata(
     read_store_metadata_file_for(file, crate::metadata::LEGACY_STORE_FORMAT_VERSION)
 }
 
+fn read_previous_store_metadata(
+    root: &layout::StoreDirectory,
+) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
+    let file = root
+        .try_open_regular(Path::new(layout::STORE_METADATA_FILE), false)?
+        .ok_or(StoreError::NotInitialized)?;
+    layout::StoreDirectory::validate_private_open_file(&file)?;
+    read_store_metadata_file_for(file, crate::metadata::PREVIOUS_STORE_FORMAT_VERSION)
+}
+
 fn read_store_metadata_file(file: File) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
     read_store_metadata_file_for(file, crate::STORE_FORMAT_VERSION)
 }
@@ -1104,6 +1336,34 @@ fn publish_migrated_metadata(
     failpoints.check(crate::PersistenceBoundary::MigrationMetadataPublished)?;
     root.sync_root("sync published migrated store metadata")?;
     failpoints.check(crate::PersistenceBoundary::MigrationMetadataDirectorySynced)
+}
+
+fn cleanup_previous_migration_metadata(
+    root: &layout::StoreDirectory,
+    legacy_metadata: &StoreMetadata,
+    failpoints: &crate::failpoint::Failpoints,
+) -> Result<(), StoreError> {
+    let relative = Path::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE);
+    let Some(file) = root.try_open_regular(relative, false)? else {
+        return Ok(());
+    };
+    layout::StoreDirectory::validate_private_open_file(&file)?;
+    if !layout::StoreDirectory::has_single_link(&file)? {
+        return Err(StoreError::UnsafePath);
+    }
+    let (staged, _) =
+        read_store_metadata_file_for(file, crate::metadata::PREVIOUS_STORE_FORMAT_VERSION)?;
+    if staged.store_id != legacy_metadata.store_id
+        || staged.store_revision != legacy_metadata.store_revision
+        || staged.audit_sequence != legacy_metadata.audit_sequence
+        || staged.created_at != legacy_metadata.created_at
+    {
+        return Err(StoreError::InvalidStoreMetadata);
+    }
+    root.remove_regular_file(relative)?;
+    failpoints.check(crate::PersistenceBoundary::MigrationPreviousMetadataRemoved)?;
+    root.sync_root("sync previous migration metadata rollback")?;
+    failpoints.check(crate::PersistenceBoundary::MigrationPreviousMetadataDirectorySynced)
 }
 
 fn safe_format_diagnostic(format: &str) -> String {

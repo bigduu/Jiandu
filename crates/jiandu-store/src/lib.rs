@@ -17,6 +17,7 @@ mod metadata;
 mod mutation;
 mod recovery;
 mod store;
+mod tombstone;
 mod transaction;
 
 pub use durability::{DirectoryDurability, StoreDoctorReport};
@@ -25,11 +26,12 @@ pub use failpoint::{PersistenceBoundary, PersistenceFailpointInjector};
 pub use idempotency::MutationOperation;
 pub use lock::{LockOwner, LockOwnerDiagnostics};
 pub use metadata::{AuditSequence, STORE_FORMAT_VERSION, StoreId, StoreMetadata};
-pub use mutation::MutationCommit;
+pub use mutation::{ForgetCommit, MutationCommit};
 pub use store::{
-    AuthorizedMutation, AuthorizedScope, AuthorizedScopes, CanonicalStore, QuarantineReceipt,
-    StoreOptions, StoreRead, StoreWatermark,
+    AuthorizedAdmin, AuthorizedMutation, AuthorizedScope, AuthorizedScopes, CanonicalStore,
+    QuarantineReceipt, StoreOptions, StoreRead, StoreWatermark,
 };
+pub use tombstone::{AdminAction, AdminActionPlan, AdminPlanTarget};
 
 #[cfg(test)]
 mod tests;

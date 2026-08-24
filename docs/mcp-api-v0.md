@@ -188,8 +188,10 @@ Receipt lookup occurs before record lookup and CAS, so retrying the exact
 successful update returns its original record/revision/ETag/store revision even
 though the supplied `expectedRevision` is now stale. Present authorization is
 still required on every retry. Exact replay lasts only while the private result
-artifact is retained; the explicit forget/hard-purge/receipt-GC lifecycle will
-define when that historical replay capability ends.
+artifact is retained. Ordinary forget keeps historical mutation replay
+artifacts; a future explicit, versioned hard-purge/receipt-GC ledger transition
+terminates replay for retired keys. External backups are outside a local
+deletion guarantee.
 
 ### `memory_forget`
 
@@ -206,7 +208,24 @@ Input:
 }
 ```
 
-The normal operation creates an auditable tombstone and makes the record unavailable to retrieval. Operator-configured hard purge is a separate administrative lifecycle, never a model tool. Bulk deletion is intentionally absent from the public MCP surface.
+The normal operation requires a destructive `memory:forget:{scope-kind}` grant
+that is independent from `memory:write:*`. It authenticates and resolves exact
+scope before receipt lookup, fingerprints scope/ID/revision/reason, and looks up
+an exact retry before record lookup or CAS. A committed retry returns the
+original body-free ID/revision/ETag/`forgottenAt` result without another audit;
+conflicting key reuse fails before a write. The metadata-last transaction
+publishes a protected tombstone before renaming the held record to a private
+witness and descriptor-truncating/syncing it to zero bytes. The zero-length
+witness remains protected and is not a secure-erase claim. Exact get checks
+global tombstone presence before any candidate record open; list filters global
+tombstone storage keys before body decode. Thus get/list exclude the ID even if
+an ambient actor injects the same name in another authorized scope, and
+create/update cannot implicitly resurrect it.
+
+Operator restore/hard purge is a separate administrative lifecycle, never a
+model tool. The current store can produce a non-executing, bounded, explicit
+target dry-run plan behind separate admin grants; bulk deletion remains absent
+from the public MCP surface.
 
 ## MCP resources
 

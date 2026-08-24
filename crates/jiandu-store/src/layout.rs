@@ -13,12 +13,13 @@ use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use std::cell::RefCell;
 
 pub(crate) const STORE_METADATA_FILE: &str = "store.json";
 pub(crate) const STORE_METADATA_INIT_FILE: &str = ".store.json.init";
-pub(crate) const STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha2.tmp";
+pub(crate) const STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha3.tmp";
+pub(crate) const PREVIOUS_STORE_METADATA_MIGRATION_FILE: &str = ".store-v1alpha2.tmp";
 pub(crate) const STORE_LOCK_FILE: &str = "LOCK";
 pub(crate) const QUARANTINE_DIR: &str = "quarantine";
 pub(crate) const QUARANTINE_RECEIPTS_DIR: &str = "receipts/quarantine";
@@ -27,6 +28,14 @@ pub(crate) const IDEMPOTENCY_RESULTS_DIR: &str = "receipts/idempotency/results";
 pub(crate) const MUTATION_AUDIT_DIR: &str = "audit/mutations";
 pub(crate) const AUDIT_GENESIS_FILE: &str = "audit/genesis.json";
 pub(crate) const AUDIT_GENESIS_TEMP_FILE: &str = "audit/.genesis-v1alpha2.tmp";
+pub(crate) const TOMBSTONES_DIR: &str = "tombstones";
+
+const TOMBSTONE_SCOPE_DIRECTORIES: &[&str] = &[
+    "tombstones/principal",
+    "tombstones/project",
+    "tombstones/session",
+    "tombstones/instance_global",
+];
 
 const LEGACY_REQUIRED_DIRECTORIES: &[&str] = &[
     "records",
@@ -45,7 +54,7 @@ const LEGACY_REQUIRED_DIRECTORIES: &[&str] = &[
     "backups",
 ];
 
-const REQUIRED_DIRECTORIES: &[&str] = &[
+const V2_REQUIRED_DIRECTORIES: &[&str] = &[
     "records",
     "records/principal",
     "records/project",
@@ -66,28 +75,54 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "backups",
 ];
 
-#[cfg(all(test, unix))]
+const REQUIRED_DIRECTORIES: &[&str] = &[
+    "records",
+    "records/principal",
+    "records/project",
+    "records/session",
+    "records/instance_global",
+    "lineages",
+    TOMBSTONES_DIR,
+    "tombstones/principal",
+    "tombstones/project",
+    "tombstones/session",
+    "tombstones/instance_global",
+    "transactions",
+    "receipts",
+    QUARANTINE_RECEIPTS_DIR,
+    "receipts/idempotency",
+    IDEMPOTENCY_RECEIPTS_DIR,
+    IDEMPOTENCY_RESULTS_DIR,
+    "audit",
+    MUTATION_AUDIT_DIR,
+    "index",
+    QUARANTINE_DIR,
+    "backups",
+];
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestHookPoint {
     DirectoryOpen,
     DirectoryEntries,
     RegularOpen,
     Rename,
+    EraseWitness,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 struct TestHook {
     point: TestHookPoint,
     name: OsString,
     action: Option<Box<dyn FnOnce()>>,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 thread_local! {
     static TEST_HOOK: RefCell<Option<TestHook>> = const { RefCell::new(None) };
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn install_test_hook(
     point: TestHookPoint,
     name: impl Into<OsString>,
@@ -106,7 +141,7 @@ pub(crate) fn install_test_hook(
     });
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn run_test_hook(point: TestHookPoint, name: &OsStr) {
     let action = TEST_HOOK.with(|slot| {
         let mut hook = slot.borrow_mut();
@@ -236,7 +271,7 @@ impl StoreDirectory {
             if !metadata.is_dir() {
                 return Err(StoreError::InvalidLayout);
             }
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             run_test_hook(TestHookPoint::DirectoryOpen, name);
             current = current.open_dir_nofollow(name).map_err(|source| {
                 secure_open_error(&current, name, "open store directory component", source)
@@ -388,6 +423,8 @@ impl StoreDirectory {
         let (to_parent, to_name) = split_relative_file(to)?;
         let from_directory = self.open_parent(&from_parent)?;
         let to_directory = self.open_parent(&to_parent)?;
+        #[cfg(test)]
+        run_test_hook(TestHookPoint::Rename, &from_name);
         from_directory
             .rename(&from_name, &to_directory, &to_name)
             .map_err(|source| StoreError::io("rename store entry", source))
@@ -458,7 +495,7 @@ impl StoreDirectory {
         if !metadata.is_dir() {
             return Err(StoreError::InvalidLayout);
         }
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         run_test_hook(TestHookPoint::DirectoryOpen, name);
         directory.open_dir_nofollow(name).map_err(|source| {
             secure_open_error(directory, name, "open child store directory", source)
@@ -487,7 +524,7 @@ impl StoreDirectory {
     ) -> Result<(), StoreError> {
         validate_normal_name(from_name)?;
         validate_normal_name(to_name)?;
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         run_test_hook(TestHookPoint::Rename, from_name);
         from_directory
             .rename(from_name, to_directory, to_name)
@@ -609,10 +646,23 @@ pub(crate) fn validate_layout(root: &StoreDirectory) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Validate a v1alpha2 layout before its active WAL and ledger are recovered
+/// under the old capability marker.
+pub(crate) fn validate_v2_layout(root: &StoreDirectory) -> Result<(), StoreError> {
+    validate_required_directories(root, V2_REQUIRED_DIRECTORIES)
+}
+
 /// Validate the exact directory capabilities needed to recover a v1alpha1
 /// transaction before the v1alpha2 format marker is published.
 pub(crate) fn validate_legacy_layout(root: &StoreDirectory) -> Result<(), StoreError> {
-    for relative in LEGACY_REQUIRED_DIRECTORIES {
+    validate_required_directories(root, LEGACY_REQUIRED_DIRECTORIES)
+}
+
+fn validate_required_directories(
+    root: &StoreDirectory,
+    required: &[&str],
+) -> Result<(), StoreError> {
+    for relative in required {
         let relative = Path::new(relative);
         if relative == Path::new(QUARANTINE_RECEIPTS_DIR) {
             if let Some(directory) = root.try_open_directory(relative)? {
@@ -648,6 +698,20 @@ pub(crate) fn ensure_v2_layout(root: &StoreDirectory) -> Result<(), StoreError> 
         root.sync_directory(Path::new(relative), "sync v1alpha2 store layout")?;
     }
     root.sync_root("sync v1alpha2 store layout root")
+}
+
+/// Idempotently prepare the authoritative scope-owner tombstone namespaces.
+/// Every ancestor is synced before the v1alpha3 capability marker can publish.
+pub(crate) fn ensure_v3_layout(root: &StoreDirectory) -> Result<(), StoreError> {
+    for relative in TOMBSTONE_SCOPE_DIRECTORIES {
+        root.create_directory_all(Path::new(relative))?;
+        root.validate_private_directory(Path::new(relative))?;
+    }
+    for relative in TOMBSTONE_SCOPE_DIRECTORIES.iter().rev() {
+        root.sync_directory(Path::new(relative), "sync v1alpha3 tombstone layout")?;
+    }
+    root.sync_directory(Path::new(TOMBSTONES_DIR), "sync v1alpha3 tombstone root")?;
+    root.sync_root("sync v1alpha3 store layout root")
 }
 
 /// Idempotently extend the original v1alpha1 layout with the namespaced
@@ -693,6 +757,21 @@ pub(crate) fn scope_relative_directory(scope: &MemoryScope) -> PathBuf {
     }
 }
 
+pub(crate) fn tombstone_scope_relative_directory(scope: &MemoryScope) -> PathBuf {
+    match scope {
+        MemoryScope::Principal { principal_id } => PathBuf::from(TOMBSTONES_DIR)
+            .join("principal")
+            .join(storage_key("principal", principal_id.as_str())),
+        MemoryScope::Project { project_id } => PathBuf::from(TOMBSTONES_DIR)
+            .join("project")
+            .join(storage_key("project", project_id.as_str())),
+        MemoryScope::Session { session_id } => PathBuf::from(TOMBSTONES_DIR)
+            .join("session")
+            .join(storage_key("session", session_id.as_str())),
+        MemoryScope::InstanceGlobal {} => PathBuf::from(TOMBSTONES_DIR).join("instance_global"),
+    }
+}
+
 pub(crate) fn record_shard(id: &MemoryId) -> String {
     record_storage_key(id)[..2].to_owned()
 }
@@ -709,6 +788,27 @@ pub(crate) fn record_relative_path(scope: &MemoryScope, id: &MemoryId) -> PathBu
     scope_relative_directory(scope)
         .join(record_shard(id))
         .join(record_file_name(id))
+}
+
+pub(crate) fn tombstone_file_name(id: &MemoryId) -> String {
+    format!("{}.json", record_storage_key(id))
+}
+
+pub(crate) fn tombstone_relative_path(scope: &MemoryScope, id: &MemoryId) -> PathBuf {
+    tombstone_scope_relative_directory(scope)
+        .join(record_shard(id))
+        .join(tombstone_file_name(id))
+}
+
+pub(crate) fn validate_tombstone_entry_name(name: &OsStr) -> Result<String, StoreError> {
+    let name = name.to_str().ok_or(StoreError::UnsafePath)?;
+    let key = name
+        .strip_suffix(".json")
+        .ok_or(StoreError::InvalidLayout)?;
+    if !valid_storage_key(key) {
+        return Err(StoreError::InvalidLayout);
+    }
+    Ok(key.to_owned())
 }
 
 pub(crate) fn validate_record_entry_name(name: &OsStr) -> Result<String, StoreError> {
@@ -902,7 +1002,7 @@ fn try_open_regular_at(
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(StoreError::io("inspect store file", source)),
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     run_test_hook(TestHookPoint::RegularOpen, name);
     match open_regular_at(directory, name, write, false, false, false) {
         Ok(file) => Ok(Some(file)),

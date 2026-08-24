@@ -142,17 +142,19 @@ On startup, Jiandu:
 2. acquires an exclusive lock and records instance metadata;
 3. checks the store format and deterministically completes or rolls back the
    single interrupted transaction, failing closed on ambiguous state;
-4. validates the exact receipt/result/audit ledger against its independent
-   audit watermark and rejects malformed, missing, or foreign artifacts;
+4. validates the exact receipt/result/audit/tombstone/logical-erasure-witness
+   ledger against its independent audit watermark and rejects malformed,
+   missing, foreign, or resurrected identities;
 5. probes required file-sync and same-filesystem atomic-replace behavior and
    fails closed if the filesystem cannot provide it;
 6. validates index compatibility and schedules a rebuild if needed;
 7. starts the authenticated MCP transport;
 8. reports readiness only after the store is safe to serve.
 
-The implemented canonical create/update core gives every success a monotonically
-increasing record revision, a content-bound opaque ETag, one new store
-watermark, one durable receipt/private result, and one sequence-addressed audit
+The implemented canonical mutation core gives every create/update success a monotonically
+increasing record revision and content-bound opaque ETag, and every committed
+create/update/forget one new store watermark, one durable receipt/private
+result, and one sequence-addressed audit
 event. The host authenticates and authorizes an exact operation/scope before
 private receipt lookup. Identical principal/operation/key/input retries return
 the original success even after disconnect/restart and advance no watermark;
@@ -160,12 +162,17 @@ conflicting reuse fails before record lookup, CAS, or a write. Updates with a
 stale expected revision otherwise fail without overwriting newer data and
 disclose only the current revision.
 
-Record, result, receipt, audit, and metadata are one pre-acknowledgement WAL
+Record/tombstone, result, receipt, audit, and metadata are one pre-acknowledgement WAL
 transaction with metadata published last. Startup can rebuild missing
 artifacts only from an exact target record and strict digest-bound intent. It
-never guesses. The explicit `v1alpha1` to `v1alpha2` migration first recovers a
-legacy WAL, prepares/syncs genesis and layout, then publishes the new
-store-format capability gate last so old writers fail closed.
+never guesses. Forget publishes and syncs its tombstone before renaming the
+held canonical record to a private witness, truncating that held descriptor to
+zero, syncing it, and retaining the verified zero-length witness; it then
+commits body-free artifacts and metadata last. This is logical erasure, not a
+claim that prior physical blocks or backups were securely erased. The explicit
+`v1alpha2` to `v1alpha3` migration first recovers a
+v2 WAL and validates its ledger, prepares/syncs tombstone layout, then publishes
+the new store-format capability gate last so old writers fail closed.
 
 Shutdown stops accepting new mutations, drains bounded in-flight work, and
 releases the store lock. No fallible post-commit receipt callback exists:
@@ -184,7 +191,7 @@ restart recovery.
 - Stored text is treated as untrusted content, never as service or host policy.
 - Secrets are rejected or redacted according to operator policy; Jiandu is not a credential vault.
 - Mutations and administrative reads produce secret-safe audit entries.
-- Destructive operations are narrow. Public `memory_forget` targets exactly one record; bulk purge is administrative.
+- Destructive operations are narrow. Public `memory_forget` targets exactly one record and requires `memory:forget:*`, which is separate from `memory:write:*`; bulk lifecycle planning requires a still-separate administrative grant and has no execution authority in this slice.
 - File permissions, hard-link counts, symlink handling, traversal checks, and data-directory ownership are validated on opened handles. Store I/O remains beneath one fixed root-directory capability rather than re-resolving ambient paths.
 
 ## Failure policy

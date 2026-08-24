@@ -1,7 +1,8 @@
 # Canonical Store Format `v1alpha1`
 
 > Historical compatibility source: new stores use
-> [`jiandu.store/v1alpha2`](store-format-v1alpha2.md). This document remains
+> [`jiandu.store/v1alpha2`](store-format-v1alpha2.md), followed by the current
+> [`jiandu.store/v1alpha3`](store-format-v1alpha3.md). This document remains
 > authoritative for validating and recovering the legacy state before the
 > explicit migration publishes its capability gate.
 

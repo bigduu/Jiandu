@@ -1,5 +1,10 @@
 # Canonical Store Format `v1alpha2`
 
+> Historical contract: [`jiandu.store/v1alpha3`](store-format-v1alpha3.md) is
+> the current writer format. This document and its checked fixtures remain the
+> immutable create/update receipt/audit and `v1alpha2` migration-source
+> contract.
+
 This document commits the `jiandu-store` on-disk extension that makes public
 create and update durably idempotent and sequence-audited. It builds on the
 record grammar, scope-safe layout, exclusive ownership, atomic replacement,
@@ -230,12 +235,13 @@ differs, the operation returns `IDEMPOTENCY_CONFLICT` before CAS, record lookup,
 or any persistent write. Diagnostics contain only the stable error category.
 
 Exact replay is guaranteed only while the private result artifact remains and
-the caller still has current authority for its exact scope. Receipt retention,
-ordinary forget, explicit hard purge, and receipt GC belong to Issue #18.
-Deleting a private result through that future explicit lifecycle terminates
-replay for the old key. External backups are outside a local hard-purge
-guarantee. Portable export must exclude private results and the live audit
-ledger; full-backup semantics are separate work.
+the caller still has current authority for its exact scope. `v1alpha3`
+ordinary forget retains historical create/update results. A future explicit
+hard-purge/receipt-GC executor must atomically retire this strict ledger before
+deleting artifacts; deletion then terminates replay for the old key. External
+backups are outside a local hard-purge guarantee. Portable export must exclude
+private results and the live audit ledger; full-backup semantics are separate
+work.
 
 ## Explicit migration from `v1alpha1`
 
@@ -262,8 +268,9 @@ the explicit migration recovery window. They never silently open a
 `v1alpha1` store as writable `v1alpha2`, and normal open never migrates an
 unknown format.
 
-This slice implements create/update idempotency, private replay results,
+This historical slice implements create/update idempotency, private replay results,
 sequence-addressed mutation audit, strict startup ledger validation, and
-explicit `v1alpha1` migration. Forget/tombstones/restore/hard purge, validation,
+explicit `v1alpha1` migration. Forget/tombstones are added by `v1alpha3`;
+restore/hard-purge execution, validation,
 portable export/import, backup metadata, search/indexing, MCP/CLI transport,
 Bamboo integration, prompt construction, and model calls remain out of scope.

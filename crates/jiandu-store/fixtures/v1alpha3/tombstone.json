@@ -1,0 +1,15 @@
+{
+  "formatVersion": "jiandu.store.tombstone/v1alpha1",
+  "storeId": "00000000-0000-4000-8000-000000000018",
+  "transactionId": "00000000-0000-4000-8000-000000000018",
+  "memoryId": "mem_fixture_forget",
+  "scope": {
+    "kind": "project",
+    "projectId": "prj_fixture_forget"
+  },
+  "revision": 2,
+  "etag": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "forgottenAt": "2026-08-24T05:00:00Z",
+  "storeRevision": 51,
+  "auditSequence": 10
+}

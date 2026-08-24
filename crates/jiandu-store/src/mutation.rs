@@ -8,13 +8,15 @@ use crate::layout::{self, FileIdentity};
 use crate::transaction::{self, RecordOperation, RecordTransaction, TransactionIntent};
 use crate::{AuthorizedMutation, CanonicalStore, MutationOperation, StoreError};
 use jiandu_core::{
-    CreationActor, Etag, MemoryId, MemoryPatch, MemoryRecord, MemoryRelation, MemorySchema,
-    MemoryScope, MemoryStatus, MemoryType, Provenance, ProvenanceInput, RememberMemoryCommand,
-    Revision, ScopeSelector, StoreRevision, Tag, Timestamp, UpdateMemoryCommand, Validate,
+    CreationActor, Etag, ForgetMemoryCommand, MemoryId, MemoryPatch, MemoryRecord, MemoryRelation,
+    MemorySchema, MemoryScope, MemoryStatus, MemoryType, Provenance, ProvenanceInput,
+    RememberMemoryCommand, Revision, ScopeSelector, StoreRevision, Tag, Timestamp,
+    UpdateMemoryCommand, Validate,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::fs::File;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -94,6 +96,18 @@ pub struct MutationCommit {
     pub idempotent_replay: bool,
 }
 
+/// Body-free durable outcome for exactly one forgotten record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForgetCommit {
+    pub transaction_id: String,
+    pub store_revision: StoreRevision,
+    pub memory_id: MemoryId,
+    pub revision: Revision,
+    pub etag: Etag,
+    pub forgotten_at: Timestamp,
+    pub idempotent_replay: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RememberFingerprint<'a> {
@@ -115,6 +129,15 @@ struct UpdateFingerprint<'a> {
     memory_id: &'a MemoryId,
     expected_revision: Revision,
     patch: &'a MemoryPatch,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForgetFingerprint<'a> {
+    authoritative_scope: &'a MemoryScope,
+    memory_id: &'a MemoryId,
+    expected_revision: Revision,
     reason: &'a str,
 }
 
@@ -168,6 +191,9 @@ impl CanonicalStore {
             created_at,
         )?;
         let (record, bytes) = input.into_record(authorization.as_scope().clone())?;
+        if crate::tombstone::id_exists_anywhere(&self.root, &record.id)? {
+            return Err(StoreError::NotFound);
+        }
         if record_id_exists_anywhere(&self.root, &record.id)? {
             return Err(StoreError::AlreadyExists {
                 id: record.id.clone(),
@@ -252,10 +278,13 @@ impl CanonicalStore {
         )? {
             return Ok(replay);
         }
+        if crate::tombstone::id_exists_anywhere(&self.root, &command.memory_id)? {
+            return Err(StoreError::NotFound);
+        }
         let relative = layout::record_relative_path(scope, &command.memory_id);
         let file = self
             .root
-            .try_open_regular(&relative, false)?
+            .try_open_regular(&relative, true)?
             .ok_or(StoreError::NotFound)?;
         let current_identity = FileIdentity::from_file(&file)?;
         let read_file = file
@@ -333,6 +362,211 @@ impl CanonicalStore {
             Some(current_identity),
             Some(current.revision),
         )
+    }
+
+    /// Idempotently forget one record in the exact destructive-authorized
+    /// scope. Receipt lookup precedes record lookup and CAS, so a committed
+    /// timeout/disconnect/restart retry returns the original body-free result.
+    pub fn forget(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &ForgetMemoryCommand,
+        forgotten_at: Timestamp,
+    ) -> Result<ForgetCommit, StoreError> {
+        self.validate_ownership()?;
+        require_operation(authorization, MutationOperation::Forget)?;
+        command.validate().map_err(|_| StoreError::InvalidRequest)?;
+        let scope = authorization.as_scope();
+        let request_fingerprint = crate::idempotency::request_fingerprint(&ForgetFingerprint {
+            authoritative_scope: scope,
+            memory_id: &command.memory_id,
+            expected_revision: command.expected_revision,
+            reason: &command.reason,
+        })?;
+        let receipt_identity = ReceiptIdentity::derive(
+            authorization.principal_id(),
+            MutationOperation::Forget,
+            &command.idempotency_key,
+        );
+        if let Some(replay) =
+            self.lookup_forget_replay(authorization, &receipt_identity, &request_fingerprint)?
+        {
+            return Ok(replay);
+        }
+        if crate::tombstone::id_exists_anywhere(&self.root, &command.memory_id)? {
+            return Err(StoreError::NotFound);
+        }
+
+        let relative = layout::record_relative_path(scope, &command.memory_id);
+        let file = self
+            .root
+            .try_open_regular(&relative, true)?
+            .ok_or(StoreError::NotFound)?;
+        let current_identity = FileIdentity::from_file(&file)?;
+        let read_file = file
+            .try_clone()
+            .map_err(|source| StoreError::io("clone forget record handle", source))?;
+        let current = Self::read_record_file(
+            read_file,
+            scope,
+            Some(&command.memory_id),
+            &layout::record_storage_key(&command.memory_id),
+            &layout::record_shard(&command.memory_id),
+        )?;
+        if command.expected_revision != current.revision {
+            return Err(StoreError::RevisionConflict {
+                current_revision: current.revision,
+            });
+        }
+        if timestamp_nanos(&forgotten_at)? < timestamp_nanos(&current.updated_at)? {
+            return Err(StoreError::InvalidRequest);
+        }
+        self.ensure_metadata_current()?;
+        let target_metadata = next_store_metadata(&self.metadata)?;
+        let transaction_id = transaction::new_transaction_id();
+        let tombstone = crate::tombstone::ProtectedTombstone::new(
+            self.metadata.store_id.clone(),
+            transaction_id.clone(),
+            current.id.clone(),
+            current.scope.clone(),
+            current.revision,
+            current.etag.clone(),
+            forgotten_at,
+            target_metadata.store_revision,
+            target_metadata.audit_sequence,
+        )?;
+        let tombstone_bytes = tombstone.canonical_bytes()?;
+        let binding = MutationBinding {
+            receipt_id: receipt_identity.receipt_id,
+            transaction_id: transaction_id.clone(),
+            principal_digest: receipt_identity.principal_digest,
+            key_digest: receipt_identity.key_digest,
+            operation: MutationOperation::Forget,
+            scope: current.scope.clone(),
+            request_fingerprint,
+            memory_id: current.id.clone(),
+            target_revision: current.revision,
+            target_etag: current.etag.clone(),
+            store_revision: target_metadata.store_revision,
+            audit_sequence: target_metadata.audit_sequence,
+        };
+        let artifacts = MutationArtifacts::build_forget(
+            self.metadata.store_id.clone(),
+            binding.clone(),
+            &tombstone,
+        )?;
+        let manifest = transaction::TransactionManifest::for_forget(
+            self.metadata.store_id.clone(),
+            transaction_id,
+            transaction::ForgetTransaction {
+                memory_id: current.id,
+                scope: current.scope,
+                revision: current.revision,
+                etag: current.etag,
+                base_store_metadata: self.metadata.clone(),
+                target_store_metadata: target_metadata,
+                idempotency: IdempotencyTransaction {
+                    binding,
+                    result_digest: artifacts.result_digest.clone(),
+                    receipt_digest: artifacts.receipt_digest.clone(),
+                    audit_digest: artifacts.audit_digest.clone(),
+                },
+                tombstone_digest: crate::idempotency::content_digest(&tombstone_bytes),
+            },
+        )?;
+        self.commit_forget(
+            manifest,
+            tombstone,
+            &tombstone_bytes,
+            artifacts,
+            file,
+            current_identity,
+        )
+    }
+
+    fn commit_forget(
+        &mut self,
+        manifest: transaction::TransactionManifest,
+        tombstone: crate::tombstone::ProtectedTombstone,
+        tombstone_bytes: &[u8],
+        artifacts: MutationArtifacts,
+        opened_record: File,
+        expected_current: FileIdentity,
+    ) -> Result<ForgetCommit, StoreError> {
+        let TransactionIntent::Forget(intent) = &manifest.intent else {
+            return Err(StoreError::InvalidTransaction);
+        };
+        let target_metadata = intent.target_store_metadata.clone();
+        let transaction_id = manifest.transaction_id.clone();
+        self.poisoned = true;
+        transaction::persist_manifest(&self.root, &manifest, &self.failpoints)?;
+        let tombstone_identity =
+            transaction::stage_tombstone(&self.root, &manifest, tombstone_bytes, &self.failpoints)?;
+        let metadata_identity =
+            transaction::stage_metadata(&self.root, &manifest, &self.failpoints)?;
+        transaction::prepare_idempotency_namespaces(&self.root, &manifest, &self.failpoints)?;
+        let result_identity = transaction::stage_mutation_result(
+            &self.root,
+            &manifest,
+            &artifacts.result_bytes,
+            &self.failpoints,
+        )?;
+        let receipt_identity = transaction::stage_idempotency_receipt(
+            &self.root,
+            &manifest,
+            &artifacts.receipt_bytes,
+            &self.failpoints,
+        )?;
+        let audit_identity = transaction::stage_mutation_audit(
+            &self.root,
+            &manifest,
+            &artifacts.audit_bytes,
+            &self.failpoints,
+        )?;
+        transaction::publish_tombstone(
+            &self.root,
+            &manifest,
+            tombstone_identity,
+            &self.failpoints,
+        )?;
+        transaction::erase_forget_record(
+            &self.root,
+            &manifest,
+            &opened_record,
+            expected_current,
+            &self.failpoints,
+        )?;
+        transaction::publish_mutation_result(
+            &self.root,
+            &manifest,
+            result_identity,
+            &self.failpoints,
+        )?;
+        transaction::publish_idempotency_receipt(
+            &self.root,
+            &manifest,
+            receipt_identity,
+            &self.failpoints,
+        )?;
+        transaction::publish_mutation_audit(
+            &self.root,
+            &manifest,
+            audit_identity,
+            &self.failpoints,
+        )?;
+        transaction::publish_metadata(&self.root, &manifest, metadata_identity, &self.failpoints)?;
+        self.metadata = target_metadata;
+        transaction::remove_manifest(&self.root, &manifest, &self.failpoints)?;
+        self.poisoned = false;
+        Ok(ForgetCommit {
+            transaction_id,
+            store_revision: self.metadata.store_revision,
+            memory_id: tombstone.memory_id,
+            revision: tombstone.revision,
+            etag: tombstone.etag,
+            forgotten_at: tombstone.forgotten_at,
+            idempotent_replay: false,
+        })
     }
 
     fn commit_record(
@@ -453,7 +687,8 @@ impl CanonicalStore {
             &self.metadata.store_id,
             binding,
             &receipt.result_digest,
-        )?;
+        )?
+        .into_record()?;
         crate::idempotency::verify_audit(
             &self.root,
             &self.metadata.store_id,
@@ -465,6 +700,74 @@ impl CanonicalStore {
             store_revision: binding.store_revision,
             previous_revision: result.previous_revision,
             record: result.record,
+            idempotent_replay: true,
+        }))
+    }
+
+    fn lookup_forget_replay(
+        &self,
+        authorization: &AuthorizedMutation,
+        identity: &ReceiptIdentity,
+        request_fingerprint: &str,
+    ) -> Result<Option<ForgetCommit>, StoreError> {
+        let Some(receipt) = crate::idempotency::read_receipt(
+            &self.root,
+            &self.metadata.store_id,
+            identity,
+            MutationOperation::Forget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let binding = &receipt.binding;
+        if binding.receipt_id != identity.receipt_id
+            || binding.principal_digest != identity.principal_digest
+            || binding.key_digest != identity.key_digest
+            || binding.operation != MutationOperation::Forget
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        if binding.scope != *authorization.as_scope()
+            || binding.request_fingerprint != request_fingerprint
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let result = crate::idempotency::read_result(
+            &self.root,
+            &self.metadata.store_id,
+            binding,
+            &receipt.result_digest,
+        )?
+        .into_forget()?;
+        crate::idempotency::verify_audit(
+            &self.root,
+            &self.metadata.store_id,
+            binding,
+            &receipt.result_digest,
+        )?;
+        let tombstone = crate::tombstone::read_exact(
+            &self.root,
+            &self.metadata.store_id,
+            &binding.scope,
+            &binding.memory_id,
+        )?
+        .ok_or(StoreError::InvalidTransaction)?;
+        if tombstone.transaction_id != binding.transaction_id
+            || tombstone.revision != binding.target_revision
+            || tombstone.etag != binding.target_etag
+            || tombstone.forgotten_at != result.forgotten_at
+            || tombstone.store_revision != binding.store_revision
+            || tombstone.audit_sequence != binding.audit_sequence
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(Some(ForgetCommit {
+            transaction_id: binding.transaction_id.clone(),
+            store_revision: binding.store_revision,
+            memory_id: binding.memory_id.clone(),
+            revision: binding.target_revision,
+            etag: binding.target_etag.clone(),
+            forgotten_at: result.forgotten_at,
             idempotent_replay: true,
         }))
     }
@@ -585,7 +888,7 @@ fn timestamp_nanos(timestamp: &Timestamp) -> Result<i128, StoreError> {
 /// Enforce the global MemoryId invariant without parsing another tenant's
 /// record body. Only private owner directory keys and the exact hashed target
 /// filename are inspected; the resulting error remains path/body-free.
-fn record_id_exists_anywhere(
+pub(crate) fn record_id_exists_anywhere(
     root: &layout::StoreDirectory,
     id: &MemoryId,
 ) -> Result<bool, StoreError> {

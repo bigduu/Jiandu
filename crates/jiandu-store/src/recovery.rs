@@ -33,9 +33,15 @@ pub(crate) fn recover(
     failpoints: &Failpoints,
 ) -> Result<RecoveryOutcome, StoreError> {
     cleanup_interrupted_manifest_publish(root)?;
-    let manifest = read_single_active_manifest(root, &metadata.store_id)?;
+    let manifest = read_single_active_manifest(root, &metadata)?;
     let metadata = match manifest.as_ref().map(|manifest| &manifest.intent) {
         Some(TransactionIntent::Record(_)) => recover_record(
+            root,
+            metadata,
+            manifest.as_ref().expect("manifest"),
+            failpoints,
+        )?,
+        Some(TransactionIntent::Forget(_)) => recover_forget(
             root,
             metadata,
             manifest.as_ref().expect("manifest"),
@@ -49,11 +55,28 @@ pub(crate) fn recover(
     };
     reject_orphan_metadata_temp(root, None)?;
     reject_orphan_record_temps(root)?;
+    reject_orphan_tombstone_temps(root)?;
     let quarantine_receipts = read_quarantine_receipts(root, &metadata.store_id)?;
     Ok(RecoveryOutcome {
         metadata,
         quarantine_receipts,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TombstoneState {
+    Absent,
+    Target,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForgetBodyState {
+    Canonical,
+    WitnessFull,
+    WitnessErased,
+    Absent,
+    Ambiguous,
 }
 
 fn cleanup_interrupted_manifest_publish(root: &StoreDirectory) -> Result<(), StoreError> {
@@ -113,7 +136,7 @@ fn cleanup_interrupted_manifest_publish(root: &StoreDirectory) -> Result<(), Sto
 
 fn read_single_active_manifest(
     root: &StoreDirectory,
-    store_id: &StoreId,
+    metadata: &StoreMetadata,
 ) -> Result<Option<TransactionManifest>, StoreError> {
     let transactions = root.open_directory(Path::new("transactions"))?;
     let mut active = Vec::new();
@@ -129,11 +152,21 @@ fn read_single_active_manifest(
         let file = StoreDirectory::try_open_regular_in(&transactions, &name)?
             .ok_or(StoreError::InvalidTransaction)?;
         StoreDirectory::validate_private_open_file(&file)?;
-        active.push(TransactionManifest::decode(
-            file,
-            &transaction_id,
-            store_id,
-        )?);
+        let manifest = TransactionManifest::decode(file, &transaction_id, &metadata.store_id)?;
+        let expected_format = match metadata.format_version.as_str() {
+            crate::metadata::LEGACY_STORE_FORMAT_VERSION => {
+                transaction::LEGACY_TRANSACTION_FORMAT_VERSION
+            }
+            crate::metadata::PREVIOUS_STORE_FORMAT_VERSION => {
+                transaction::PREVIOUS_TRANSACTION_FORMAT_VERSION
+            }
+            crate::STORE_FORMAT_VERSION => transaction::TRANSACTION_FORMAT_VERSION,
+            _ => return Err(StoreError::InvalidStoreMetadata),
+        };
+        if manifest.format_version != expected_format {
+            return Err(StoreError::InvalidTransaction);
+        }
+        active.push(manifest);
     }
     if active.len() > 1 {
         return Err(StoreError::InvalidTransaction);
@@ -167,13 +200,13 @@ fn recover_record(
             metadata_state,
         );
     }
-    let published_artifact = mutation_artifact_published(root, record)?;
+    let published_artifact = mutation_artifact_published(root, manifest)?;
     match (record_state, metadata_state) {
         (RecordState::Base, MetadataState::Base) => {
             if published_artifact {
                 return Err(StoreError::InvalidTransaction);
             }
-            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_transaction_temps(root, manifest, failpoints)?;
             cleanup_manifest(root, manifest, failpoints)?;
             Ok(record.base_store_metadata.clone())
         }
@@ -183,7 +216,7 @@ fn recover_record(
                 MutationArtifacts::from_record_intent(manifest.store_id.clone(), record, target)?;
             complete_mutation_artifacts(root, manifest, &artifacts, failpoints)?;
             recover_target_metadata(root, manifest, failpoints)?;
-            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_transaction_temps(root, manifest, failpoints)?;
             cleanup_manifest(root, manifest, failpoints)?;
             Ok(record.target_store_metadata.clone())
         }
@@ -192,7 +225,7 @@ fn recover_record(
             let artifacts =
                 MutationArtifacts::from_record_intent(manifest.store_id.clone(), record, target)?;
             complete_mutation_artifacts(root, manifest, &artifacts, failpoints)?;
-            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_transaction_temps(root, manifest, failpoints)?;
             cleanup_manifest(root, manifest, failpoints)?;
             Ok(record.target_store_metadata.clone())
         }
@@ -200,6 +233,274 @@ fn recover_record(
         | (RecordState::Ambiguous, _)
         | (_, MetadataState::Ambiguous) => Err(StoreError::InvalidTransaction),
     }
+}
+
+fn recover_forget(
+    root: &StoreDirectory,
+    metadata: StoreMetadata,
+    manifest: &TransactionManifest,
+    failpoints: &Failpoints,
+) -> Result<StoreMetadata, StoreError> {
+    let TransactionIntent::Forget(forget) = &manifest.intent else {
+        return Err(StoreError::InvalidTransaction);
+    };
+    let metadata_state = if metadata == forget.base_store_metadata {
+        MetadataState::Base
+    } else if metadata == forget.target_store_metadata {
+        MetadataState::Target
+    } else {
+        MetadataState::Ambiguous
+    };
+    let body_state = classify_forget_body(root, manifest, forget)?;
+    let tombstone_state = classify_tombstone(root, manifest, forget)?;
+    let published_artifact = mutation_artifact_published(root, manifest)?;
+
+    match (body_state, tombstone_state, metadata_state) {
+        (ForgetBodyState::Canonical, TombstoneState::Absent, MetadataState::Base)
+            if !published_artifact =>
+        {
+            cleanup_transaction_temps(root, manifest, failpoints)?;
+            cleanup_manifest(root, manifest, failpoints)?;
+            Ok(forget.base_store_metadata.clone())
+        }
+        (ForgetBodyState::Canonical, TombstoneState::Target, MetadataState::Base)
+            if !published_artifact =>
+        {
+            let tombstone = sync_recovered_tombstone(root, manifest, forget, failpoints)?;
+            let source = transaction::record_relative(manifest)?;
+            let file = root
+                .try_open_regular(&source, true)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            StoreDirectory::validate_private_open_file(&file)?;
+            validate_forget_record(
+                file.try_clone()
+                    .map_err(|source| StoreError::io("clone recovered forget record", source))?,
+                forget,
+            )?;
+            let identity = FileIdentity::from_file(&file)?;
+            let witness =
+                transaction::rename_forget_record(root, manifest, &file, identity, failpoints)?;
+            transaction::erase_open_forget_witness(
+                root,
+                &witness,
+                &file,
+                identity,
+                PersistenceBoundary::RecoveryForgottenBodyErased,
+                PersistenceBoundary::RecoveryForgottenBodySynced,
+                failpoints,
+            )?;
+            complete_recovered_forget(
+                root,
+                manifest,
+                forget,
+                &tombstone,
+                metadata_state,
+                failpoints,
+            )
+        }
+        (
+            ForgetBodyState::WitnessFull | ForgetBodyState::WitnessErased,
+            TombstoneState::Target,
+            MetadataState::Base | MetadataState::Target,
+        ) => {
+            let tombstone = sync_recovered_tombstone(root, manifest, forget, failpoints)?;
+            erase_recovered_witness(root, manifest, forget, body_state, failpoints)?;
+            complete_recovered_forget(
+                root,
+                manifest,
+                forget,
+                &tombstone,
+                metadata_state,
+                failpoints,
+            )?;
+            Ok(forget.target_store_metadata.clone())
+        }
+        _ => Err(StoreError::InvalidTransaction),
+    }
+}
+
+fn classify_forget_body(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+) -> Result<ForgetBodyState, StoreError> {
+    let canonical = root.try_open_regular(&transaction::record_relative(manifest)?, false)?;
+    let witness =
+        root.try_open_regular(&transaction::erasure_witness_relative(manifest)?, false)?;
+    match (canonical, witness) {
+        (Some(_), Some(_)) => Ok(ForgetBodyState::Ambiguous),
+        (Some(file), None) => match validate_forget_record(file, forget) {
+            Ok(()) => Ok(ForgetBodyState::Canonical),
+            Err(error @ StoreError::Io { .. }) => Err(error),
+            Err(_) => Ok(ForgetBodyState::Ambiguous),
+        },
+        (None, Some(file)) => {
+            StoreDirectory::validate_private_open_file(&file)?;
+            let length = file
+                .metadata()
+                .map_err(|source| StoreError::io("inspect forget erasure witness", source))?
+                .len();
+            if length == 0 {
+                Ok(ForgetBodyState::WitnessErased)
+            } else {
+                match validate_forget_record(file, forget) {
+                    Ok(()) => Ok(ForgetBodyState::WitnessFull),
+                    Err(error @ StoreError::Io { .. }) => Err(error),
+                    Err(_) => Ok(ForgetBodyState::Ambiguous),
+                }
+            }
+        }
+        (None, None) => Ok(ForgetBodyState::Absent),
+    }
+}
+
+fn validate_forget_record(
+    file: std::fs::File,
+    forget: &transaction::ForgetTransaction,
+) -> Result<(), StoreError> {
+    let decoded = crate::CanonicalStore::read_record_file(
+        file,
+        &forget.scope,
+        Some(&forget.memory_id),
+        &layout::record_storage_key(&forget.memory_id),
+        &layout::record_shard(&forget.memory_id),
+    )?;
+    if decoded.revision != forget.revision || decoded.etag != forget.etag {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(())
+}
+
+fn classify_tombstone(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+) -> Result<TombstoneState, StoreError> {
+    let relative = transaction::tombstone_relative(manifest)?;
+    let Some(file) = root.try_open_regular(&relative, false)? else {
+        return Ok(TombstoneState::Absent);
+    };
+    let digest_file = file
+        .try_clone()
+        .map_err(|source| StoreError::io("clone protected tombstone", source))?;
+    if transaction::raw_file_digest(digest_file)? != forget.tombstone_digest {
+        return Ok(TombstoneState::Ambiguous);
+    }
+    match crate::tombstone::ProtectedTombstone::decode(file, &manifest.store_id) {
+        Ok(tombstone) if tombstone_matches_forget(&tombstone, manifest, forget) => {
+            Ok(TombstoneState::Target)
+        }
+        Ok(_) | Err(StoreError::InvalidTransaction) => Ok(TombstoneState::Ambiguous),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_target_tombstone(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+) -> Result<crate::tombstone::ProtectedTombstone, StoreError> {
+    let tombstone =
+        crate::tombstone::read_exact(root, &manifest.store_id, &forget.scope, &forget.memory_id)?
+            .ok_or(StoreError::InvalidTransaction)?;
+    if !tombstone_matches_forget(&tombstone, manifest, forget)
+        || crate::idempotency::content_digest(&tombstone.canonical_bytes()?)
+            != forget.tombstone_digest
+    {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(tombstone)
+}
+
+fn tombstone_matches_forget(
+    tombstone: &crate::tombstone::ProtectedTombstone,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+) -> bool {
+    tombstone.store_id == manifest.store_id
+        && tombstone.transaction_id == manifest.transaction_id
+        && tombstone.memory_id == forget.memory_id
+        && tombstone.scope == forget.scope
+        && tombstone.revision == forget.revision
+        && tombstone.etag == forget.etag
+        && tombstone.store_revision == forget.target_store_metadata.store_revision
+        && tombstone.audit_sequence == forget.target_store_metadata.audit_sequence
+}
+
+fn sync_recovered_tombstone(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+    failpoints: &Failpoints,
+) -> Result<crate::tombstone::ProtectedTombstone, StoreError> {
+    let tombstone = read_target_tombstone(root, manifest, forget)?;
+    let relative = transaction::tombstone_relative(manifest)?;
+    transaction::sync_parent(root, &relative, "sync recovered protected tombstone")?;
+    failpoints.check(PersistenceBoundary::RecoveryTombstoneSynced)?;
+    Ok(tombstone)
+}
+
+fn erase_recovered_witness(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+    body_state: ForgetBodyState,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let relative = transaction::erasure_witness_relative(manifest)?;
+    let file = root
+        .try_open_regular(&relative, true)?
+        .ok_or(StoreError::InvalidTransaction)?;
+    StoreDirectory::validate_private_open_file(&file)?;
+    match body_state {
+        ForgetBodyState::WitnessFull => validate_forget_record(
+            file.try_clone()
+                .map_err(|source| StoreError::io("clone recovered forget witness", source))?,
+            forget,
+        )?,
+        ForgetBodyState::WitnessErased => {
+            if file
+                .metadata()
+                .map_err(|source| StoreError::io("inspect recovered forget witness", source))?
+                .len()
+                != 0
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+        }
+        _ => return Err(StoreError::InvalidTransaction),
+    }
+    let identity = FileIdentity::from_file(&file)?;
+    transaction::sync_parent(root, &relative, "sync recovered forget witness namespace")?;
+    failpoints.check(PersistenceBoundary::RecoveryForgetWitnessDirectorySynced)?;
+    transaction::erase_open_forget_witness(
+        root,
+        &relative,
+        &file,
+        identity,
+        PersistenceBoundary::RecoveryForgottenBodyErased,
+        PersistenceBoundary::RecoveryForgottenBodySynced,
+        failpoints,
+    )
+}
+
+fn complete_recovered_forget(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    forget: &transaction::ForgetTransaction,
+    tombstone: &crate::tombstone::ProtectedTombstone,
+    metadata_state: MetadataState,
+    failpoints: &Failpoints,
+) -> Result<StoreMetadata, StoreError> {
+    let artifacts =
+        MutationArtifacts::from_forget_intent(manifest.store_id.clone(), forget, tombstone)?;
+    complete_mutation_artifacts(root, manifest, &artifacts, failpoints)?;
+    if metadata_state == MetadataState::Base {
+        recover_target_metadata(root, manifest, failpoints)?;
+    }
+    cleanup_transaction_temps(root, manifest, failpoints)?;
+    cleanup_manifest(root, manifest, failpoints)?;
+    Ok(forget.target_store_metadata.clone())
 }
 
 fn recover_legacy_record_state(
@@ -214,18 +515,18 @@ fn recover_legacy_record_state(
     };
     match (record_state, metadata_state) {
         (RecordState::Base, MetadataState::Base) => {
-            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_transaction_temps(root, manifest, failpoints)?;
             cleanup_manifest(root, manifest, failpoints)?;
             Ok(record.base_store_metadata.clone())
         }
         (RecordState::Target, MetadataState::Base) => {
             recover_target_metadata(root, manifest, failpoints)?;
-            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_transaction_temps(root, manifest, failpoints)?;
             cleanup_manifest(root, manifest, failpoints)?;
             Ok(record.target_store_metadata.clone())
         }
         (RecordState::Target, MetadataState::Target) => {
-            cleanup_record_temps(root, manifest, failpoints)?;
+            cleanup_transaction_temps(root, manifest, failpoints)?;
             cleanup_manifest(root, manifest, failpoints)?;
             Ok(record.target_store_metadata.clone())
         }
@@ -298,12 +599,9 @@ fn read_target_record(
 
 fn mutation_artifact_published(
     root: &StoreDirectory,
-    record: &transaction::RecordTransaction,
+    manifest: &TransactionManifest,
 ) -> Result<bool, StoreError> {
-    let idempotency = record
-        .idempotency
-        .as_ref()
-        .ok_or(StoreError::InvalidTransaction)?;
+    let idempotency = transaction::mutation_idempotency(manifest)?;
     for relative in [
         crate::idempotency::result_relative(&idempotency.binding.receipt_id)?,
         crate::idempotency::receipt_relative_for_binding(&idempotency.binding)?,
@@ -329,14 +627,7 @@ fn complete_mutation_artifacts(
     artifacts: &MutationArtifacts,
     failpoints: &Failpoints,
 ) -> Result<(), StoreError> {
-    let TransactionIntent::Record(record) = &manifest.intent else {
-        return Err(StoreError::InvalidTransaction);
-    };
-    let binding = &record
-        .idempotency
-        .as_ref()
-        .ok_or(StoreError::InvalidTransaction)?
-        .binding;
+    let binding = &transaction::mutation_idempotency(manifest)?.binding;
     for relative in [
         crate::idempotency::result_relative(&binding.receipt_id)?,
         crate::idempotency::receipt_relative_for_binding(binding)?,
@@ -372,14 +663,7 @@ fn complete_mutation_artifact(
     kind: MutationArtifactKind,
     failpoints: &Failpoints,
 ) -> Result<(), StoreError> {
-    let TransactionIntent::Record(record) = &manifest.intent else {
-        return Err(StoreError::InvalidTransaction);
-    };
-    let binding = &record
-        .idempotency
-        .as_ref()
-        .ok_or(StoreError::InvalidTransaction)?
-        .binding;
+    let binding = &transaction::mutation_idempotency(manifest)?.binding;
     let (staged, published) = match kind {
         MutationArtifactKind::Result => (
             crate::idempotency::result_temp_relative(binding)?,
@@ -478,8 +762,8 @@ fn validate_mutation_artifact(
         MutationArtifactKind::Result => {
             let decoded = crate::idempotency::DurableMutationResult::decode(
                 file,
-                &artifacts.result.store_id,
-                &artifacts.result.binding,
+                artifacts.result.store_id(),
+                artifacts.result.binding(),
             )?;
             (decoded == artifacts.result)
                 .then_some(())
@@ -522,24 +806,59 @@ fn recover_target_metadata(
     failpoints.check(PersistenceBoundary::RecoveryMetadataDirectorySynced)
 }
 
-fn cleanup_record_temps(
+fn cleanup_transaction_temps(
     root: &StoreDirectory,
     manifest: &TransactionManifest,
     failpoints: &Failpoints,
 ) -> Result<(), StoreError> {
-    let record_temp = transaction::record_temp_relative(manifest)?;
-    if root.remove_regular_file_if_exists(&record_temp)? {
-        transaction::sync_parent(root, &record_temp, "sync recovery record temp cleanup")?;
-        failpoints.check(PersistenceBoundary::RecoveryRecordDirectorySynced)?;
+    if matches!(manifest.intent, TransactionIntent::Record(_)) {
+        let record_temp = transaction::record_temp_relative(manifest)?;
+        if root.remove_regular_file_if_exists(&record_temp)? {
+            transaction::sync_parent(root, &record_temp, "sync recovery record temp cleanup")?;
+            failpoints.check(PersistenceBoundary::RecoveryRecordDirectorySynced)?;
+        }
+    } else if let TransactionIntent::Forget(forget) = &manifest.intent {
+        let tombstone_temp = transaction::tombstone_temp_relative(manifest)?;
+        if let Some(file) = root.try_open_regular(&tombstone_temp, false)? {
+            StoreDirectory::validate_private_open_file(&file)?;
+            let digest_file = file
+                .try_clone()
+                .map_err(|source| StoreError::io("clone staged tombstone", source))?;
+            if transaction::raw_file_digest(digest_file)? != forget.tombstone_digest {
+                return Err(StoreError::InvalidTransaction);
+            }
+            let tombstone = crate::tombstone::ProtectedTombstone::decode(file, &manifest.store_id)?;
+            if !tombstone_matches_forget(&tombstone, manifest, forget) {
+                return Err(StoreError::InvalidTransaction);
+            }
+            root.remove_regular_file(&tombstone_temp)?;
+            transaction::sync_parent(
+                root,
+                &tombstone_temp,
+                "sync recovery tombstone temp cleanup",
+            )?;
+            failpoints.check(PersistenceBoundary::RecoveryTombstoneSynced)?;
+        }
+        if let Some(file) =
+            root.try_open_regular(&transaction::erasure_witness_relative(manifest)?, false)?
+        {
+            StoreDirectory::validate_private_open_file(&file)?;
+            if file
+                .metadata()
+                .map_err(|source| StoreError::io("inspect committed forget witness", source))?
+                .len()
+                != 0
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+        }
     }
     let metadata_temp = transaction::metadata_temp_relative(manifest)?;
     if root.remove_regular_file_if_exists(&metadata_temp)? {
         root.sync_root("sync recovery metadata temp cleanup")?;
         failpoints.check(PersistenceBoundary::RecoveryMetadataDirectorySynced)?;
     }
-    if let TransactionIntent::Record(record) = &manifest.intent
-        && let Some(idempotency) = &record.idempotency
-    {
+    if let Ok(idempotency) = transaction::mutation_idempotency(manifest) {
         for (relative, boundary) in [
             (
                 crate::idempotency::result_temp_relative(&idempotency.binding)?,
@@ -722,24 +1041,93 @@ fn reject_orphan_record_temps_in(
         let metadata = directory
             .symlink_metadata(&name)
             .map_err(|source| StoreError::io("inspect record namespace entry", source))?;
+        let erasure_witness = transaction::transaction_id_from_erasure_witness_name(&name);
+        let resembles_erasure_witness = name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".forgotten-"));
         if metadata.is_symlink() {
-            if name
-                .to_str()
-                .is_some_and(|name| name.starts_with(".record-") && name.ends_with(".tmp"))
+            if is_record_transaction_temp(&name) || resembles_erasure_witness {
+                return Err(StoreError::UnsafePath);
+            }
+            continue;
+        }
+        if metadata.is_dir() {
+            if resembles_erasure_witness {
+                return Err(StoreError::InvalidTransaction);
+            }
+            let child = StoreDirectory::open_child_directory(directory, &name)?;
+            reject_orphan_record_temps_in(&child, depth + 1)?;
+            continue;
+        }
+        if erasure_witness.is_some() {
+            let file = StoreDirectory::try_open_regular_in(directory, &name)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            StoreDirectory::validate_private_open_file(&file)?;
+            if file
+                .metadata()
+                .map_err(|source| StoreError::io("inspect forget erasure witness", source))?
+                .len()
+                != 0
             {
+                return Err(StoreError::InvalidTransaction);
+            }
+            continue;
+        }
+        if resembles_erasure_witness {
+            return Err(StoreError::InvalidTransaction);
+        }
+        if is_record_transaction_temp(&name) {
+            let file = StoreDirectory::try_open_regular_in(directory, &name)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            StoreDirectory::validate_private_open_file(&file)?;
+            return Err(StoreError::InvalidTransaction);
+        }
+    }
+    Ok(())
+}
+
+fn is_record_transaction_temp(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        (name.starts_with(".record-") && name.ends_with(".tmp"))
+            || (name.starts_with(".forgotten-") && name.ends_with(".body"))
+    })
+}
+
+fn reject_orphan_tombstone_temps(root: &StoreDirectory) -> Result<(), StoreError> {
+    let tombstones = root.open_directory(Path::new(layout::TOMBSTONES_DIR))?;
+    reject_orphan_tombstone_temps_in(&tombstones, 0)
+}
+
+fn reject_orphan_tombstone_temps_in(
+    directory: &cap_std::fs::Dir,
+    depth: usize,
+) -> Result<(), StoreError> {
+    if depth > 4 {
+        return Err(StoreError::InvalidLayout);
+    }
+    let entries = directory
+        .entries()
+        .map_err(|source| StoreError::io("inspect tombstone transaction artifacts", source))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|source| StoreError::io("read tombstone transaction artifact", source))?;
+        let name = entry.file_name();
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|source| StoreError::io("inspect tombstone namespace entry", source))?;
+        let is_temp = name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".tombstone-") && name.ends_with(".tmp"));
+        if metadata.is_symlink() {
+            if is_temp {
                 return Err(StoreError::UnsafePath);
             }
             continue;
         }
         if metadata.is_dir() {
             let child = StoreDirectory::open_child_directory(directory, &name)?;
-            reject_orphan_record_temps_in(&child, depth + 1)?;
-            continue;
-        }
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with(".record-") && name.ends_with(".tmp"))
-        {
+            reject_orphan_tombstone_temps_in(&child, depth + 1)?;
+        } else if is_temp {
             let file = StoreDirectory::try_open_regular_in(directory, &name)?
                 .ok_or(StoreError::InvalidTransaction)?;
             StoreDirectory::validate_private_open_file(&file)?;
