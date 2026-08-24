@@ -21,12 +21,20 @@ Tracking issues:
 
 - [#3 — canonical filesystem initialization and validated reads](https://github.com/bigduu/Jiandu/issues/3)
 - [#4 — singleton atomic CAS mutations and crash recovery](https://github.com/bigduu/Jiandu/issues/4)
-- [#5 — idempotency, audit, tombstones, and portable import/export](https://github.com/bigduu/Jiandu/issues/5)
+- [#5 — idempotency, audit, tombstones, and portable import/export](https://github.com/bigduu/Jiandu/issues/5) (parent tracker), split into:
+  - [#17 — durable create/update idempotency and audit](https://github.com/bigduu/Jiandu/issues/17)
+  - [#18 — idempotent forget and protected tombstones](https://github.com/bigduu/Jiandu/issues/18)
+  - [#19 — deterministic validation and portable export](https://github.com/bigduu/Jiandu/issues/19)
+  - [#20 — committed import and recovery-safe backup metadata](https://github.com/bigduu/Jiandu/issues/20)
 
 - Implement data-directory initialization and exclusive ownership.
 - Add canonical record serialization, validation, and scope-safe paths.
 - Implement atomic create/update CAS with versioned manifests, durability diagnostics, and deterministic crash recovery.
-- Add durable idempotency receipts, audit events, forget/tombstones, and portable import/export.
+- Add durable create/update idempotency receipts, private replay results,
+  sequence-addressed audit events, and an explicit capability-gated store
+  migration.
+- Add forget/tombstones, validation/export, import, and backup behavior through
+  their separate consistency slices.
 - Implement validate, import/export, backup metadata, and migration hooks.
 
 Outcome: one local process can safely own durable memory without a model or MCP transport.

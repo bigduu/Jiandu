@@ -1,0 +1,840 @@
+//! Strict private idempotency-result, receipt, and mutation-audit artifacts.
+//!
+//! Receipt metadata and audit events deliberately contain hashes and typed
+//! identity metadata only. The full replay result lives in a separate bounded
+//! private artifact for which this crate exposes no enumeration API.
+
+use crate::layout::{self, StoreDirectory};
+use crate::transaction;
+use crate::{AuditSequence, StoreError, StoreId, StoreMetadata};
+use jiandu_core::{
+    Etag, IdempotencyKey, MemoryId, MemoryRecord, MemoryScope, PrincipalId, Revision,
+    StoreRevision, Validate,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+pub(crate) const RESULT_FORMAT_VERSION: &str = "jiandu.store.mutation-result/v1alpha1";
+pub(crate) const RECEIPT_FORMAT_VERSION: &str = "jiandu.store.idempotency-receipt/v1alpha1";
+pub(crate) const AUDIT_FORMAT_VERSION: &str = "jiandu.store.mutation-audit/v1alpha1";
+pub(crate) const GENESIS_FORMAT_VERSION: &str = "jiandu.store.audit-genesis/v1alpha1";
+
+const MAX_RESULT_BYTES: usize = 1_048_576;
+const MAX_SAFE_ARTIFACT_BYTES: usize = 65_536;
+const RECEIPT_ID_LENGTH: usize = 64;
+
+/// Mutation operation included in authorization, receipt identity, and audit.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationOperation {
+    Create,
+    Update,
+}
+
+impl MutationOperation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+        }
+    }
+
+    pub(crate) const fn required_grant(self, scope: &MemoryScope) -> &'static str {
+        match scope {
+            MemoryScope::Principal { .. } => "memory:write:principal",
+            MemoryScope::Project { .. } => "memory:write:project",
+            MemoryScope::Session { .. } => "memory:write:session",
+            MemoryScope::InstanceGlobal {} => "memory:write:instance_global",
+        }
+    }
+}
+
+/// Derived lookup identity. Raw principal and idempotency key values never
+/// leave this constructor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptIdentity {
+    pub(crate) receipt_id: String,
+    pub(crate) principal_digest: String,
+    pub(crate) key_digest: String,
+}
+
+impl ReceiptIdentity {
+    pub(crate) fn derive(
+        principal_id: &PrincipalId,
+        operation: MutationOperation,
+        key: &IdempotencyKey,
+    ) -> Self {
+        let principal_digest = domain_digest(b"jiandu/principal/v1\0", principal_id.as_str());
+        let key_digest = domain_digest(b"jiandu/idempotency-key/v1\0", key.as_str());
+        let mut hasher = Sha256::new();
+        hasher.update(b"jiandu/receipt-identity/v1\0");
+        hasher.update(principal_id.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(operation.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(key_digest.as_bytes());
+        let receipt_id = hex_digest(hasher.finalize().as_slice());
+        Self {
+            receipt_id,
+            principal_digest,
+            key_digest,
+        }
+    }
+}
+
+/// Fields repeated in every durable artifact so recovery never infers
+/// principal, operation, scope, or result identity from a path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MutationBinding {
+    pub(crate) receipt_id: String,
+    pub(crate) transaction_id: String,
+    pub(crate) principal_digest: String,
+    pub(crate) key_digest: String,
+    pub(crate) operation: MutationOperation,
+    pub(crate) scope: MemoryScope,
+    pub(crate) request_fingerprint: String,
+    pub(crate) memory_id: MemoryId,
+    pub(crate) target_revision: Revision,
+    pub(crate) target_etag: Etag,
+    pub(crate) store_revision: StoreRevision,
+    pub(crate) audit_sequence: AuditSequence,
+}
+
+/// Body-free WAL extension binding the three durable artifacts by digest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct IdempotencyTransaction {
+    pub(crate) binding: MutationBinding,
+    pub(crate) result_digest: String,
+    pub(crate) receipt_digest: String,
+    pub(crate) audit_digest: String,
+}
+
+impl IdempotencyTransaction {
+    pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        self.binding.validate()?;
+        if !transaction::valid_content_digest(&self.result_digest)
+            || !transaction::valid_content_digest(&self.receipt_digest)
+            || !transaction::valid_content_digest(&self.audit_digest)
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(())
+    }
+}
+
+impl MutationBinding {
+    pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        let valid_revision = match self.operation {
+            MutationOperation::Create => self.target_revision.get() == 1,
+            MutationOperation::Update => self.target_revision.get() > 1,
+        };
+        if !valid_receipt_id(&self.receipt_id)
+            || !transaction::valid_transaction_id(&self.transaction_id)
+            || !transaction::valid_content_digest(&self.principal_digest)
+            || !transaction::valid_content_digest(&self.key_digest)
+            || !transaction::valid_content_digest(&self.request_fingerprint)
+            || !transaction::valid_content_digest(self.target_etag.as_str())
+            || self.store_revision.0 == 0
+            || self.audit_sequence.0 == 0
+            || !valid_revision
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(())
+    }
+}
+
+/// Private body-bearing replay result. No public API lists this artifact.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DurableMutationResult {
+    pub(crate) format_version: String,
+    pub(crate) store_id: StoreId,
+    pub(crate) binding: MutationBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_revision: Option<Revision>,
+    pub(crate) record: MemoryRecord,
+}
+
+impl DurableMutationResult {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate()?;
+        canonical_json(self, MAX_RESULT_BYTES)
+    }
+
+    pub(crate) fn decode(
+        file: File,
+        expected_store_id: &StoreId,
+        expected_binding: &MutationBinding,
+    ) -> Result<Self, StoreError> {
+        decode_canonical(file, MAX_RESULT_BYTES, |result: &Self| {
+            result.validate()?;
+            if &result.store_id != expected_store_id || &result.binding != expected_binding {
+                return Err(StoreError::InvalidTransaction);
+            }
+            Ok(())
+        })
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        self.binding.validate()?;
+        self.record
+            .validate()
+            .map_err(|_| StoreError::InvalidTransaction)?;
+        let valid_previous = match (self.binding.operation, self.previous_revision) {
+            (MutationOperation::Create, None) => true,
+            (MutationOperation::Update, Some(previous)) => previous
+                .get()
+                .checked_add(1)
+                .is_some_and(|next| next == self.binding.target_revision.get()),
+            _ => false,
+        };
+        if self.format_version != RESULT_FORMAT_VERSION
+            || !valid_previous
+            || self.record.id != self.binding.memory_id
+            || self.record.scope != self.binding.scope
+            || self.record.revision != self.binding.target_revision
+            || self.record.etag != self.binding.target_etag
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(())
+    }
+}
+
+/// Body-free durable receipt used for conflict detection and replay lookup.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DurableIdempotencyReceipt {
+    pub(crate) format_version: String,
+    pub(crate) store_id: StoreId,
+    pub(crate) binding: MutationBinding,
+    pub(crate) result_digest: String,
+}
+
+impl DurableIdempotencyReceipt {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate()?;
+        canonical_json(self, MAX_SAFE_ARTIFACT_BYTES)
+    }
+
+    pub(crate) fn decode(
+        file: File,
+        expected_store_id: &StoreId,
+        expected_receipt_id: &str,
+    ) -> Result<Self, StoreError> {
+        decode_canonical(file, MAX_SAFE_ARTIFACT_BYTES, |receipt: &Self| {
+            receipt.validate()?;
+            if &receipt.store_id != expected_store_id
+                || receipt.binding.receipt_id != expected_receipt_id
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+            Ok(())
+        })
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        self.binding.validate()?;
+        if self.format_version != RECEIPT_FORMAT_VERSION
+            || !transaction::valid_content_digest(&self.result_digest)
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(())
+    }
+}
+
+/// One body-free, sequence-addressed committed mutation event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DurableAuditEvent {
+    pub(crate) format_version: String,
+    pub(crate) store_id: StoreId,
+    pub(crate) binding: MutationBinding,
+    pub(crate) result_digest: String,
+}
+
+impl DurableAuditEvent {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate()?;
+        canonical_json(self, MAX_SAFE_ARTIFACT_BYTES)
+    }
+
+    pub(crate) fn decode(
+        file: File,
+        expected_store_id: &StoreId,
+        expected_sequence: AuditSequence,
+    ) -> Result<Self, StoreError> {
+        decode_canonical(file, MAX_SAFE_ARTIFACT_BYTES, |event: &Self| {
+            event.validate()?;
+            if &event.store_id != expected_store_id
+                || event.binding.audit_sequence != expected_sequence
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+            Ok(())
+        })
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        self.binding.validate()?;
+        if self.format_version != AUDIT_FORMAT_VERSION
+            || !transaction::valid_content_digest(&self.result_digest)
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(())
+    }
+}
+
+/// Body-free migration marker defining where v1alpha2 audit coverage begins.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuditGenesis {
+    pub(crate) format_version: String,
+    pub(crate) store_id: StoreId,
+    pub(crate) base_store_revision: StoreRevision,
+    pub(crate) first_audit_sequence: AuditSequence,
+}
+
+impl AuditGenesis {
+    pub(crate) fn new(store_id: StoreId, base_store_revision: StoreRevision) -> Self {
+        Self {
+            format_version: GENESIS_FORMAT_VERSION.to_owned(),
+            store_id,
+            base_store_revision,
+            first_audit_sequence: AuditSequence(1),
+        }
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        if self.format_version != GENESIS_FORMAT_VERSION || self.first_audit_sequence.0 != 1 {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        canonical_json(self, MAX_SAFE_ARTIFACT_BYTES).map_err(|_| StoreError::InvalidStoreMetadata)
+    }
+
+    pub(crate) fn decode(file: File, expected_store_id: &StoreId) -> Result<Self, StoreError> {
+        decode_canonical(file, MAX_SAFE_ARTIFACT_BYTES, |genesis: &Self| {
+            if genesis.format_version != GENESIS_FORMAT_VERSION
+                || &genesis.store_id != expected_store_id
+                || genesis.first_audit_sequence.0 != 1
+            {
+                return Err(StoreError::InvalidStoreMetadata);
+            }
+            Ok(())
+        })
+        .map_err(|_| StoreError::InvalidStoreMetadata)
+    }
+}
+
+pub(crate) struct MutationArtifacts {
+    pub(crate) result: DurableMutationResult,
+    pub(crate) result_bytes: Vec<u8>,
+    pub(crate) result_digest: String,
+    pub(crate) receipt: DurableIdempotencyReceipt,
+    pub(crate) receipt_bytes: Vec<u8>,
+    pub(crate) receipt_digest: String,
+    pub(crate) audit: DurableAuditEvent,
+    pub(crate) audit_bytes: Vec<u8>,
+    pub(crate) audit_digest: String,
+}
+
+impl MutationArtifacts {
+    pub(crate) fn build(
+        store_id: StoreId,
+        binding: MutationBinding,
+        previous_revision: Option<Revision>,
+        record: MemoryRecord,
+    ) -> Result<Self, StoreError> {
+        let result = DurableMutationResult {
+            format_version: RESULT_FORMAT_VERSION.to_owned(),
+            store_id: store_id.clone(),
+            binding: binding.clone(),
+            previous_revision,
+            record,
+        };
+        let result_bytes = result.canonical_bytes()?;
+        let result_digest = content_digest(&result_bytes);
+        let receipt = DurableIdempotencyReceipt {
+            format_version: RECEIPT_FORMAT_VERSION.to_owned(),
+            store_id: store_id.clone(),
+            binding: binding.clone(),
+            result_digest: result_digest.clone(),
+        };
+        let receipt_bytes = receipt.canonical_bytes()?;
+        let receipt_digest = content_digest(&receipt_bytes);
+        let audit = DurableAuditEvent {
+            format_version: AUDIT_FORMAT_VERSION.to_owned(),
+            store_id,
+            binding,
+            result_digest: result_digest.clone(),
+        };
+        let audit_bytes = audit.canonical_bytes()?;
+        let audit_digest = content_digest(&audit_bytes);
+        Ok(Self {
+            result,
+            result_bytes,
+            result_digest,
+            receipt,
+            receipt_bytes,
+            receipt_digest,
+            audit,
+            audit_bytes,
+            audit_digest,
+        })
+    }
+
+    pub(crate) fn from_record_intent(
+        store_id: StoreId,
+        intent: &transaction::RecordTransaction,
+        record: MemoryRecord,
+    ) -> Result<Self, StoreError> {
+        let idempotency = intent
+            .idempotency
+            .as_ref()
+            .ok_or(StoreError::InvalidTransaction)?;
+        let artifacts = Self::build(
+            store_id,
+            idempotency.binding.clone(),
+            intent.base_revision,
+            record,
+        )?;
+        if artifacts.result_digest != idempotency.result_digest
+            || artifacts.receipt_digest != idempotency.receipt_digest
+            || artifacts.audit_digest != idempotency.audit_digest
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(artifacts)
+    }
+}
+
+pub(crate) fn request_fingerprint(value: &impl Serialize) -> Result<String, StoreError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| StoreError::InvalidRequest)?;
+    Ok(domain_digest_bytes(
+        b"jiandu/canonical-mutation-input/v1\0",
+        &bytes,
+    ))
+}
+
+pub(crate) fn content_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{}", hex_digest(digest.as_slice()))
+}
+
+pub(crate) fn receipt_relative(
+    identity: &ReceiptIdentity,
+    operation: MutationOperation,
+) -> Result<PathBuf, StoreError> {
+    validate_identity(identity)?;
+    Ok(PathBuf::from(layout::IDEMPOTENCY_RECEIPTS_DIR)
+        .join(digest_hex(&identity.principal_digest)?)
+        .join(operation.as_str())
+        .join(&identity.receipt_id[..2])
+        .join(format!("{}.json", identity.receipt_id)))
+}
+
+pub(crate) fn receipt_relative_for_binding(
+    binding: &MutationBinding,
+) -> Result<PathBuf, StoreError> {
+    binding.validate()?;
+    receipt_relative(
+        &ReceiptIdentity {
+            receipt_id: binding.receipt_id.clone(),
+            principal_digest: binding.principal_digest.clone(),
+            key_digest: binding.key_digest.clone(),
+        },
+        binding.operation,
+    )
+}
+
+pub(crate) fn result_relative(receipt_id: &str) -> Result<PathBuf, StoreError> {
+    if !valid_receipt_id(receipt_id) {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(PathBuf::from(layout::IDEMPOTENCY_RESULTS_DIR)
+        .join(&receipt_id[..2])
+        .join(format!("{receipt_id}.json")))
+}
+
+pub(crate) fn audit_relative(sequence: AuditSequence) -> Result<PathBuf, StoreError> {
+    if sequence.0 == 0 {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(PathBuf::from(layout::MUTATION_AUDIT_DIR).join(format!("{:020}.json", sequence.0)))
+}
+
+pub(crate) fn result_temp_relative(binding: &MutationBinding) -> Result<PathBuf, StoreError> {
+    temp_sibling(
+        &result_relative(&binding.receipt_id)?,
+        "result",
+        &binding.transaction_id,
+    )
+}
+
+pub(crate) fn receipt_temp_relative(binding: &MutationBinding) -> Result<PathBuf, StoreError> {
+    temp_sibling(
+        &receipt_relative_for_binding(binding)?,
+        "receipt",
+        &binding.transaction_id,
+    )
+}
+
+pub(crate) fn audit_temp_relative(binding: &MutationBinding) -> Result<PathBuf, StoreError> {
+    temp_sibling(
+        &audit_relative(binding.audit_sequence)?,
+        "audit",
+        &binding.transaction_id,
+    )
+}
+
+pub(crate) fn read_receipt(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    identity: &ReceiptIdentity,
+    operation: MutationOperation,
+) -> Result<Option<DurableIdempotencyReceipt>, StoreError> {
+    let relative = receipt_relative(identity, operation)?;
+    root.try_open_regular(&relative, false)?
+        .map(|file| {
+            StoreDirectory::validate_private_open_file(&file)?;
+            DurableIdempotencyReceipt::decode(file, store_id, &identity.receipt_id)
+        })
+        .transpose()
+}
+
+pub(crate) fn read_result(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    binding: &MutationBinding,
+    expected_digest: &str,
+) -> Result<DurableMutationResult, StoreError> {
+    if !transaction::valid_content_digest(expected_digest) {
+        return Err(StoreError::InvalidTransaction);
+    }
+    let file = root
+        .try_open_regular(&result_relative(&binding.receipt_id)?, false)?
+        .ok_or(StoreError::InvalidTransaction)?;
+    StoreDirectory::validate_private_open_file(&file)?;
+    let read_file = file
+        .try_clone()
+        .map_err(|source| StoreError::io("clone mutation result artifact", source))?;
+    if transaction::raw_file_digest(read_file)? != expected_digest {
+        return Err(StoreError::InvalidTransaction);
+    }
+    DurableMutationResult::decode(file, store_id, binding)
+}
+
+pub(crate) fn verify_audit(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    binding: &MutationBinding,
+    expected_result_digest: &str,
+) -> Result<(), StoreError> {
+    let file = root
+        .try_open_regular(&audit_relative(binding.audit_sequence)?, false)?
+        .ok_or(StoreError::InvalidTransaction)?;
+    StoreDirectory::validate_private_open_file(&file)?;
+    let audit = DurableAuditEvent::decode(file, store_id, binding.audit_sequence)?;
+    if audit.binding != *binding || audit.result_digest != expected_result_digest {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(())
+}
+
+/// Validate the complete private receipt/result/audit ledger before a store
+/// becomes ready. This rejects malformed, foreign, orphaned, duplicated, or
+/// partially published artifacts that are not covered by an active WAL.
+pub(crate) fn validate_ledger(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+) -> Result<(), StoreError> {
+    let receipts = read_all_receipts(root, metadata)?;
+    let expected_count =
+        usize::try_from(metadata.audit_sequence.0).map_err(|_| StoreError::InvalidTransaction)?;
+    if receipts.len() != expected_count {
+        return Err(StoreError::InvalidTransaction);
+    }
+
+    let mut expected_results = BTreeSet::new();
+    let mut receipts_by_sequence = BTreeMap::new();
+    for receipt in receipts {
+        let binding = &receipt.binding;
+        if binding.store_revision.0 > metadata.store_revision.0
+            || binding.audit_sequence.0 > metadata.audit_sequence.0
+            || receipts_by_sequence
+                .insert(binding.audit_sequence, receipt.clone())
+                .is_some()
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        let result_path = result_relative(&binding.receipt_id)?;
+        let _result = read_result(root, &metadata.store_id, binding, &receipt.result_digest)?;
+        verify_audit(root, &metadata.store_id, binding, &receipt.result_digest)?;
+        expected_results.insert(result_path);
+    }
+
+    validate_result_namespace(root, &expected_results)?;
+    validate_audit_namespace(root, metadata, &receipts_by_sequence)
+}
+
+fn read_all_receipts(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+) -> Result<Vec<DurableIdempotencyReceipt>, StoreError> {
+    let root_relative = Path::new(layout::IDEMPOTENCY_RECEIPTS_DIR);
+    let principal_directories = root.open_directory(root_relative)?;
+    let mut receipts = Vec::new();
+    for principal_name in entry_names(&principal_directories, "list receipt principals")? {
+        let principal = principal_name
+            .to_str()
+            .filter(|value| valid_hex(value, 64))
+            .ok_or(StoreError::InvalidTransaction)?;
+        let principal_directory =
+            StoreDirectory::open_child_directory(&principal_directories, &principal_name)?;
+        for operation_name in entry_names(&principal_directory, "list receipt operations")? {
+            let operation = match operation_name.to_str() {
+                Some("create") => MutationOperation::Create,
+                Some("update") => MutationOperation::Update,
+                _ => return Err(StoreError::InvalidTransaction),
+            };
+            let operation_directory =
+                StoreDirectory::open_child_directory(&principal_directory, &operation_name)?;
+            for shard_name in entry_names(&operation_directory, "list receipt shards")? {
+                let shard = shard_name
+                    .to_str()
+                    .filter(|value| valid_hex(value, 2))
+                    .ok_or(StoreError::InvalidTransaction)?;
+                let shard_directory =
+                    StoreDirectory::open_child_directory(&operation_directory, &shard_name)?;
+                for file_name in entry_names(&shard_directory, "list receipt artifacts")? {
+                    let receipt_id = json_hex_name(&file_name, 64)?;
+                    if !receipt_id.starts_with(shard) {
+                        return Err(StoreError::InvalidTransaction);
+                    }
+                    let file = StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
+                        .ok_or(StoreError::InvalidTransaction)?;
+                    StoreDirectory::validate_private_open_file(&file)?;
+                    let receipt =
+                        DurableIdempotencyReceipt::decode(file, &metadata.store_id, receipt_id)?;
+                    let relative = root_relative
+                        .join(principal)
+                        .join(operation.as_str())
+                        .join(shard)
+                        .join(&file_name);
+                    if receipt.binding.operation != operation
+                        || digest_hex(&receipt.binding.principal_digest)? != principal
+                        || receipt_relative_for_binding(&receipt.binding)? != relative
+                    {
+                        return Err(StoreError::InvalidTransaction);
+                    }
+                    receipts.push(receipt);
+                }
+            }
+        }
+    }
+    Ok(receipts)
+}
+
+fn validate_result_namespace(
+    root: &StoreDirectory,
+    expected: &BTreeSet<PathBuf>,
+) -> Result<(), StoreError> {
+    let root_relative = Path::new(layout::IDEMPOTENCY_RESULTS_DIR);
+    let results = root.open_directory(root_relative)?;
+    let mut observed = BTreeSet::new();
+    for shard_name in entry_names(&results, "list result shards")? {
+        let shard = shard_name
+            .to_str()
+            .filter(|value| valid_hex(value, 2))
+            .ok_or(StoreError::InvalidTransaction)?;
+        let shard_directory = StoreDirectory::open_child_directory(&results, &shard_name)?;
+        for file_name in entry_names(&shard_directory, "list result artifacts")? {
+            let receipt_id = json_hex_name(&file_name, 64)?;
+            if !receipt_id.starts_with(shard) {
+                return Err(StoreError::InvalidTransaction);
+            }
+            let file = StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            StoreDirectory::validate_private_open_file(&file)?;
+            let relative = root_relative.join(shard).join(&file_name);
+            if !expected.contains(&relative) || !observed.insert(relative) {
+                return Err(StoreError::InvalidTransaction);
+            }
+        }
+    }
+    if &observed == expected {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidTransaction)
+    }
+}
+
+fn validate_audit_namespace(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+    receipts: &BTreeMap<AuditSequence, DurableIdempotencyReceipt>,
+) -> Result<(), StoreError> {
+    let audits = root.open_directory(Path::new(layout::MUTATION_AUDIT_DIR))?;
+    let mut observed = BTreeSet::new();
+    for file_name in entry_names(&audits, "list mutation audit events")? {
+        let name = file_name.to_str().ok_or(StoreError::InvalidTransaction)?;
+        let digits = name
+            .strip_suffix(".json")
+            .filter(|digits| digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or(StoreError::InvalidTransaction)?;
+        let value = digits
+            .parse::<u64>()
+            .map_err(|_| StoreError::InvalidTransaction)?;
+        let sequence = AuditSequence(value);
+        if audit_relative(sequence)? != Path::new(layout::MUTATION_AUDIT_DIR).join(&file_name)
+            || !observed.insert(sequence)
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        let receipt = receipts
+            .get(&sequence)
+            .ok_or(StoreError::InvalidTransaction)?;
+        let file = StoreDirectory::try_open_regular_in(&audits, &file_name)?
+            .ok_or(StoreError::InvalidTransaction)?;
+        StoreDirectory::validate_private_open_file(&file)?;
+        let event = DurableAuditEvent::decode(file, &metadata.store_id, sequence)?;
+        if event.binding != receipt.binding || event.result_digest != receipt.result_digest {
+            return Err(StoreError::InvalidTransaction);
+        }
+    }
+    let expected: BTreeSet<_> = (1..=metadata.audit_sequence.0).map(AuditSequence).collect();
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidTransaction)
+    }
+}
+
+fn entry_names(
+    directory: &cap_std::fs::Dir,
+    operation: &'static str,
+) -> Result<Vec<std::ffi::OsString>, StoreError> {
+    let entries = directory
+        .entries()
+        .map_err(|source| StoreError::io(operation, source))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        names.push(
+            entry
+                .map_err(|source| StoreError::io(operation, source))?
+                .file_name(),
+        );
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn json_hex_name(name: &OsStr, length: usize) -> Result<&str, StoreError> {
+    name.to_str()
+        .and_then(|value| value.strip_suffix(".json"))
+        .filter(|value| valid_hex(value, length))
+        .ok_or(StoreError::InvalidTransaction)
+}
+
+fn valid_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_canonical<T: DeserializeOwned + Serialize>(
+    file: File,
+    maximum: usize,
+    validate: impl FnOnce(&T) -> Result<(), StoreError>,
+) -> Result<T, StoreError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| StoreError::io("inspect private store artifact", source))?;
+    if metadata.len() > maximum as u64 || !StoreDirectory::has_single_link(&file)? {
+        return Err(StoreError::InvalidTransaction);
+    }
+    let mut bytes = Vec::new();
+    file.take((maximum + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| StoreError::io("read private store artifact", source))?;
+    let value: T = serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidTransaction)?;
+    validate(&value)?;
+    if canonical_json(&value, maximum)? != bytes {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(value)
+}
+
+fn canonical_json(value: &impl Serialize, maximum: usize) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| StoreError::InvalidTransaction)?;
+    bytes.push(b'\n');
+    if bytes.len() > maximum {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(bytes)
+}
+
+fn validate_identity(identity: &ReceiptIdentity) -> Result<(), StoreError> {
+    if !valid_receipt_id(&identity.receipt_id)
+        || !transaction::valid_content_digest(&identity.principal_digest)
+        || !transaction::valid_content_digest(&identity.key_digest)
+    {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(())
+}
+
+fn valid_receipt_id(value: &str) -> bool {
+    value.len() == RECEIPT_ID_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn digest_hex(value: &str) -> Result<&str, StoreError> {
+    if !transaction::valid_content_digest(value) {
+        return Err(StoreError::InvalidTransaction);
+    }
+    Ok(&value[7..])
+}
+
+fn temp_sibling(target: &Path, kind: &str, transaction_id: &str) -> Result<PathBuf, StoreError> {
+    if !transaction::valid_transaction_id(transaction_id) {
+        return Err(StoreError::InvalidTransaction);
+    }
+    let parent = target.parent().ok_or(StoreError::InvalidTransaction)?;
+    Ok(parent.join(format!(".{kind}-{transaction_id}.tmp")))
+}
+
+fn domain_digest(domain: &[u8], value: &str) -> String {
+    domain_digest_bytes(domain, value.as_bytes())
+}
+
+fn domain_digest_bytes(domain: &[u8], value: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(value);
+    format!("sha256:{}", hex_digest(hasher.finalize().as_slice()))
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}

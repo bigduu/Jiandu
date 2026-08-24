@@ -1,0 +1,6 @@
+{
+  "formatVersion": "jiandu.store.audit-genesis/v1alpha1",
+  "storeId": "00000000-0000-4000-8000-000000000017",
+  "baseStoreRevision": 41,
+  "firstAuditSequence": 1
+}

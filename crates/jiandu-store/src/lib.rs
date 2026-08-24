@@ -10,6 +10,7 @@ mod document;
 mod durability;
 mod error;
 mod failpoint;
+mod idempotency;
 mod layout;
 mod lock;
 mod metadata;
@@ -21,12 +22,13 @@ mod transaction;
 pub use durability::{DirectoryDurability, StoreDoctorReport};
 pub use error::{InvalidRecordReason, StoreError, StoreErrorCode};
 pub use failpoint::{PersistenceBoundary, PersistenceFailpointInjector};
+pub use idempotency::MutationOperation;
 pub use lock::{LockOwner, LockOwnerDiagnostics};
-pub use metadata::{STORE_FORMAT_VERSION, StoreId, StoreMetadata};
-pub use mutation::{CreateMemoryInput, MutationCommit};
+pub use metadata::{AuditSequence, STORE_FORMAT_VERSION, StoreId, StoreMetadata};
+pub use mutation::MutationCommit;
 pub use store::{
-    AuthorizedScope, AuthorizedScopes, CanonicalStore, QuarantineReceipt, StoreOptions, StoreRead,
-    StoreWatermark,
+    AuthorizedMutation, AuthorizedScope, AuthorizedScopes, CanonicalStore, QuarantineReceipt,
+    StoreOptions, StoreRead, StoreWatermark,
 };
 
 #[cfg(test)]

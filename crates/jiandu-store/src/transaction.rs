@@ -1,6 +1,7 @@
 //! Versioned, body-free transaction intents for canonical store recovery.
 
 use crate::failpoint::Failpoints;
+use crate::idempotency::IdempotencyTransaction;
 use crate::layout::{self, FileIdentity, StoreDirectory};
 use crate::{PersistenceBoundary, StoreError, StoreId, StoreMetadata};
 use jiandu_core::{Etag, MemoryId, MemoryScope, Revision};
@@ -12,7 +13,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub(crate) const TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha1";
+pub(crate) const TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha2";
+pub(crate) const LEGACY_TRANSACTION_FORMAT_VERSION: &str = "jiandu.store.transaction/v1alpha1";
 pub(crate) const QUARANTINE_RECEIPT_FORMAT_VERSION: &str =
     "jiandu.store.quarantine-receipt/v1alpha1";
 const MAX_TRANSACTION_BYTES: usize = 65_536;
@@ -40,6 +42,8 @@ pub(crate) struct RecordTransaction {
     pub(crate) target_etag: Etag,
     pub(crate) base_store_metadata: StoreMetadata,
     pub(crate) target_store_metadata: StoreMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) idempotency: Option<IdempotencyTransaction>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,7 +58,7 @@ pub(crate) struct QuarantineTransaction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TransactionIntent {
-    Record(RecordTransaction),
+    Record(Box<RecordTransaction>),
     Quarantine(QuarantineTransaction),
 }
 
@@ -72,13 +76,14 @@ pub(crate) struct TransactionManifest {
 impl TransactionManifest {
     pub(crate) fn for_record(
         store_id: StoreId,
+        transaction_id: String,
         transaction: RecordTransaction,
     ) -> Result<Self, StoreError> {
         let manifest = Self {
             format_version: TRANSACTION_FORMAT_VERSION.to_owned(),
-            transaction_id: new_transaction_id(),
+            transaction_id,
             store_id,
-            intent: TransactionIntent::Record(transaction),
+            intent: TransactionIntent::Record(Box::new(transaction)),
         };
         manifest.validate()?;
         Ok(manifest)
@@ -122,20 +127,29 @@ impl TransactionManifest {
     }
 
     fn validate(&self) -> Result<(), StoreError> {
-        if self.format_version != TRANSACTION_FORMAT_VERSION
-            || !valid_transaction_id(&self.transaction_id)
+        if !matches!(
+            self.format_version.as_str(),
+            TRANSACTION_FORMAT_VERSION | LEGACY_TRANSACTION_FORMAT_VERSION
+        ) || !valid_transaction_id(&self.transaction_id)
         {
             return Err(StoreError::InvalidTransaction);
         }
         match &self.intent {
-            TransactionIntent::Record(record) => record.validate(&self.store_id),
+            TransactionIntent::Record(record) => {
+                record.validate(&self.store_id, &self.format_version, &self.transaction_id)
+            }
             TransactionIntent::Quarantine(quarantine) => quarantine.validate(),
         }
     }
 }
 
 impl RecordTransaction {
-    fn validate(&self, store_id: &StoreId) -> Result<(), StoreError> {
+    fn validate(
+        &self,
+        store_id: &StoreId,
+        manifest_format: &str,
+        transaction_id: &str,
+    ) -> Result<(), StoreError> {
         let valid_base = match self.operation {
             RecordOperation::Create => {
                 self.base_revision.is_none()
@@ -159,18 +173,58 @@ impl RecordTransaction {
             .0
             .checked_add(1)
             .ok_or(StoreError::InvalidTransaction)?;
+        let is_legacy = manifest_format == LEGACY_TRANSACTION_FORMAT_VERSION;
+        let expected_store_format = if is_legacy {
+            crate::metadata::LEGACY_STORE_FORMAT_VERSION
+        } else {
+            crate::STORE_FORMAT_VERSION
+        };
+        let audit_advances = if is_legacy {
+            self.base_store_metadata.audit_sequence.0 == 0
+                && self.target_store_metadata.audit_sequence.0 == 0
+                && self.idempotency.is_none()
+        } else {
+            self.base_store_metadata
+                .audit_sequence
+                .0
+                .checked_add(1)
+                .is_some_and(|next| next == self.target_store_metadata.audit_sequence.0)
+                && self.idempotency.as_ref().is_some_and(|idempotency| {
+                    idempotency.validate().is_ok()
+                        && idempotency.binding.transaction_id == transaction_id
+                        && idempotency.binding.operation == self.operation.into()
+                        && idempotency.binding.scope == self.scope
+                        && idempotency.binding.memory_id == self.memory_id
+                        && idempotency.binding.target_revision == self.target_revision
+                        && idempotency.binding.target_etag == self.target_etag
+                        && idempotency.binding.store_revision
+                            == self.target_store_metadata.store_revision
+                        && idempotency.binding.audit_sequence
+                            == self.target_store_metadata.audit_sequence
+                })
+        };
         if !valid_base
             || !valid_content_etag(self.target_etag.as_str())
             || &self.base_store_metadata.store_id != store_id
             || &self.target_store_metadata.store_id != store_id
-            || self.base_store_metadata.format_version != crate::STORE_FORMAT_VERSION
-            || self.target_store_metadata.format_version != crate::STORE_FORMAT_VERSION
+            || self.base_store_metadata.format_version != expected_store_format
+            || self.target_store_metadata.format_version != expected_store_format
             || self.base_store_metadata.created_at != self.target_store_metadata.created_at
             || self.target_store_metadata.store_revision.0 != next_store_revision
+            || !audit_advances
         {
             return Err(StoreError::InvalidTransaction);
         }
         Ok(())
+    }
+}
+
+impl From<RecordOperation> for crate::MutationOperation {
+    fn from(operation: RecordOperation) -> Self {
+        match operation {
+            RecordOperation::Create => Self::Create,
+            RecordOperation::Update => Self::Update,
+        }
     }
 }
 
@@ -449,6 +503,105 @@ pub(crate) fn stage_metadata(
     FileIdentity::from_file(&root.open_existing_regular(&staged, false)?)
 }
 
+pub(crate) fn prepare_idempotency_namespaces(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let TransactionIntent::Record(record) = &manifest.intent else {
+        return Err(StoreError::InvalidTransaction);
+    };
+    let idempotency = record
+        .idempotency
+        .as_ref()
+        .ok_or(StoreError::InvalidTransaction)?;
+    for relative in [
+        crate::idempotency::result_relative(&idempotency.binding.receipt_id)?,
+        crate::idempotency::receipt_relative_for_binding(&idempotency.binding)?,
+        crate::idempotency::audit_relative(idempotency.binding.audit_sequence)?,
+    ] {
+        let parent = relative.parent().ok_or(StoreError::InvalidTransaction)?;
+        root.create_directory_all(parent)?;
+        sync_directory_chain(root, parent, "sync mutation artifact namespace")?;
+    }
+    failpoints.check(PersistenceBoundary::IdempotencyNamespacePrepared)
+}
+
+pub(crate) fn stage_mutation_result(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    bytes: &[u8],
+    failpoints: &Failpoints,
+) -> Result<FileIdentity, StoreError> {
+    let binding = record_idempotency(manifest)?.binding.clone();
+    let staged = crate::idempotency::result_temp_relative(&binding)?;
+    write_new_file(
+        root,
+        &staged,
+        bytes,
+        FilePersistence {
+            write_operation: "write staged mutation result",
+            sync_operation: "sync staged mutation result",
+            directory_operation: "sync staged mutation result directory",
+            written: PersistenceBoundary::MutationResultTempWritten,
+            synced: PersistenceBoundary::MutationResultTempSynced,
+            directory_synced: PersistenceBoundary::MutationResultTempDirectorySynced,
+        },
+        failpoints,
+    )?;
+    FileIdentity::from_file(&root.open_existing_regular(&staged, false)?)
+}
+
+pub(crate) fn stage_idempotency_receipt(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    bytes: &[u8],
+    failpoints: &Failpoints,
+) -> Result<FileIdentity, StoreError> {
+    let binding = record_idempotency(manifest)?.binding.clone();
+    let staged = crate::idempotency::receipt_temp_relative(&binding)?;
+    write_new_file(
+        root,
+        &staged,
+        bytes,
+        FilePersistence {
+            write_operation: "write staged idempotency receipt",
+            sync_operation: "sync staged idempotency receipt",
+            directory_operation: "sync staged idempotency receipt directory",
+            written: PersistenceBoundary::MutationReceiptTempWritten,
+            synced: PersistenceBoundary::MutationReceiptTempSynced,
+            directory_synced: PersistenceBoundary::MutationReceiptTempDirectorySynced,
+        },
+        failpoints,
+    )?;
+    FileIdentity::from_file(&root.open_existing_regular(&staged, false)?)
+}
+
+pub(crate) fn stage_mutation_audit(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    bytes: &[u8],
+    failpoints: &Failpoints,
+) -> Result<FileIdentity, StoreError> {
+    let binding = record_idempotency(manifest)?.binding.clone();
+    let staged = crate::idempotency::audit_temp_relative(&binding)?;
+    write_new_file(
+        root,
+        &staged,
+        bytes,
+        FilePersistence {
+            write_operation: "write staged mutation audit event",
+            sync_operation: "sync staged mutation audit event",
+            directory_operation: "sync staged mutation audit directory",
+            written: PersistenceBoundary::MutationAuditTempWritten,
+            synced: PersistenceBoundary::MutationAuditTempSynced,
+            directory_synced: PersistenceBoundary::MutationAuditTempDirectorySynced,
+        },
+        failpoints,
+    )?;
+    FileIdentity::from_file(&root.open_existing_regular(&staged, false)?)
+}
+
 pub(crate) fn publish_record(
     root: &StoreDirectory,
     manifest: &TransactionManifest,
@@ -484,6 +637,69 @@ pub(crate) fn publish_record(
     failpoints.check(PersistenceBoundary::RecordDirectorySynced)
 }
 
+pub(crate) fn publish_mutation_result(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    staged_identity: FileIdentity,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let binding = &record_idempotency(manifest)?.binding;
+    publish_new_artifact(
+        root,
+        &crate::idempotency::result_temp_relative(binding)?,
+        &crate::idempotency::result_relative(&binding.receipt_id)?,
+        staged_identity,
+        ArtifactPublication {
+            published_boundary: PersistenceBoundary::MutationResultPublished,
+            synced_boundary: PersistenceBoundary::MutationResultDirectorySynced,
+            sync_operation: "sync committed mutation result",
+        },
+        failpoints,
+    )
+}
+
+pub(crate) fn publish_idempotency_receipt(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    staged_identity: FileIdentity,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let binding = &record_idempotency(manifest)?.binding;
+    publish_new_artifact(
+        root,
+        &crate::idempotency::receipt_temp_relative(binding)?,
+        &crate::idempotency::receipt_relative_for_binding(binding)?,
+        staged_identity,
+        ArtifactPublication {
+            published_boundary: PersistenceBoundary::MutationReceiptPublished,
+            synced_boundary: PersistenceBoundary::MutationReceiptDirectorySynced,
+            sync_operation: "sync committed idempotency receipt",
+        },
+        failpoints,
+    )
+}
+
+pub(crate) fn publish_mutation_audit(
+    root: &StoreDirectory,
+    manifest: &TransactionManifest,
+    staged_identity: FileIdentity,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    let binding = &record_idempotency(manifest)?.binding;
+    publish_new_artifact(
+        root,
+        &crate::idempotency::audit_temp_relative(binding)?,
+        &crate::idempotency::audit_relative(binding.audit_sequence)?,
+        staged_identity,
+        ArtifactPublication {
+            published_boundary: PersistenceBoundary::MutationAuditPublished,
+            synced_boundary: PersistenceBoundary::MutationAuditDirectorySynced,
+            sync_operation: "sync committed mutation audit event",
+        },
+        failpoints,
+    )
+}
+
 pub(crate) fn publish_metadata(
     root: &StoreDirectory,
     manifest: &TransactionManifest,
@@ -499,6 +715,45 @@ pub(crate) fn publish_metadata(
     failpoints.check(PersistenceBoundary::MetadataRenamed)?;
     root.sync_root("sync committed store metadata")?;
     failpoints.check(PersistenceBoundary::MetadataDirectorySynced)
+}
+
+#[derive(Clone, Copy)]
+struct ArtifactPublication {
+    published_boundary: PersistenceBoundary,
+    synced_boundary: PersistenceBoundary,
+    sync_operation: &'static str,
+}
+
+fn publish_new_artifact(
+    root: &StoreDirectory,
+    staged: &Path,
+    target: &Path,
+    staged_identity: FileIdentity,
+    publication: ArtifactPublication,
+    failpoints: &Failpoints,
+) -> Result<(), StoreError> {
+    if root.regular_file_exists(target)? {
+        return Err(StoreError::InvalidTransaction);
+    }
+    root.rename(staged, target)?;
+    if !root.file_identity_matches(target, staged_identity)? {
+        return Err(StoreError::UnsafePath);
+    }
+    failpoints.check(publication.published_boundary)?;
+    sync_parent(root, target, publication.sync_operation)?;
+    failpoints.check(publication.synced_boundary)
+}
+
+fn record_idempotency(
+    manifest: &TransactionManifest,
+) -> Result<&IdempotencyTransaction, StoreError> {
+    let TransactionIntent::Record(record) = &manifest.intent else {
+        return Err(StoreError::InvalidTransaction);
+    };
+    record
+        .idempotency
+        .as_ref()
+        .ok_or(StoreError::InvalidTransaction)
 }
 
 pub(crate) fn persist_quarantine_receipt(
@@ -568,6 +823,11 @@ pub(crate) fn raw_file_digest(mut file: File) -> Result<String, StoreError> {
         }
         hasher.update(&buffer[..read]);
     }
+    // `File::try_clone` may share the underlying cursor with the handle that
+    // will subsequently be decoded. Rewind before returning so hashing never
+    // makes that authoritative handle appear empty.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| StoreError::io("rewind hashed store file", source))?;
     Ok(format_digest(hasher.finalize().as_slice()))
 }
 
@@ -618,7 +878,7 @@ pub(crate) fn sync_parent(
     }
 }
 
-fn sync_directory_chain(
+pub(crate) fn sync_directory_chain(
     root: &StoreDirectory,
     directory: &Path,
     operation: &'static str,

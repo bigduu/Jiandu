@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and a canonical-store core with exclusive ownership, validated reads, atomic create/update CAS, durability diagnostics, and deterministic crash recovery. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and a canonical-store core with exclusive ownership, validated reads, atomic create/update CAS, durable idempotent replay, sequence-addressed audit, explicit format migration, durability diagnostics, and deterministic crash recovery. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -39,7 +39,7 @@ Jiandu therefore separates three responsibilities:
 - Public contracts use opaque IDs, never workspace paths as identity.
 - Principal, Project, Session, and operator-global scopes remain distinct.
 - Read and write results are structured data, not pre-rendered prompt instructions.
-- Canonical mutations use expected-revision CAS. Public mutation contracts carry idempotency keys; durable replay receipts are the next store slice.
+- Canonical create/update uses expected-revision CAS plus principal/operation-scoped durable receipts. Identical retries replay the original result without another mutation or audit event.
 - Forget and purge operations are explicit, authorized, and auditable.
 - Jiandu remains useful without an LLM provider; extraction and reranking are optional later capabilities.
 - If Jiandu is unavailable, an agent can continue without recalled memory according to host policy.
@@ -59,6 +59,7 @@ MCP does not force a client to inject context. Jiandu returns memory records; th
 - [Architecture](docs/architecture.md)
 - [MCP API v0](docs/mcp-api-v0.md)
 - [Data model, filesystem, scopes, and lineage](docs/data-model.md)
+- [Canonical store format v1alpha2](docs/store-format-v1alpha2.md)
 - [Bamboo integration and migration](docs/integrations/bamboo.md)
 - [Delivery roadmap](docs/roadmap.md)
 
@@ -73,14 +74,17 @@ crates/jiandu-core/                  agent-neutral domain types and contracts
   src/                               ordinary structs, enums, newtypes, and validation
 crates/jiandu-store/                 exclusive ownership, reads, atomic CAS, and recovery
   fixtures/v1alpha1/                 canonical store-document conformance data
+  fixtures/v1alpha2/                 strict metadata, WAL, receipt, result, and audit fixtures
   src/                               private paths, strict codec, lock, reads, transactions, and recovery
 ```
 
 Future index, MCP adapter, daemon, and CLI crates are introduced only when their
 boundary is needed. `jiandu-store` depends on `jiandu-core`; `jiandu-core` has
 no storage, transport, Bamboo, prompt, LLM, or filesystem-path identity
-dependency. The store's on-disk compatibility rules are documented in
-[Canonical store format v1alpha1](docs/store-format-v1alpha1.md).
+dependency. The current on-disk compatibility rules are documented in
+[Canonical store format v1alpha2](docs/store-format-v1alpha2.md); the
+[v1alpha1 document](docs/store-format-v1alpha1.md) remains the migration source
+contract.
 
 Run the contract gates from the repository root:
 

@@ -142,28 +142,39 @@ On startup, Jiandu:
 2. acquires an exclusive lock and records instance metadata;
 3. checks the store format and deterministically completes or rolls back the
    single interrupted transaction, failing closed on ambiguous state;
-4. probes required file-sync and same-filesystem atomic-replace behavior and
+4. validates the exact receipt/result/audit ledger against its independent
+   audit watermark and rejects malformed, missing, or foreign artifacts;
+5. probes required file-sync and same-filesystem atomic-replace behavior and
    fails closed if the filesystem cannot provide it;
-5. validates index compatibility and schedules a rebuild if needed;
-6. starts the authenticated MCP transport;
-7. reports readiness only after the store is safe to serve.
+6. validates index compatibility and schedules a rebuild if needed;
+7. starts the authenticated MCP transport;
+8. reports readiness only after the store is safe to serve.
 
 The implemented canonical create/update core gives every success a monotonically
-increasing record revision, a content-bound opaque ETag, and one new store
-watermark. Updates with a stale expected revision fail without overwriting
-newer data and disclose only the current revision. Record replacement and the
-watermark are reconciled as one two-file transaction. Issue #5 adds the
-pre-acknowledgement receipt/audit extension required for retried requests with
-the same principal, operation, and idempotency key to return the original
-result and for conflicting key reuse to be rejected.
+increasing record revision, a content-bound opaque ETag, one new store
+watermark, one durable receipt/private result, and one sequence-addressed audit
+event. The host authenticates and authorizes an exact operation/scope before
+private receipt lookup. Identical principal/operation/key/input retries return
+the original success even after disconnect/restart and advance no watermark;
+conflicting reuse fails before record lookup, CAS, or a write. Updates with a
+stale expected revision otherwise fail without overwriting newer data and
+disclose only the current revision.
+
+Record, result, receipt, audit, and metadata are one pre-acknowledgement WAL
+transaction with metadata published last. Startup can rebuild missing
+artifacts only from an exact target record and strict digest-bound intent. It
+never guesses. The explicit `v1alpha1` to `v1alpha2` migration first recovers a
+legacy WAL, prepares/syncs genesis and layout, then publishes the new
+store-format capability gate last so old writers fail closed.
 
 Shutdown stops accepting new mutations, drains bounded in-flight work, and
-releases the store lock. Once Issue #5 lands it also flushes its durable
-idempotency/audit receipts. Crash recovery already relies on strict write-ahead
-transaction manifests, same-filesystem temporary files, file and directory
-sync boundaries, atomic replacement, and startup reconciliation. Any failure
-after write-ahead begins poisons the current handle so stale in-memory metadata
-cannot be served before restart recovery.
+releases the store lock. No fallible post-commit receipt callback exists:
+receipt/result/audit durability is inside the same transaction that precedes a
+success response. Crash recovery relies on strict write-ahead manifests,
+same-filesystem temporary files, file and directory sync boundaries, atomic
+replacement, and startup reconciliation. Any failure after write-ahead begins
+poisons the current handle so stale in-memory metadata cannot be served before
+restart recovery.
 
 ## Security model
 
@@ -185,7 +196,7 @@ cannot be served before restart recovery.
 | Revision conflict | Mutation fails with the current revision metadata. | Re-read, reconcile, and retry with a new idempotency key. |
 | Index missing/corrupt | Mark index degraded and rebuild from canonical records. | Basic exact reads remain available; search capability reports degradation. |
 | Record invalid | Fail the read with path-free validation diagnostics; move it only through an explicit operator quarantine action. | Do not inject the invalid record; ask an operator to validate/quarantine it. |
-| Client disconnects | Complete or roll back canonical state according to the transaction boundary. | Until #5, re-read and reconcile an ambiguous result; after durable receipts land, retry safely with the same idempotency key. |
+| Client disconnects | Complete or roll back the record/receipt/audit transaction according to its durable state. | Retry the identical operation with the same key and current exact-scope authority. |
 
 ## Observability
 

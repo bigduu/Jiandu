@@ -6,7 +6,7 @@ use crate::{InvalidRecordReason, StoreError, StoreId, StoreMetadata};
 use jiandu_core::{
     ListSort, MemoryId, MemoryListRequest, MemoryListResult, MemoryRecord, MemoryScope,
     MemorySummary, PrincipalId, ProjectId, ScopeSelector, SessionId, StoreRevision, Timestamp,
-    Validate,
+    TrustedRequestContext, Validate,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -73,6 +73,36 @@ impl AuthorizedScopes {
         allowed.then(|| AuthorizedScope(scope.clone()))
     }
 
+    /// Authenticate and authorize one exact mutation scope before any private
+    /// receipt lookup can occur.
+    pub fn authorize_mutation(
+        &self,
+        context: &TrustedRequestContext,
+        scope: &MemoryScope,
+        operation: crate::MutationOperation,
+    ) -> Result<AuthorizedMutation, StoreError> {
+        context
+            .validate()
+            .map_err(|_| StoreError::Unauthenticated)?;
+        if context.principal_id != self.principal_id {
+            return Err(StoreError::Forbidden);
+        }
+        let exact = self.authorize_exact(scope).ok_or(StoreError::Forbidden)?;
+        let required = operation.required_grant(scope);
+        if !context
+            .grants
+            .iter()
+            .any(|grant| grant.as_str() == required)
+        {
+            return Err(StoreError::Forbidden);
+        }
+        Ok(AuthorizedMutation {
+            principal_id: context.principal_id.clone(),
+            scope: exact.0,
+            operation,
+        })
+    }
+
     fn all_scopes(&self) -> Vec<MemoryScope> {
         let mut scopes = Vec::with_capacity(
             1 + self.project_ids.len() + self.session_ids.len() + usize::from(self.instance_global),
@@ -132,6 +162,32 @@ impl AuthorizedScope {
     #[must_use]
     pub fn as_scope(&self) -> &MemoryScope {
         &self.0
+    }
+}
+
+/// Fresh authenticated and operation-authorized exact mutation capability.
+/// Private fields prevent a model-visible command from selecting a principal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedMutation {
+    pub(crate) principal_id: PrincipalId,
+    pub(crate) scope: MemoryScope,
+    pub(crate) operation: crate::MutationOperation,
+}
+
+impl AuthorizedMutation {
+    #[must_use]
+    pub fn as_scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn principal_id(&self) -> &PrincipalId {
+        &self.principal_id
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> crate::MutationOperation {
+        self.operation
     }
 }
 
@@ -231,7 +287,9 @@ impl CanonicalStore {
 
         let metadata = prepare_initial_metadata(&root)?;
         layout::create_layout(&root)?;
+        ensure_audit_genesis(&root, &metadata, &options.failpoints, false)?;
         commit_initial_metadata(&root)?;
+        crate::idempotency::validate_ledger(&root, &metadata)?;
         root.validate_ambient_identity()?;
         lock.validate_ownership(&root)?;
         crate::durability::probe(
@@ -267,6 +325,7 @@ impl CanonicalStore {
         root.validate_private_root()?;
         let (metadata, original_metadata_bytes) = read_store_metadata(&root)?;
         layout::validate_layout(&root)?;
+        validate_audit_genesis(&root, &metadata)?;
         if !root.regular_file_exists(Path::new(layout::STORE_LOCK_FILE))? {
             return Err(StoreError::InvalidLayout);
         }
@@ -281,6 +340,11 @@ impl CanonicalStore {
         lock.publish_owner(&root, &owner)?;
         layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
         let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
+        validate_audit_genesis(&root, &recovered.metadata)?;
+        crate::idempotency::validate_ledger(&root, &recovered.metadata)?;
+        if root.regular_file_exists(Path::new(layout::STORE_METADATA_MIGRATION_FILE))? {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
         crate::durability::probe(
             &root,
             &options.failpoints,
@@ -289,6 +353,72 @@ impl CanonicalStore {
         Ok(Self {
             root,
             metadata: recovered.metadata,
+            lock,
+            failpoints: options.failpoints,
+            poisoned: false,
+            quarantine_receipts: recovered.quarantine_receipts,
+            forced_unsupported_durability: options.forced_unsupported_durability,
+        })
+    }
+
+    /// Explicitly migrate a locked v1alpha1 store into the receipt/audit-gated
+    /// v1alpha2 format. An older writer rejects the final format marker.
+    pub fn migrate_v1alpha1(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+    ) -> Result<Self, StoreError> {
+        Self::migrate_v1alpha1_with_options(data_dir, owner, StoreOptions::default())
+    }
+
+    pub fn migrate_v1alpha1_with_options(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+        options: StoreOptions,
+    ) -> Result<Self, StoreError> {
+        let root = layout::StoreDirectory::open(data_dir.as_ref(), false)?;
+        root.validate_private_root()?;
+        let (metadata, original_metadata_bytes) = read_legacy_store_metadata(&root)?;
+        layout::validate_legacy_layout(&root)?;
+        if !root.regular_file_exists(Path::new(layout::STORE_LOCK_FILE))? {
+            return Err(StoreError::InvalidLayout);
+        }
+        let _lock_file = root.validate_private_file(Path::new(layout::STORE_LOCK_FILE))?;
+
+        let mut lock = crate::lock::StoreLock::acquire(&root, false)?;
+        let (locked_metadata, locked_metadata_bytes) = read_legacy_store_metadata(&root)?;
+        if locked_metadata != metadata || locked_metadata_bytes != original_metadata_bytes {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        root.validate_ambient_identity()?;
+        lock.publish_owner(&root, &owner)?;
+
+        // Legacy recovery must run while the legacy format marker is still
+        // authoritative. Only after it removes the old WAL do we create v2
+        // namespaces or publish the capability gate.
+        layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
+        let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
+        if recovered.metadata.format_version != crate::metadata::LEGACY_STORE_FORMAT_VERSION {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+
+        layout::ensure_v2_layout(&root)?;
+        options
+            .failpoints
+            .check(crate::PersistenceBoundary::MigrationLayoutSynced)?;
+        let target_metadata = recovered.metadata.clone().upgraded_from_legacy()?;
+        ensure_audit_genesis(&root, &target_metadata, &options.failpoints, true)?;
+        publish_migrated_metadata(&root, &target_metadata, &options.failpoints)?;
+        layout::validate_layout(&root)?;
+        validate_audit_genesis(&root, &target_metadata)?;
+        crate::idempotency::validate_ledger(&root, &target_metadata)?;
+        crate::durability::probe(
+            &root,
+            &options.failpoints,
+            options.forced_unsupported_durability,
+        )?;
+        Ok(Self {
+            root,
+            metadata: target_metadata,
             lock,
             failpoints: options.failpoints,
             poisoned: false,
@@ -821,10 +951,27 @@ pub(crate) fn read_store_metadata(
         .try_open_regular(Path::new(layout::STORE_METADATA_FILE), false)?
         .ok_or(StoreError::NotInitialized)?;
     layout::StoreDirectory::validate_private_open_file(&file)?;
-    read_store_metadata_file(file)
+    read_store_metadata_file_for(file, crate::STORE_FORMAT_VERSION)
+}
+
+fn read_legacy_store_metadata(
+    root: &layout::StoreDirectory,
+) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
+    let file = root
+        .try_open_regular(Path::new(layout::STORE_METADATA_FILE), false)?
+        .ok_or(StoreError::NotInitialized)?;
+    layout::StoreDirectory::validate_private_open_file(&file)?;
+    read_store_metadata_file_for(file, crate::metadata::LEGACY_STORE_FORMAT_VERSION)
 }
 
 fn read_store_metadata_file(file: File) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
+    read_store_metadata_file_for(file, crate::STORE_FORMAT_VERSION)
+}
+
+fn read_store_metadata_file_for(
+    file: File,
+    expected_format: &str,
+) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
     if file
         .metadata()
         .map_err(|source| StoreError::io("inspect store metadata", source))?
@@ -844,19 +991,119 @@ fn read_store_metadata_file(file: File) -> Result<(StoreMetadata, Vec<u8>), Stor
         .and_then(|object| object.get("formatVersion"))
         .and_then(serde_json::Value::as_str)
         .ok_or(StoreError::InvalidStoreMetadata)?;
-    if format != crate::STORE_FORMAT_VERSION {
+    if format != expected_format {
         return Err(StoreError::UnsupportedStoreFormat {
             found: safe_format_diagnostic(format),
         });
     }
     let metadata: StoreMetadata =
         serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidStoreMetadata)?;
-    if metadata.format_version != crate::STORE_FORMAT_VERSION
+    if metadata.format_version != expected_format
+        || (expected_format == crate::metadata::LEGACY_STORE_FORMAT_VERSION
+            && metadata.audit_sequence.0 != 0)
         || metadata.canonical_bytes()? != bytes
     {
         return Err(StoreError::InvalidStoreMetadata);
     }
     Ok((metadata, bytes))
+}
+
+fn ensure_audit_genesis(
+    root: &layout::StoreDirectory,
+    metadata: &StoreMetadata,
+    failpoints: &crate::failpoint::Failpoints,
+    replace_stale: bool,
+) -> Result<(), StoreError> {
+    let expected =
+        crate::idempotency::AuditGenesis::new(metadata.store_id.clone(), metadata.store_revision);
+    let target = Path::new(layout::AUDIT_GENESIS_FILE);
+    let staged = Path::new(layout::AUDIT_GENESIS_TEMP_FILE);
+    if let Some(file) = root.try_open_regular(target, false)? {
+        layout::StoreDirectory::validate_private_open_file(&file)?;
+        let existing = crate::idempotency::AuditGenesis::decode(file, &metadata.store_id)?;
+        if existing == expected {
+            if root.remove_regular_file_if_exists(staged)? {
+                root.sync_directory(Path::new("audit"), "sync stale genesis temp cleanup")?;
+            }
+            root.sync_directory(Path::new("audit"), "sync existing audit genesis")?;
+            failpoints.check(crate::PersistenceBoundary::MigrationGenesisDirectorySynced)?;
+            return Ok(());
+        }
+        if !replace_stale {
+            return Err(StoreError::InvalidStoreMetadata);
+        }
+        root.remove_regular_file(target)?;
+        root.sync_directory(Path::new("audit"), "sync stale audit genesis removal")?;
+    }
+    if root.remove_regular_file_if_exists(staged)? {
+        root.sync_directory(Path::new("audit"), "sync genesis temp rollback")?;
+    }
+    let bytes = expected.canonical_bytes()?;
+    let mut file = root.create_new_regular(staged)?;
+    layout::StoreDirectory::set_private_file(&file)?;
+    file.write_all(&bytes)
+        .map_err(|source| StoreError::io("write staged audit genesis", source))?;
+    failpoints.check(crate::PersistenceBoundary::MigrationGenesisTempWritten)?;
+    file.sync_all()
+        .map_err(|source| StoreError::io("sync staged audit genesis", source))?;
+    failpoints.check(crate::PersistenceBoundary::MigrationGenesisTempSynced)?;
+    root.sync_directory(Path::new("audit"), "sync staged audit genesis directory")?;
+    failpoints.check(crate::PersistenceBoundary::MigrationGenesisTempDirectorySynced)?;
+    let identity = layout::FileIdentity::from_file(&file)?;
+    drop(file);
+    root.rename(staged, target)?;
+    if !root.file_identity_matches(target, identity)? {
+        return Err(StoreError::UnsafePath);
+    }
+    failpoints.check(crate::PersistenceBoundary::MigrationGenesisPublished)?;
+    root.sync_directory(Path::new("audit"), "sync published audit genesis")?;
+    failpoints.check(crate::PersistenceBoundary::MigrationGenesisDirectorySynced)
+}
+
+fn validate_audit_genesis(
+    root: &layout::StoreDirectory,
+    metadata: &StoreMetadata,
+) -> Result<(), StoreError> {
+    let file = root
+        .try_open_regular(Path::new(layout::AUDIT_GENESIS_FILE), false)?
+        .ok_or(StoreError::InvalidStoreMetadata)?;
+    layout::StoreDirectory::validate_private_open_file(&file)?;
+    let genesis = crate::idempotency::AuditGenesis::decode(file, &metadata.store_id)?;
+    if genesis.base_store_revision.0 > metadata.store_revision.0 {
+        return Err(StoreError::InvalidStoreMetadata);
+    }
+    Ok(())
+}
+
+fn publish_migrated_metadata(
+    root: &layout::StoreDirectory,
+    metadata: &StoreMetadata,
+    failpoints: &crate::failpoint::Failpoints,
+) -> Result<(), StoreError> {
+    let staged = Path::new(layout::STORE_METADATA_MIGRATION_FILE);
+    if root.remove_regular_file_if_exists(staged)? {
+        root.sync_root("sync stale migration metadata rollback")?;
+    }
+    let bytes = metadata.canonical_bytes()?;
+    let mut file = root.create_new_regular(staged)?;
+    layout::StoreDirectory::set_private_file(&file)?;
+    file.write_all(&bytes)
+        .map_err(|source| StoreError::io("write staged migrated store metadata", source))?;
+    failpoints.check(crate::PersistenceBoundary::MigrationMetadataTempWritten)?;
+    file.sync_all()
+        .map_err(|source| StoreError::io("sync staged migrated store metadata", source))?;
+    failpoints.check(crate::PersistenceBoundary::MigrationMetadataTempSynced)?;
+    root.sync_root("sync staged migrated metadata directory")?;
+    failpoints.check(crate::PersistenceBoundary::MigrationMetadataTempDirectorySynced)?;
+    let identity = layout::FileIdentity::from_file(&file)?;
+    drop(file);
+    root.rename(staged, Path::new(layout::STORE_METADATA_FILE))?;
+    if !root.file_identity_matches(Path::new(layout::STORE_METADATA_FILE), identity)? {
+        return Err(StoreError::UnsafePath);
+    }
+    failpoints.check(crate::PersistenceBoundary::MigrationMetadataPublished)?;
+    root.sync_root("sync published migrated store metadata")?;
+    failpoints.check(crate::PersistenceBoundary::MigrationMetadataDirectorySynced)
 }
 
 fn safe_format_diagnostic(format: &str) -> String {
