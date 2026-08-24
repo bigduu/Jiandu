@@ -160,9 +160,14 @@ This gives the user-visible behavior of “deep copy through this message” wit
 │   ├── principal/<principal-key>/<shard>/<memory-key>.md
 │   ├── project/<project-key>/<shard>/<memory-key>.md
 │   ├── session/<session-key>/<shard>/<memory-key>.md
-│   └── instance_global/<shard>/<memory-key>.md
+│   ├── instance_global/<shard>/<memory-key>.md
+│   └── .../<shard>/.forgotten-<transaction-id>.erased  # private zero-length witness
 ├── lineages/<target-session-key>.json
-├── tombstones/<shard>/<memory-key>.json
+├── tombstones/
+│   ├── principal/<principal-key>/<shard>/<memory-key>.json
+│   ├── project/<project-key>/<shard>/<memory-key>.json
+│   ├── session/<session-key>/<shard>/<memory-key>.json
+│   └── instance_global/<shard>/<memory-key>.json
 ├── transactions/<transaction-id>.json
 ├── receipts/
 │   ├── quarantine/quarantine-<transaction-id>.json
@@ -180,6 +185,13 @@ This gives the user-visible behavior of “deep copy through this message” wit
 The authoritative owner segment is part of the private layout for Principal, Project, and Session records. Every `<owner-key>` and `<memory-key>` is a domain-separated lowercase SHA-256 storage key of its opaque ID. This keeps distinct case-sensitive IDs separate on case-insensitive filesystems and bounds component length; the original IDs remain authoritative in validated frontmatter. The owner segment lets an authorized list traverse only granted owners instead of parsing other tenants' records. It is never inferred from a workspace path.
 
 Sharding uses the first two characters of the memory storage key only to bound directory size. Clients never observe these paths. Exact reads receive typed memory IDs plus host-authorized scopes, recompute the private key, and still validate the original ID/scope in frontmatter. Absent and inaccessible IDs share the same public not-found result. `store.json`, record frontmatter, transaction manifests, and tombstones carry explicit format versions.
+
+A committed forget retains exactly one strict, private, single-link,
+zero-length logical-erasure witness at the former record shard. Startup binds
+the witness name to the receipt/WAL transaction and rejects missing, extra,
+nonzero, linked, symlinked, partial, or foreign witnesses. Normal list scans
+skip only a syntactically valid witness after that readiness check. Descriptor
+truncation does not promise secure erasure of filesystem blocks or backups.
 
 ## Atomic idempotent mutation protocol
 
@@ -213,9 +225,11 @@ record/revision/ETag/store revision and does not rewrite state or advance
 result is retained only in a bounded, non-enumerable private artifact; metadata,
 WAL, audit, and diagnostics contain no body, update reason, raw key/query,
 credential, or path. Full byte/state/migration/failpoint details are committed
-in [the `v1alpha2` store-format document](store-format-v1alpha2.md).
-
-Forget/tombstone retention and hard-purge/receipt-GC lifecycle are Issue #18.
+in [the `v1alpha2` store-format document](store-format-v1alpha2.md). The
+implemented single-record forget transaction publishes protection before
+removing the canonical record, commits its body-free result/receipt/audit and
+metadata in one WAL, and is specified in
+[the `v1alpha3` document](store-format-v1alpha3.md).
 Derived index maintenance remains asynchronous and non-authoritative in its own
 milestone.
 
@@ -227,11 +241,16 @@ A later opt-in watcher may import external edits by parsing the full record, pre
 
 ## Forget, purge, and retention
 
-- `memory_forget` creates an authorized tombstone for one memory ID.
+- `memory_forget` requires an operation-specific `memory:forget:*` grant and
+  creates an idempotent, revision-aware tombstone for exactly one memory ID.
 - Search and reads exclude tombstoned content immediately after commit.
+- Exact get checks global tombstone presence before opening a record; list
+  filters a once-per-call global tombstone-key snapshot before opening or
+  decoding candidate bodies, including cross-scope ambient resurrection names.
 - Audit entries retain metadata necessary to prove the operation without retaining the forgotten body.
-- Hard purge timing is operator policy and must account for backups and legal retention requirements.
-- Bulk purge, scope deletion, and store reset are administrative commands requiring explicit target resolution and dry-run output.
+- Hard purge timing is operator policy and must account for backups and legal retention requirements. Ordinary forget retains historical private mutation replay artifacts.
+- Bulk restore/purge is absent from model APIs. The implemented host-only seam produces a bounded, exact-scope, sorted dry-run plan and opaque confirmation digest but executes nothing.
+- Future receipt GC/hard purge must atomically retire the strict receipt/result/audit ledger and its logical-erasure witness before deleting replay bytes; external backups are outside local deletion guarantees.
 - Import cannot recreate an ID still protected by a tombstone unless an operator performs an explicit restore workflow.
 
 ## Derived data

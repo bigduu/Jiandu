@@ -2,13 +2,14 @@ use super::*;
 use crate::document::{decode_canonical_document, encode_canonical_document};
 use crate::layout;
 use jiandu_core::{
-    ClientId, CreationActor, FrontmatterProvenance, FrontmatterScope, Grant, IdempotencyKey,
-    ListSort, MemoryFrontmatterV1Alpha1, MemoryId, MemoryListRequest, MemoryPatch, MemorySchema,
-    MemoryScope, MemoryStatus, MemoryType, PageCursor, PageLimit, PrincipalId, ProjectId,
-    ProvenanceInput, RememberMemoryCommand, Revision, ScopeSelector, SessionId, StoreRevision, Tag,
-    TagPatch, Timestamp, TrustedRequestContext, UpdateMemoryCommand,
+    ClientId, CreationActor, ForgetMemoryCommand, FrontmatterProvenance, FrontmatterScope, Grant,
+    IdempotencyKey, ListSort, MemoryFrontmatterV1Alpha1, MemoryId, MemoryListRequest, MemoryPatch,
+    MemorySchema, MemoryScope, MemoryStatus, MemoryType, PageCursor, PageLimit, PrincipalId,
+    ProjectId, ProvenanceInput, RememberMemoryCommand, Revision, ScopeSelector, SessionId,
+    StoreRevision, Tag, TagPatch, Timestamp, TrustedRequestContext, UpdateMemoryCommand,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -196,6 +197,15 @@ fn update_command(id: &MemoryId, revision: u64, title: &str) -> UpdateMemoryComm
     }
 }
 
+fn forget_command(id: &MemoryId, revision: u64, key: &str, reason: &str) -> ForgetMemoryCommand {
+    ForgetMemoryCommand {
+        memory_id: id.clone(),
+        expected_revision: Revision::new(revision).expect("positive revision"),
+        reason: reason.to_owned(),
+        idempotency_key: IdempotencyKey::new(key).expect("valid forget idempotency key"),
+    }
+}
+
 #[derive(Debug)]
 struct FailOnce {
     boundary: PersistenceBoundary,
@@ -261,6 +271,54 @@ const RECOVERY_IDEMPOTENCY_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
 ];
 
+const FORGET_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::ManifestTempWritten,
+    PersistenceBoundary::ManifestTempSynced,
+    PersistenceBoundary::ManifestTempDirectorySynced,
+    PersistenceBoundary::ManifestPublished,
+    PersistenceBoundary::ManifestDirectorySynced,
+    PersistenceBoundary::TombstoneNamespacePrepared,
+    PersistenceBoundary::TombstoneTempWritten,
+    PersistenceBoundary::TombstoneTempSynced,
+    PersistenceBoundary::TombstoneTempDirectorySynced,
+    PersistenceBoundary::MetadataTempWritten,
+    PersistenceBoundary::MetadataTempSynced,
+    PersistenceBoundary::MetadataTempDirectorySynced,
+    PersistenceBoundary::IdempotencyNamespacePrepared,
+    PersistenceBoundary::MutationResultTempWritten,
+    PersistenceBoundary::MutationResultTempSynced,
+    PersistenceBoundary::MutationResultTempDirectorySynced,
+    PersistenceBoundary::MutationReceiptTempWritten,
+    PersistenceBoundary::MutationReceiptTempSynced,
+    PersistenceBoundary::MutationReceiptTempDirectorySynced,
+    PersistenceBoundary::MutationAuditTempWritten,
+    PersistenceBoundary::MutationAuditTempSynced,
+    PersistenceBoundary::MutationAuditTempDirectorySynced,
+    PersistenceBoundary::TombstonePublished,
+    PersistenceBoundary::TombstoneDirectorySynced,
+    PersistenceBoundary::RecordRenamedForForget,
+    PersistenceBoundary::ForgetRecordDirectorySynced,
+    PersistenceBoundary::ForgottenBodyErased,
+    PersistenceBoundary::ForgottenBodySynced,
+    PersistenceBoundary::MutationResultPublished,
+    PersistenceBoundary::MutationResultDirectorySynced,
+    PersistenceBoundary::MutationReceiptPublished,
+    PersistenceBoundary::MutationReceiptDirectorySynced,
+    PersistenceBoundary::MutationAuditPublished,
+    PersistenceBoundary::MutationAuditDirectorySynced,
+    PersistenceBoundary::MetadataRenamed,
+    PersistenceBoundary::MetadataDirectorySynced,
+    PersistenceBoundary::ManifestRemoved,
+    PersistenceBoundary::ManifestRemovalDirectorySynced,
+];
+
+const FORGET_RECOVERY_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::RecoveryTombstoneSynced,
+    PersistenceBoundary::RecoveryForgetWitnessDirectorySynced,
+    PersistenceBoundary::RecoveryForgottenBodyErased,
+    PersistenceBoundary::RecoveryForgottenBodySynced,
+];
+
 const MIGRATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::MigrationLayoutSynced,
     PersistenceBoundary::MigrationGenesisTempWritten,
@@ -273,6 +331,20 @@ const MIGRATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::MigrationMetadataTempDirectorySynced,
     PersistenceBoundary::MigrationMetadataPublished,
     PersistenceBoundary::MigrationMetadataDirectorySynced,
+];
+
+const V3_MIGRATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::MigrationLayoutSynced,
+    PersistenceBoundary::MigrationMetadataTempWritten,
+    PersistenceBoundary::MigrationMetadataTempSynced,
+    PersistenceBoundary::MigrationMetadataTempDirectorySynced,
+    PersistenceBoundary::MigrationMetadataPublished,
+    PersistenceBoundary::MigrationMetadataDirectorySynced,
+];
+
+const PREVIOUS_MIGRATION_RECOVERY_BOUNDARIES: &[PersistenceBoundary] = &[
+    PersistenceBoundary::MigrationPreviousMetadataRemoved,
+    PersistenceBoundary::MigrationPreviousMetadataDirectorySynced,
 ];
 
 fn mutation_target_was_published(boundary: PersistenceBoundary) -> bool {
@@ -349,11 +421,32 @@ fn make_legacy_store(root: &Path) -> StoreMetadata {
     fs::remove_dir_all(root.join("receipts/idempotency")).expect("remove v2 idempotency layout");
     fs::remove_dir_all(root.join(layout::MUTATION_AUDIT_DIR))
         .expect("remove v2 mutation audit layout");
+    for kind in ["principal", "project", "session", "instance_global"] {
+        fs::remove_dir_all(root.join(layout::TOMBSTONES_DIR).join(kind))
+            .expect("remove v3 tombstone layout");
+    }
     fs::write(
         root.join("store.json"),
         metadata.canonical_bytes().expect("legacy metadata bytes"),
     )
     .expect("write legacy store metadata");
+    metadata
+}
+
+fn make_v1alpha2_store(root: &Path) -> StoreMetadata {
+    let store = CanonicalStore::initialize(root, owner()).expect("initialize v2 migration fixture");
+    let mut metadata = store.metadata.clone();
+    drop(store);
+    metadata.format_version = crate::metadata::PREVIOUS_STORE_FORMAT_VERSION.to_owned();
+    for kind in ["principal", "project", "session", "instance_global"] {
+        fs::remove_dir_all(root.join(layout::TOMBSTONES_DIR).join(kind))
+            .expect("remove v3 tombstone layout");
+    }
+    fs::write(
+        root.join(layout::STORE_METADATA_FILE),
+        metadata.canonical_bytes().expect("v2 metadata bytes"),
+    )
+    .expect("write v2 store metadata");
     metadata
 }
 
@@ -368,6 +461,63 @@ fn only_regular_file_below(root: &Path, relative: &str) -> PathBuf {
     let files = regular_files_below(root, relative);
     assert_eq!(files.len(), 1, "expected one file below {relative}");
     root.join(&files[0])
+}
+
+fn erasure_witnesses_below(root: &Path) -> Vec<PathBuf> {
+    regular_files_below(root, "records")
+        .into_iter()
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                transaction::transaction_id_from_erasure_witness_name(name).is_some()
+            })
+        })
+        .map(|path| root.join(path))
+        .collect()
+}
+
+fn only_erasure_witness(root: &Path) -> PathBuf {
+    let witnesses = erasure_witnesses_below(root);
+    assert_eq!(witnesses.len(), 1, "expected one erasure witness");
+    witnesses.into_iter().next().expect("one erasure witness")
+}
+
+fn committed_forget_fixture() -> TempDir {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_witness_fixture"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_witness_fixture"))
+        .with_project(project_id("prj_witness_fixture"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_witness_fixture",
+        "witness fixture body sentinel",
+    )
+    .expect("create witness fixture");
+    store
+        .forget(
+            &forget_authorization,
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "forget-witness-fixture",
+                "witness fixture reason",
+            ),
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect("commit witness fixture");
+    drop(store);
+    assert_eq!(
+        fs::metadata(only_erasure_witness(directory.path()))
+            .expect("fixture witness metadata")
+            .len(),
+        0
+    );
+    directory
 }
 
 fn committed_idempotency_fixture() -> TempDir {
@@ -2039,6 +2189,1224 @@ fn create_and_update_enforce_global_identity_cas_and_monotonic_time() {
 }
 
 #[test]
+fn forget_is_destructive_authorized_cas_replayable_and_prevents_resurrection() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_forget"),
+    };
+    let authority =
+        AuthorizedScopes::new(principal_id("prn_forget")).with_project(project_id("prj_forget"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_forget",
+        "FORGOTTEN_BODY_SENTINEL",
+    )
+    .expect("create forgotten target");
+    let command = forget_command(
+        &created.record.id,
+        created.record.revision.get(),
+        "forget-key-sentinel",
+        "RAW_FORGET_REASON_SENTINEL",
+    );
+    assert_eq!(
+        store
+            .forget(
+                &forget_authorization,
+                &command,
+                timestamp("2026-08-24T01:59:59Z"),
+            )
+            .expect_err("forget time cannot precede the current record")
+            .code(),
+        StoreErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        store.watermark().expect("rejected forget is write-free"),
+        StoreRevision(1)
+    );
+    let committed = store
+        .forget(
+            &forget_authorization,
+            &command,
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect("forget current record");
+    assert!(!committed.idempotent_replay);
+    assert_eq!(committed.memory_id, created.record.id);
+    assert_eq!(committed.revision, created.record.revision);
+    assert_eq!(committed.etag, created.record.etag);
+    assert_eq!(committed.store_revision, StoreRevision(2));
+    assert_eq!(
+        store
+            .get(&created.record.id, &authority)
+            .expect_err("forgotten get")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    assert!(
+        store
+            .list(&list_request(vec![scope_selector(&scope)], 10), &authority)
+            .expect("list after forget")
+            .result
+            .memories
+            .is_empty()
+    );
+
+    drop(store);
+    let mut reopened =
+        CanonicalStore::open(directory.path(), owner()).expect("reopen forgotten store");
+    let replay = reopened
+        .forget(
+            &forget_authorization,
+            &command,
+            timestamp("2026-08-24T09:00:00Z"),
+        )
+        .expect("exact forget retry replays before record lookup");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.transaction_id, committed.transaction_id);
+    assert_eq!(replay.forgotten_at, committed.forgotten_at);
+    assert_eq!(
+        reopened.watermark().expect("replay watermark"),
+        StoreRevision(2)
+    );
+
+    let conflict = forget_command(
+        &created.record.id,
+        created.record.revision.get(),
+        "forget-key-sentinel",
+        "different reason",
+    );
+    assert_eq!(
+        reopened
+            .forget(
+                &forget_authorization,
+                &conflict,
+                timestamp("2026-08-24T10:00:00Z"),
+            )
+            .expect_err("different input conflicts before missing record")
+            .code(),
+        StoreErrorCode::IdempotencyConflict
+    );
+    let new_key = forget_command(
+        &created.record.id,
+        created.record.revision.get(),
+        "forget-new-key",
+        "new attempt",
+    );
+    assert_eq!(
+        reopened
+            .forget(
+                &forget_authorization,
+                &new_key,
+                timestamp("2026-08-24T10:00:00Z"),
+            )
+            .expect_err("new-key forget remains non-disclosing")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    let mut resurrection = remember_command(&scope, "resurrection", "resurrection body");
+    resurrection.idempotency_key =
+        IdempotencyKey::new("create-after-forget").expect("new create key");
+    assert_eq!(
+        reopened
+            .create(
+                &create_authorization,
+                &resurrection,
+                created.record.id.clone(),
+                CreationActor::Host,
+                timestamp("2026-08-24T10:00:00Z"),
+            )
+            .expect_err("create cannot resurrect a tombstoned ID")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    assert_eq!(
+        reopened
+            .update(
+                &update_authorization,
+                &update_command(&created.record.id, 1, "resurrection update"),
+                timestamp("2026-08-24T10:00:00Z"),
+            )
+            .expect_err("update cannot resurrect a tombstoned ID")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    let historical_create = create_memory(
+        &mut reopened,
+        &create_authorization,
+        "mem_forget",
+        "FORGOTTEN_BODY_SENTINEL",
+    )
+    .expect("historical create result remains privately replayable");
+    assert!(historical_create.idempotent_replay);
+    assert_eq!(historical_create.record.body, "FORGOTTEN_BODY_SENTINEL");
+    assert_eq!(
+        reopened.watermark().expect("final watermark"),
+        StoreRevision(2)
+    );
+}
+
+#[test]
+fn protected_tombstone_hides_an_ambient_same_scope_record_from_reads_and_updates() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_tombstone_priority"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_tombstone_priority"))
+        .with_project(project_id("prj_tombstone_priority"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_tombstone_priority",
+        "original forgotten body",
+    )
+    .expect("create target");
+    store
+        .forget(
+            &forget_authorization,
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "forget-tombstone-priority",
+                "operator reason",
+            ),
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect("forget target");
+
+    let injected = encode_canonical_document(
+        &MemoryFrontmatterV1Alpha1::from_record(&created.record),
+        "ambient resurrection body",
+    )
+    .expect("canonical injected record");
+    let record_path = write_raw_record(directory.path(), &scope, &created.record.id, &injected);
+    assert_eq!(
+        store
+            .get(&created.record.id, &authority)
+            .expect_err("tombstone wins over an injected canonical name")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    assert!(
+        store
+            .list(&list_request(vec![scope_selector(&scope)], 10), &authority)
+            .expect("tombstoned ambient record is omitted")
+            .result
+            .memories
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .update(
+                &update_authorization,
+                &update_command(&created.record.id, 1, "ambient resurrection update"),
+                timestamp("2026-08-24T10:00:00Z"),
+            )
+            .expect_err("tombstone blocks ambient update before record lookup")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    assert_eq!(
+        store
+            .forget(
+                &forget_authorization,
+                &forget_command(
+                    &created.record.id,
+                    created.record.revision.get(),
+                    "ambient-resurrection-forget",
+                    "must remain tombstone-hidden",
+                ),
+                timestamp("2026-08-24T01:00:00Z"),
+            )
+            .expect_err("tombstone blocks a new-key forget before record or time inspection")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    drop(store);
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("startup rejects a canonical record beside its tombstone")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+    assert_eq!(
+        fs::read(record_path).expect("injected bytes retained"),
+        injected
+    );
+}
+
+#[test]
+fn protected_tombstone_globally_hides_cross_scope_ambient_records_before_body_decode() {
+    let directory = TempDir::new().expect("temporary directory");
+    let forgotten_scope = MemoryScope::Project {
+        project_id: project_id("prj_tombstone_scope_a"),
+    };
+    let injected_scope = MemoryScope::Project {
+        project_id: project_id("prj_tombstone_scope_b"),
+    };
+    let authority_a = AuthorizedScopes::new(principal_id("prn_tombstone_cross_scope"))
+        .with_project(project_id("prj_tombstone_scope_a"));
+    let authority_only_b = AuthorizedScopes::new(principal_id("prn_tombstone_cross_scope"))
+        .with_project(project_id("prj_tombstone_scope_b"));
+    let authority_a_and_b = AuthorizedScopes::new(principal_id("prn_tombstone_cross_scope"))
+        .with_project(project_id("prj_tombstone_scope_a"))
+        .with_project(project_id("prj_tombstone_scope_b"));
+    let create_authorization =
+        authorized_mutation(&authority_a, &forgotten_scope, MutationOperation::Create);
+    let forget_authorization =
+        authorized_mutation(&authority_a, &forgotten_scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_tombstone_cross_scope",
+        "forgotten cross-scope body",
+    )
+    .expect("create target");
+    store
+        .forget(
+            &forget_authorization,
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "forget-cross-scope",
+                "cross-scope reason",
+            ),
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect("forget target");
+
+    let malformed = b"MALFORMED_AMBIENT_BODY_MUST_NEVER_BE_OPENED";
+    let injected_path = write_raw_record(
+        directory.path(),
+        &injected_scope,
+        &created.record.id,
+        malformed,
+    );
+    for (label, authority, requested_scopes) in [
+        (
+            "only B",
+            &authority_only_b,
+            vec![scope_selector(&injected_scope)],
+        ),
+        (
+            "A plus B",
+            &authority_a_and_b,
+            vec![
+                scope_selector(&forgotten_scope),
+                scope_selector(&injected_scope),
+            ],
+        ),
+    ] {
+        assert_eq!(
+            store.get(&created.record.id, authority).unwrap_err().code(),
+            StoreErrorCode::NotFound,
+            "{label}: global tombstone wins before candidate body open"
+        );
+        let listed = store
+            .list(&list_request(requested_scopes, 10), authority)
+            .unwrap_or_else(|error| {
+                panic!("{label}: tombstone filter must precede decode: {error}")
+            });
+        assert!(listed.result.memories.is_empty(), "{label}");
+    }
+    assert_eq!(
+        fs::read(&injected_path).expect("ambient malformed bytes remain untouched"),
+        malformed
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn forget_rename_replacement_never_erases_the_wrong_inode() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_forget_rename_race"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_forget_rename_race"))
+        .with_project(project_id("prj_forget_rename_race"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_forget_rename_race",
+        "validated original body",
+    )
+    .expect("create target");
+    let record_path = layout::record_path(directory.path(), &scope, &created.record.id)
+        .expect("canonical record path");
+    let saved_path = record_path.with_extension("validated");
+    let original_bytes = fs::read(&record_path).expect("original bytes");
+    let replacement_bytes = encode_canonical_document(
+        &MemoryFrontmatterV1Alpha1::from_record(&created.record),
+        "replacement body that must survive",
+    )
+    .expect("replacement bytes");
+    let hook_record = record_path.clone();
+    let hook_saved = saved_path.clone();
+    let hook_replacement = replacement_bytes.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::Rename,
+        layout::record_file_name(&created.record.id),
+        move || {
+            fs::rename(&hook_record, &hook_saved).expect("move validated source inode");
+            fs::write(&hook_record, hook_replacement).expect("install replacement inode");
+        },
+    );
+
+    let error = store
+        .forget(
+            &forget_authorization,
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "forget-rename-race",
+                "race reason",
+            ),
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect_err("post-rename identity mismatch fails closed");
+    assert_eq!(error.code(), StoreErrorCode::UnsafePath);
+    assert_eq!(
+        fs::read(&record_path).expect("replacement restored to canonical name"),
+        replacement_bytes
+    );
+    assert_eq!(
+        fs::read(&saved_path).expect("validated original retained"),
+        original_bytes
+    );
+    assert_eq!(
+        store
+            .watermark()
+            .expect_err("failed transaction poisons the live handle")
+            .code(),
+        StoreErrorCode::RecoveryRequired
+    );
+    drop(store);
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("replacement cannot satisfy the strict recovery intent")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+}
+
+#[test]
+fn forget_descriptor_erasure_preserves_a_last_moment_witness_replacement() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_forget_erase_race"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_forget_erase_race"))
+        .with_project(project_id("prj_forget_erase_race"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_forget_erase_race",
+        "descriptor-bound body sentinel",
+    )
+    .expect("create target");
+    let record_path = layout::record_path(directory.path(), &scope, &created.record.id)
+        .expect("canonical record path");
+    let shard_directory = record_path.parent().expect("record shard").to_path_buf();
+    let saved_original =
+        shard_directory.join(".forgotten-00000000-0000-4000-8000-000000000000.erased");
+    let replacement_bytes = b"replacement witness bytes must remain exact".to_vec();
+    let hook_shard = shard_directory.clone();
+    let hook_saved = saved_original.clone();
+    let hook_replacement = replacement_bytes.clone();
+    layout::install_test_hook(
+        layout::TestHookPoint::EraseWitness,
+        "forget-erasure-witness",
+        move || {
+            let witness = fs::read_dir(&hook_shard)
+                .expect("list witness shard")
+                .map(|entry| entry.expect("witness entry").path())
+                .find(|path| {
+                    path.file_name().is_some_and(|name| {
+                        transaction::transaction_id_from_erasure_witness_name(name).is_some()
+                    })
+                })
+                .expect("renamed erasure witness");
+            fs::rename(&witness, &hook_saved).expect("move held original witness");
+            fs::write(&witness, &hook_replacement).expect("install replacement witness");
+            let replacement = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&witness)
+                .expect("open replacement witness");
+            layout::StoreDirectory::set_private_file(&replacement)
+                .expect("harden replacement witness permissions");
+        },
+    );
+
+    let error = store
+        .forget(
+            &forget_authorization,
+            &forget_command(
+                &created.record.id,
+                created.record.revision.get(),
+                "forget-erase-race",
+                "erase race reason",
+            ),
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect_err("replacement makes the transaction fail closed");
+    assert_eq!(error.code(), StoreErrorCode::UnsafePath);
+    let replacement_witness = fs::read_dir(&shard_directory)
+        .expect("list replacement witness")
+        .map(|entry| entry.expect("replacement entry").path())
+        .find(|path| {
+            path != &saved_original
+                && path.file_name().is_some_and(|name| {
+                    transaction::transaction_id_from_erasure_witness_name(name).is_some()
+                })
+        })
+        .expect("replacement witness remains named");
+    assert_eq!(
+        fs::read(&replacement_witness).expect("replacement witness bytes"),
+        replacement_bytes
+    );
+    assert_eq!(
+        fs::metadata(&saved_original)
+            .expect("held original witness")
+            .len(),
+        0,
+        "descriptor erasure follows the opened original after namespace replacement"
+    );
+    assert_eq!(
+        store
+            .watermark()
+            .expect_err("unsafe post-rename state poisons the handle")
+            .code(),
+        StoreErrorCode::RecoveryRequired
+    );
+    drop(store);
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("foreign witness and saved original fail closed at restart")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+}
+
+#[test]
+fn committed_erasure_witness_namespace_is_exact_private_and_zero_length() {
+    let missing = committed_forget_fixture();
+    fs::remove_file(only_erasure_witness(missing.path())).expect("remove committed witness");
+    assert_eq!(
+        CanonicalStore::open(missing.path(), owner())
+            .expect_err("missing committed witness fails closed")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+
+    let nonzero = committed_forget_fixture();
+    let nonzero_witness = only_erasure_witness(nonzero.path());
+    fs::write(&nonzero_witness, b"partial forgotten body residue")
+        .expect("replace witness with nonzero bytes");
+    assert_eq!(
+        CanonicalStore::open(nonzero.path(), owner())
+            .expect_err("nonzero committed witness fails closed")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+
+    let duplicate = committed_forget_fixture();
+    let witness = only_erasure_witness(duplicate.path());
+    let duplicate_witness = witness
+        .parent()
+        .expect("witness shard")
+        .join(".forgotten-00000000-0000-4000-8000-000000000001.erased");
+    fs::copy(&witness, &duplicate_witness).expect("copy duplicate zero witness");
+    let duplicate_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&duplicate_witness)
+        .expect("open duplicate witness");
+    layout::StoreDirectory::set_private_file(&duplicate_file)
+        .expect("harden duplicate witness permissions");
+    assert_eq!(
+        CanonicalStore::open(duplicate.path(), owner())
+            .expect_err("duplicate committed witness fails exact ledger validation")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+
+    let orphan = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_orphan_witness"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_orphan_witness"))
+        .with_project(project_id("prj_orphan_witness"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let mut store = CanonicalStore::initialize(orphan.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut store,
+        &create_authorization,
+        "mem_orphan_witness",
+        "orphan witness body",
+    )
+    .expect("create record");
+    drop(store);
+    let record_path =
+        layout::record_path(orphan.path(), &scope, &created.record.id).expect("record path");
+    let orphan_witness = record_path
+        .parent()
+        .expect("record shard")
+        .join(".forgotten-00000000-0000-4000-8000-000000000002.erased");
+    fs::write(&orphan_witness, []).expect("write zero orphan witness");
+    let orphan_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&orphan_witness)
+        .expect("open orphan witness");
+    layout::StoreDirectory::set_private_file(&orphan_file)
+        .expect("harden orphan witness permissions");
+    assert_eq!(
+        CanonicalStore::open(orphan.path(), owner())
+            .expect_err("orphan witness fails exact ledger validation")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+
+    let directory_witness = committed_forget_fixture();
+    let witness = only_erasure_witness(directory_witness.path());
+    fs::remove_file(&witness).expect("remove file witness");
+    fs::create_dir(&witness).expect("replace witness with directory");
+    assert_eq!(
+        CanonicalStore::open(directory_witness.path(), owner())
+            .expect_err("directory-shaped witness fails closed")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_or_symlinked_erasure_witnesses_fail_closed_without_following_targets() {
+    use std::os::unix::fs::symlink;
+
+    let linked = committed_forget_fixture();
+    let witness = only_erasure_witness(linked.path());
+    let linked_witness = witness
+        .parent()
+        .expect("witness shard")
+        .join(".forgotten-00000000-0000-4000-8000-000000000003.erased");
+    fs::hard_link(&witness, &linked_witness).expect("hard-link witness");
+    assert_eq!(
+        CanonicalStore::open(linked.path(), owner())
+            .expect_err("hard-linked witness fails closed")
+            .code(),
+        StoreErrorCode::UnsafePath
+    );
+
+    let linked_target = TempDir::new().expect("outside witness target");
+    let outside = linked_target.path().join("outside");
+    fs::write(&outside, b"outside bytes must not be followed").expect("write outside target");
+    let symlinked = committed_forget_fixture();
+    let witness = only_erasure_witness(symlinked.path());
+    fs::remove_file(&witness).expect("remove canonical witness");
+    symlink(&outside, &witness).expect("symlink witness");
+    assert_eq!(
+        CanonicalStore::open(symlinked.path(), owner())
+            .expect_err("symlinked witness fails closed")
+            .code(),
+        StoreErrorCode::UnsafePath
+    );
+    assert_eq!(
+        fs::read(&outside).expect("outside bytes remain"),
+        b"outside bytes must not be followed"
+    );
+}
+
+#[test]
+fn interrupted_forget_with_absent_or_partial_witness_fails_closed() {
+    for mutation in ["absent", "partial"] {
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = MemoryScope::Project {
+            project_id: project_id(&format!("prj_recovery_witness_{mutation}")),
+        };
+        let authority =
+            AuthorizedScopes::new(principal_id(&format!("prn_recovery_witness_{mutation}")))
+                .with_project(project_id(&format!("prj_recovery_witness_{mutation}")));
+        let create_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let forget_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Forget);
+        let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+        let created = create_memory(
+            &mut store,
+            &create_authorization,
+            &format!("mem_recovery_witness_{mutation}"),
+            "interrupted witness body",
+        )
+        .expect("create interrupted target");
+        drop(store);
+        let mut crashing = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(
+                PersistenceBoundary::RecordRenamedForForget,
+            )),
+        )
+        .expect("open failpoint writer");
+        assert_eq!(
+            crashing
+                .forget(
+                    &forget_authorization,
+                    &forget_command(
+                        &created.record.id,
+                        created.record.revision.get(),
+                        &format!("forget-recovery-witness-{mutation}"),
+                        "recovery witness reason",
+                    ),
+                    timestamp("2026-08-24T03:00:00Z"),
+                )
+                .expect_err("interrupt after witness rename")
+                .code(),
+            StoreErrorCode::InjectedFailure
+        );
+        drop(crashing);
+        let witness = only_erasure_witness(directory.path());
+        if mutation == "absent" {
+            fs::remove_file(&witness).expect("remove recovery witness");
+        } else {
+            fs::write(&witness, b"partial witness").expect("truncate recovery witness");
+        }
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("ambiguous recovery witness fails closed")
+                .code(),
+            StoreErrorCode::InvalidTransaction,
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+fn forget_write_and_admin_grants_are_independently_authorized() {
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_grant_split"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_grant_split"));
+    let context = |grant: &str| TrustedRequestContext {
+        principal_id: principal_id("prn_grant_split"),
+        client_id: ClientId::new("cli_grant_split_test").expect("client ID"),
+        grants: BTreeSet::from([Grant::new(grant).expect("grant")]),
+    };
+    assert_eq!(
+        authority
+            .authorize_mutation(
+                &context("memory:write:principal"),
+                &scope,
+                MutationOperation::Forget,
+            )
+            .expect_err("write grant cannot forget")
+            .code(),
+        StoreErrorCode::Forbidden
+    );
+    for operation in [MutationOperation::Create, MutationOperation::Update] {
+        assert_eq!(
+            authority
+                .authorize_mutation(&context("memory:forget:principal"), &scope, operation,)
+                .expect_err("forget grant cannot write")
+                .code(),
+            StoreErrorCode::Forbidden
+        );
+    }
+    assert_eq!(
+        authority
+            .authorize_admin_plan(
+                &context("memory:forget:principal"),
+                &scope,
+                AdminAction::HardPurge,
+            )
+            .expect_err("ordinary forget grant cannot plan admin purge")
+            .code(),
+        StoreErrorCode::Forbidden
+    );
+}
+
+#[test]
+fn forget_failpoints_recover_to_old_or_fully_forgotten_state() {
+    for &boundary in FORGET_PERSISTENCE_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = MemoryScope::Project {
+            project_id: project_id("prj_forget_failpoints"),
+        };
+        let authority = AuthorizedScopes::new(principal_id("prn_forget_failpoints"))
+            .with_project(project_id("prj_forget_failpoints"));
+        let create_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let forget_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Forget);
+        let mut initial =
+            CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+        let created = create_memory(
+            &mut initial,
+            &create_authorization,
+            "mem_forget_failpoint",
+            "failpoint body sentinel",
+        )
+        .expect("create target");
+        drop(initial);
+        let command = forget_command(
+            &created.record.id,
+            1,
+            "forget-failpoint-key",
+            "failpoint reason sentinel",
+        );
+        let injector = FailOnce::at(boundary);
+        let mut crashing = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(injector.clone()),
+        )
+        .expect("open failpoint writer");
+        assert_eq!(
+            crashing
+                .forget(
+                    &forget_authorization,
+                    &command,
+                    timestamp("2026-08-24T03:00:00Z"),
+                )
+                .expect_err("forget boundary interrupts acknowledgement")
+                .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+        drop(crashing);
+
+        let mut recovered = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("recover {boundary:?}: {error}"));
+        match recovered.get(&created.record.id, &authority) {
+            Ok(read) => {
+                assert_eq!(read.result.body, "failpoint body sentinel", "{boundary:?}");
+                recovered
+                    .forget(
+                        &forget_authorization,
+                        &command,
+                        timestamp("2026-08-24T03:00:00Z"),
+                    )
+                    .unwrap_or_else(|error| panic!("retry {boundary:?}: {error}"));
+            }
+            Err(StoreError::NotFound) => {
+                let replay = recovered
+                    .forget(
+                        &forget_authorization,
+                        &command,
+                        timestamp("2026-08-24T08:00:00Z"),
+                    )
+                    .unwrap_or_else(|error| panic!("replay {boundary:?}: {error}"));
+                assert!(replay.idempotent_replay, "{boundary:?}");
+            }
+            Err(error) => panic!("unexpected recovered state {boundary:?}: {error}"),
+        }
+        assert_eq!(
+            recovered
+                .get(&created.record.id, &authority)
+                .expect_err("final forgotten state")
+                .code(),
+            StoreErrorCode::NotFound,
+            "{boundary:?}"
+        );
+        assert_eq!(recovered.watermark().expect("watermark"), StoreRevision(2));
+        assert_eq!(recovered.metadata.audit_sequence, AuditSequence(2));
+        assert_eq!(
+            fs::read_dir(directory.path().join("transactions"))
+                .expect("transactions")
+                .count(),
+            0,
+            "{boundary:?}"
+        );
+        let witnesses = regular_files_below(directory.path(), "records")
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        transaction::transaction_id_from_erasure_witness_name(OsStr::new(name))
+                            .is_some()
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(witnesses.len(), 1, "{boundary:?}: {witnesses:?}");
+        assert_eq!(
+            fs::metadata(directory.path().join(&witnesses[0]))
+                .expect("witness metadata")
+                .len(),
+            0,
+            "{boundary:?}"
+        );
+        let tombstone_temps = regular_files_below(directory.path(), layout::TOMBSTONES_DIR)
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".tombstone-"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            tombstone_temps.is_empty(),
+            "{boundary:?}: {tombstone_temps:?}"
+        );
+    }
+}
+
+#[test]
+fn forget_recovery_boundaries_are_restartable() {
+    for &recovery_boundary in FORGET_RECOVERY_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = MemoryScope::Project {
+            project_id: project_id("prj_forget_recovery"),
+        };
+        let authority = AuthorizedScopes::new(principal_id("prn_forget_recovery"))
+            .with_project(project_id("prj_forget_recovery"));
+        let create_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Create);
+        let forget_authorization =
+            authorized_mutation(&authority, &scope, MutationOperation::Forget);
+        let mut initial =
+            CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+        let created = create_memory(
+            &mut initial,
+            &create_authorization,
+            "mem_forget_recovery",
+            "recovery body",
+        )
+        .expect("create target");
+        drop(initial);
+        let command = forget_command(
+            &created.record.id,
+            1,
+            "forget-recovery-key",
+            "recovery reason",
+        );
+        let live_boundary = match recovery_boundary {
+            PersistenceBoundary::RecoveryTombstoneSynced => PersistenceBoundary::TombstonePublished,
+            PersistenceBoundary::RecoveryForgetWitnessDirectorySynced
+            | PersistenceBoundary::RecoveryForgottenBodyErased
+            | PersistenceBoundary::RecoveryForgottenBodySynced => {
+                PersistenceBoundary::RecordRenamedForForget
+            }
+            _ => unreachable!("covered recovery boundary"),
+        };
+        let mut crashing = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(live_boundary)),
+        )
+        .expect("open crashing writer");
+        assert_eq!(
+            crashing
+                .forget(
+                    &forget_authorization,
+                    &command,
+                    timestamp("2026-08-24T03:00:00Z"),
+                )
+                .expect_err("seed interrupted forget")
+                .code(),
+            StoreErrorCode::InjectedFailure
+        );
+        drop(crashing);
+        let recovery_injector = FailOnce::at(recovery_boundary);
+        assert_eq!(
+            CanonicalStore::open_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(recovery_injector.clone()),
+            )
+            .expect_err("recovery itself is interrupted")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{recovery_boundary:?}"
+        );
+        assert!(recovery_injector.fired.load(Ordering::SeqCst));
+        let mut recovered = CanonicalStore::open(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("second recovery {recovery_boundary:?}: {error}"));
+        if recovered.get(&created.record.id, &authority).is_ok() {
+            recovered
+                .forget(
+                    &forget_authorization,
+                    &command,
+                    timestamp("2026-08-24T03:00:00Z"),
+                )
+                .expect("complete rolled-back forget");
+        }
+        let replay = recovered
+            .forget(
+                &forget_authorization,
+                &command,
+                timestamp("2026-08-24T09:00:00Z"),
+            )
+            .expect("final exact replay");
+        assert!(replay.idempotent_replay, "{recovery_boundary:?}");
+        assert_eq!(recovered.watermark().expect("watermark"), StoreRevision(2));
+    }
+}
+
+#[test]
+fn admin_lifecycle_plan_is_bounded_sorted_exact_scope_and_non_executing() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_admin_plan"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_admin_plan"))
+        .with_project(project_id("prj_admin_plan"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let mut forgotten = Vec::new();
+    for (id, key, time) in [
+        ("mem_admin_z", "forget-admin-z", "2026-08-24T03:00:00Z"),
+        ("mem_admin_a", "forget-admin-a", "2026-08-24T04:00:00Z"),
+    ] {
+        let created = create_memory(&mut store, &create_authorization, id, "admin secret body")
+            .expect("create admin target");
+        store
+            .forget(
+                &forget_authorization,
+                &forget_command(&created.record.id, 1, key, "admin raw reason"),
+                timestamp(time),
+            )
+            .expect("forget admin target");
+        forgotten.push(created.record);
+    }
+    let admin_context = TrustedRequestContext {
+        principal_id: principal_id("prn_admin_plan"),
+        client_id: ClientId::new("cli_admin_plan").expect("client ID"),
+        grants: BTreeSet::from([
+            Grant::new("memory:admin:hard_purge").expect("admin hard-purge grant")
+        ]),
+    };
+    let capability = authority
+        .authorize_admin_plan(&admin_context, &scope, AdminAction::HardPurge)
+        .expect("authorize exact admin plan");
+    let reverse = vec![forgotten[0].id.clone(), forgotten[1].id.clone()];
+    let plan = store
+        .plan_admin_action(&capability, &reverse)
+        .expect("plan two explicit targets");
+    assert_eq!(plan.action, AdminAction::HardPurge);
+    assert_eq!(plan.count, 2);
+    assert_eq!(plan.store_revision, StoreRevision(4));
+    assert!(plan.confirmation_digest.starts_with("sha256:"));
+    assert!(
+        plan.targets
+            .windows(2)
+            .all(|pair| pair[0].memory_id < pair[1].memory_id)
+    );
+    let sorted_ids = plan
+        .targets
+        .iter()
+        .map(|target| target.memory_id.clone())
+        .collect::<Vec<_>>();
+    let stable = store
+        .plan_admin_action(&capability, &sorted_ids)
+        .expect("sorted input produces same plan");
+    assert_eq!(stable, plan);
+    assert_eq!(
+        store
+            .plan_admin_action(
+                &capability,
+                &[forgotten[0].id.clone(), forgotten[0].id.clone()],
+            )
+            .expect_err("duplicate targets are invalid")
+            .code(),
+        StoreErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        store
+            .plan_admin_action(&capability, &[memory_id("mem_admin_missing")])
+            .expect_err("missing target makes the whole plan fail")
+            .code(),
+        StoreErrorCode::NotFound
+    );
+    assert_eq!(
+        store
+            .plan_admin_action(&capability, &[])
+            .expect_err("empty bulk target is invalid")
+            .code(),
+        StoreErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        store
+            .plan_admin_action(
+                &capability,
+                &(0..101)
+                    .map(|index| memory_id(&format!("mem_admin_{index:03}")))
+                    .collect::<Vec<_>>(),
+            )
+            .expect_err("admin plan is bounded")
+            .code(),
+        StoreErrorCode::InvalidRequest
+    );
+    // Planning has no execution authority and changes no watermark/read state.
+    assert_eq!(store.watermark().expect("watermark"), StoreRevision(4));
+    for record in forgotten {
+        assert_eq!(
+            store
+                .get(&record.id, &authority)
+                .expect_err("plan cannot restore")
+                .code(),
+            StoreErrorCode::NotFound
+        );
+    }
+}
+
+#[test]
+fn forget_manifest_tombstone_receipt_audit_and_result_are_secret_safe_and_strict() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_forget_secret_safety"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_forget_secret_safety"))
+        .with_project(project_id("prj_forget_secret_safety"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut initial = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let created = create_memory(
+        &mut initial,
+        &create_authorization,
+        "mem_forget_secret_safety",
+        "HIGH_ENTROPY_FORGOTTEN_BODY_7ee98d",
+    )
+    .expect("create target");
+    drop(initial);
+    let command = forget_command(
+        &created.record.id,
+        1,
+        "forget-raw-key-7ee98d",
+        "HIGH_ENTROPY_RAW_REASON_7ee98d",
+    );
+    let mut interrupted = CanonicalStore::open_with_options(
+        directory.path(),
+        owner(),
+        StoreOptions::with_failpoint_injector(FailOnce::at(
+            PersistenceBoundary::ManifestDirectorySynced,
+        )),
+    )
+    .expect("open interrupted writer");
+    assert_eq!(
+        interrupted
+            .forget(
+                &forget_authorization,
+                &command,
+                timestamp("2026-08-24T03:00:00Z"),
+            )
+            .expect_err("leave body-free manifest")
+            .code(),
+        StoreErrorCode::InjectedFailure
+    );
+    let manifest_path = only_regular_file_below(directory.path(), "transactions");
+    let manifest_bytes = fs::read(&manifest_path).expect("manifest bytes");
+    let ambient_path = directory.path().display().to_string();
+    for forbidden in [
+        "HIGH_ENTROPY_FORGOTTEN_BODY_7ee98d",
+        "HIGH_ENTROPY_RAW_REASON_7ee98d",
+        "forget-raw-key-7ee98d",
+        &ambient_path,
+    ] {
+        assert!(!String::from_utf8_lossy(&manifest_bytes).contains(forbidden));
+    }
+    drop(interrupted);
+
+    let mut recovered = CanonicalStore::open(directory.path(), owner()).expect("rollback manifest");
+    recovered
+        .forget(
+            &forget_authorization,
+            &command,
+            timestamp("2026-08-24T03:00:00Z"),
+        )
+        .expect("commit forget");
+    let identity = crate::idempotency::ReceiptIdentity::derive(
+        forget_authorization.principal_id(),
+        MutationOperation::Forget,
+        &command.idempotency_key,
+    );
+    let receipt = crate::idempotency::read_receipt(
+        &recovered.root,
+        recovered.store_id(),
+        &identity,
+        MutationOperation::Forget,
+    )
+    .expect("read receipt")
+    .expect("forget receipt");
+    let safe_paths = [
+        crate::transaction::manifest_relative(&receipt.binding.transaction_id)
+            .expect("manifest relative"),
+        crate::idempotency::receipt_relative_for_binding(&receipt.binding)
+            .expect("receipt relative"),
+        crate::idempotency::result_relative(&receipt.binding.receipt_id).expect("result relative"),
+        crate::idempotency::audit_relative(receipt.binding.audit_sequence).expect("audit relative"),
+        transaction::erasure_witness_relative_for(
+            &receipt.binding.scope,
+            &receipt.binding.memory_id,
+            &receipt.binding.transaction_id,
+        )
+        .expect("erasure witness relative"),
+        layout::tombstone_relative_path(&receipt.binding.scope, &receipt.binding.memory_id),
+    ];
+    for relative in safe_paths.iter().skip(1) {
+        let bytes = fs::read(directory.path().join(relative)).expect("safe artifact bytes");
+        let text = String::from_utf8_lossy(&bytes);
+        for forbidden in [
+            "HIGH_ENTROPY_FORGOTTEN_BODY_7ee98d",
+            "HIGH_ENTROPY_RAW_REASON_7ee98d",
+            "forget-raw-key-7ee98d",
+            &ambient_path,
+        ] {
+            assert!(!text.contains(forbidden), "{}", relative.display());
+        }
+    }
+    assert!(!directory.path().join(&safe_paths[0]).exists());
+    assert_eq!(
+        fs::metadata(directory.path().join(&safe_paths[4]))
+            .expect("erasure witness metadata")
+            .len(),
+        0
+    );
+
+    drop(recovered);
+    let tombstone_path = directory
+        .path()
+        .join(safe_paths.last().expect("tombstone path"));
+    let original = fs::read(&tombstone_path).expect("tombstone bytes");
+    let mut value: serde_json::Value = serde_json::from_slice(&original).expect("tombstone JSON");
+    value
+        .as_object_mut()
+        .expect("tombstone object")
+        .insert("unknownField".to_owned(), serde_json::json!(true));
+    let mut malformed = serde_json::to_vec_pretty(&value).expect("malformed tombstone");
+    malformed.push(b'\n');
+    fs::write(&tombstone_path, &malformed).expect("replace tombstone with unknown field");
+    assert_eq!(
+        CanonicalStore::open(directory.path(), owner())
+            .expect_err("strict tombstone rejects unknown fields")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+    assert_eq!(
+        fs::read(&tombstone_path).expect("failed open is read-only"),
+        malformed
+    );
+}
+
+#[test]
 fn create_replays_exact_result_across_generated_values_and_restart_without_writes() {
     let directory = TempDir::new().expect("temporary directory");
     let scope = MemoryScope::Project {
@@ -3613,7 +4981,7 @@ fn legacy_receipt_layout_migrates_idempotently_across_create_and_sync_failures()
 }
 
 #[test]
-fn v1alpha1_to_v1alpha2_migration_is_restartable_at_every_boundary_and_gates_old_writers() {
+fn v1alpha1_to_current_v1alpha3_migration_is_restartable_and_gates_old_writers() {
     for &boundary in MIGRATION_PERSISTENCE_BOUNDARIES {
         let directory = TempDir::new().expect("temporary directory");
         let legacy = make_legacy_store(directory.path());
@@ -3651,7 +5019,7 @@ fn v1alpha1_to_v1alpha2_migration_is_restartable_at_every_boundary_and_gates_old
         let migrated = if published {
             assert_eq!(
                 CanonicalStore::migrate_v1alpha1(directory.path(), owner())
-                    .expect_err("old writer rejects the v1alpha2 capability gate")
+                    .expect_err("old writer rejects the current v1alpha3 capability gate")
                     .code(),
                 StoreErrorCode::UnsupportedStoreFormat,
                 "{boundary:?}"
@@ -3696,7 +5064,376 @@ fn v1alpha1_to_v1alpha2_migration_is_restartable_at_every_boundary_and_gates_old
 }
 
 #[test]
-fn migration_recovers_a_legacy_record_transaction_before_publishing_the_v2_gate() {
+fn v1alpha2_to_v1alpha3_migration_is_metadata_last_restartable_and_preserves_records() {
+    for &boundary in V3_MIGRATION_PERSISTENCE_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let previous = make_v1alpha2_store(directory.path());
+        let scope = MemoryScope::Project {
+            project_id: project_id("prj_v3_migration"),
+        };
+        let header = frontmatter(
+            "mem_v3_migration",
+            scope,
+            "2026-08-24T01:00:00Z",
+            "2026-08-24T01:00:00Z",
+        );
+        let record_path = write_record(directory.path(), &header, "v2 preserved body\n");
+        let record_bytes = fs::read(&record_path).expect("record before v3 migration");
+        let record_mtime = fs::metadata(&record_path)
+            .expect("record metadata")
+            .modified()
+            .expect("record mtime");
+        let before_open = tree_snapshot(directory.path());
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("v3 reader requires explicit v2 migration")
+                .code(),
+            StoreErrorCode::UnsupportedStoreFormat
+        );
+        assert_eq!(tree_snapshot(directory.path()), before_open);
+
+        let injector = FailOnce::at(boundary);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha2_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(injector.clone()),
+            )
+            .expect_err("v3 migration failpoint interrupts readiness")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+        let published = store_metadata(directory.path()).format_version == STORE_FORMAT_VERSION;
+        let migrated = if published {
+            assert_eq!(
+                CanonicalStore::migrate_v1alpha2(directory.path(), owner())
+                    .expect_err("v2 writer rejects published v3 marker")
+                    .code(),
+                StoreErrorCode::UnsupportedStoreFormat,
+                "{boundary:?}"
+            );
+            CanonicalStore::open(directory.path(), owner()).expect("open published v3 migration")
+        } else {
+            CanonicalStore::migrate_v1alpha2(directory.path(), owner())
+                .expect("retry pre-publish v3 migration")
+        };
+        assert_eq!(migrated.store_id(), &previous.store_id, "{boundary:?}");
+        assert_eq!(migrated.watermark().expect("watermark"), StoreRevision(0));
+        assert_eq!(
+            fs::read(&record_path).expect("record after migration"),
+            record_bytes,
+            "{boundary:?}"
+        );
+        assert_eq!(
+            fs::metadata(&record_path)
+                .expect("record metadata after migration")
+                .modified()
+                .expect("record mtime after migration"),
+            record_mtime,
+            "{boundary:?}"
+        );
+        for kind in ["principal", "project", "session", "instance_global"] {
+            assert!(
+                directory
+                    .path()
+                    .join(layout::TOMBSTONES_DIR)
+                    .join(kind)
+                    .is_dir(),
+                "{boundary:?}: {kind}"
+            );
+        }
+        assert!(
+            !directory
+                .path()
+                .join(layout::STORE_METADATA_MIGRATION_FILE)
+                .exists()
+        );
+        drop(migrated);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha2(directory.path(), owner())
+                .expect_err("v2 migration remains gated after restart")
+                .code(),
+            StoreErrorCode::UnsupportedStoreFormat
+        );
+    }
+}
+
+#[test]
+fn current_migrator_strictly_resumes_the_previous_v1alpha2_metadata_stage() {
+    use std::io::Write as _;
+
+    let directory = TempDir::new().expect("temporary directory");
+    let legacy = make_legacy_store(directory.path());
+    let staged = StoreMetadata {
+        format_version: crate::metadata::PREVIOUS_STORE_FORMAT_VERSION.to_owned(),
+        ..legacy.clone()
+    };
+    let root = layout::StoreDirectory::open(directory.path(), false).expect("open legacy root");
+    let relative = Path::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE);
+    let mut file = root
+        .create_new_regular(relative)
+        .expect("create prior migration stage");
+    layout::StoreDirectory::set_private_file(&file).expect("private stage permissions");
+    file.write_all(&staged.canonical_bytes().expect("canonical v2 marker"))
+        .expect("write prior migration stage");
+    file.sync_all().expect("sync prior migration stage");
+    root.sync_root("sync test prior migration stage")
+        .expect("sync stage directory");
+    drop(file);
+    drop(root);
+
+    let migrated = CanonicalStore::migrate_v1alpha1(directory.path(), owner())
+        .expect("strict matching prior stage is safely rolled back and retried");
+    assert_eq!(migrated.store_id(), &legacy.store_id);
+    assert_eq!(migrated.metadata.format_version, STORE_FORMAT_VERSION);
+    assert!(!directory.path().join(relative).exists());
+    drop(migrated);
+
+    let invalid_directory = TempDir::new().expect("invalid stage directory");
+    let invalid_legacy = make_legacy_store(invalid_directory.path());
+    let foreign = StoreMetadata {
+        format_version: crate::metadata::PREVIOUS_STORE_FORMAT_VERSION.to_owned(),
+        store_id: StoreId::new("00000000-0000-4000-8000-000000000018").expect("foreign store ID"),
+        ..invalid_legacy
+    };
+    let root = layout::StoreDirectory::open(invalid_directory.path(), false)
+        .expect("open invalid legacy root");
+    let mut file = root
+        .create_new_regular(relative)
+        .expect("create foreign migration stage");
+    layout::StoreDirectory::set_private_file(&file).expect("private foreign permissions");
+    file.write_all(&foreign.canonical_bytes().expect("foreign canonical marker"))
+        .expect("write foreign migration stage");
+    file.sync_all().expect("sync foreign migration stage");
+    drop(file);
+    drop(root);
+    assert_eq!(
+        CanonicalStore::migrate_v1alpha1(invalid_directory.path(), owner())
+            .expect_err("foreign prior migration stage fails closed")
+            .code(),
+        StoreErrorCode::InvalidStoreMetadata
+    );
+    assert!(invalid_directory.path().join(relative).is_file());
+}
+
+#[test]
+fn previous_migration_metadata_cleanup_is_restartable_at_every_boundary() {
+    use std::io::Write as _;
+
+    for &boundary in PREVIOUS_MIGRATION_RECOVERY_BOUNDARIES {
+        let directory = TempDir::new().expect("temporary directory");
+        let legacy = make_legacy_store(directory.path());
+        let staged = StoreMetadata {
+            format_version: crate::metadata::PREVIOUS_STORE_FORMAT_VERSION.to_owned(),
+            ..legacy.clone()
+        };
+        let root = layout::StoreDirectory::open(directory.path(), false).expect("open legacy root");
+        let relative = Path::new(layout::PREVIOUS_STORE_METADATA_MIGRATION_FILE);
+        let mut file = root
+            .create_new_regular(relative)
+            .expect("create prior migration stage");
+        layout::StoreDirectory::set_private_file(&file).expect("private stage permissions");
+        file.write_all(&staged.canonical_bytes().expect("canonical v2 marker"))
+            .expect("write prior migration stage");
+        file.sync_all().expect("sync prior migration stage");
+        root.sync_root("sync test prior migration stage")
+            .expect("sync stage directory");
+        drop(file);
+        drop(root);
+
+        let injector = FailOnce::at(boundary);
+        assert_eq!(
+            CanonicalStore::migrate_v1alpha1_with_options(
+                directory.path(),
+                owner(),
+                StoreOptions::with_failpoint_injector(injector.clone()),
+            )
+            .expect_err("previous stage cleanup boundary interrupts migration")
+            .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+        let migrated = CanonicalStore::migrate_v1alpha1(directory.path(), owner())
+            .unwrap_or_else(|error| panic!("retry previous-stage cleanup {boundary:?}: {error}"));
+        assert_eq!(migrated.store_id(), &legacy.store_id, "{boundary:?}");
+        assert!(!directory.path().join(relative).exists(), "{boundary:?}");
+    }
+}
+
+#[test]
+fn active_manifest_codec_must_match_the_authoritative_store_capability() {
+    let directory = TempDir::new().expect("temporary directory");
+    let metadata = make_v1alpha2_store(directory.path());
+    let manifest = crate::transaction::TransactionManifest::for_quarantine(
+        metadata.store_id.clone(),
+        crate::transaction::QuarantineTransaction {
+            memory_id: memory_id("mem_cross_capability_manifest"),
+            scope: MemoryScope::Principal {
+                principal_id: principal_id("prn_cross_capability_manifest"),
+            },
+            quarantine_token: "1".repeat(32),
+            source_digest: crate::idempotency::content_digest(b"invalid source"),
+        },
+    )
+    .expect("current-format quarantine intent");
+    assert_eq!(
+        manifest.format_version,
+        crate::transaction::TRANSACTION_FORMAT_VERSION
+    );
+    let root = layout::StoreDirectory::open(directory.path(), false).expect("open v2 root");
+    crate::transaction::persist_manifest(
+        &root,
+        &manifest,
+        &crate::failpoint::Failpoints::default(),
+    )
+    .expect("persist mismatched manifest fixture");
+    drop(root);
+
+    assert_eq!(
+        CanonicalStore::migrate_v1alpha2(directory.path(), owner())
+            .expect_err("v2 capability rejects a v3 transaction codec")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+    assert_eq!(store_metadata(directory.path()), metadata);
+}
+
+#[test]
+fn v1alpha3_migration_recovers_and_validates_active_v1alpha2_wal_first() {
+    let directory = TempDir::new().expect("temporary directory");
+    let base_metadata = make_v1alpha2_store(directory.path());
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_v2_wal_migration"),
+    };
+    let header = frontmatter(
+        "mem_v2_wal_migration",
+        scope.clone(),
+        "2026-08-24T01:00:00Z",
+        "2026-08-24T01:00:00Z",
+    );
+    let bytes = encode_canonical_document(&header, "v2 WAL body").expect("record bytes");
+    let record = decode_canonical_document(&bytes, Some(&header.id))
+        .expect("record")
+        .record;
+    let mut target_metadata = base_metadata.clone();
+    target_metadata.store_revision = StoreRevision(1);
+    target_metadata.audit_sequence = AuditSequence(1);
+    let transaction_id = crate::transaction::new_transaction_id();
+    let key = IdempotencyKey::new("v2-wal-migration-key").expect("key");
+    let identity = crate::idempotency::ReceiptIdentity::derive(
+        &principal_id("prn_v2_wal_migration"),
+        MutationOperation::Create,
+        &key,
+    );
+    let binding = crate::idempotency::MutationBinding {
+        receipt_id: identity.receipt_id,
+        transaction_id: transaction_id.clone(),
+        principal_digest: identity.principal_digest,
+        key_digest: identity.key_digest,
+        operation: MutationOperation::Create,
+        scope: scope.clone(),
+        request_fingerprint: crate::idempotency::request_fingerprint(&serde_json::json!({
+            "fixture": "v2-wal-migration"
+        }))
+        .expect("fingerprint"),
+        memory_id: record.id.clone(),
+        target_revision: record.revision,
+        target_etag: record.etag.clone(),
+        store_revision: StoreRevision(1),
+        audit_sequence: AuditSequence(1),
+    };
+    let artifacts = crate::idempotency::MutationArtifacts::build(
+        base_metadata.store_id.clone(),
+        binding.clone(),
+        None,
+        record.clone(),
+    )
+    .expect("v2 artifacts");
+    let manifest = crate::transaction::TransactionManifest {
+        format_version: crate::transaction::PREVIOUS_TRANSACTION_FORMAT_VERSION.to_owned(),
+        transaction_id,
+        store_id: base_metadata.store_id.clone(),
+        intent: crate::transaction::TransactionIntent::Record(Box::new(
+            crate::transaction::RecordTransaction {
+                operation: crate::transaction::RecordOperation::Create,
+                memory_id: record.id.clone(),
+                scope: scope.clone(),
+                base_revision: None,
+                base_etag: None,
+                target_revision: record.revision,
+                target_etag: record.etag.clone(),
+                base_store_metadata: base_metadata,
+                target_store_metadata: target_metadata,
+                idempotency: Some(crate::idempotency::IdempotencyTransaction {
+                    binding,
+                    result_digest: artifacts.result_digest.clone(),
+                    receipt_digest: artifacts.receipt_digest.clone(),
+                    audit_digest: artifacts.audit_digest.clone(),
+                }),
+            },
+        )),
+    };
+    let root = layout::StoreDirectory::open(directory.path(), false).expect("open v2 root");
+    let failpoints =
+        crate::failpoint::Failpoints::new(FailOnce::at(PersistenceBoundary::RecordRenamed));
+    crate::transaction::persist_manifest(&root, &manifest, &failpoints).expect("persist v2 WAL");
+    let record_identity = crate::transaction::stage_record(&root, &manifest, &bytes, &failpoints)
+        .expect("stage v2 record");
+    crate::transaction::stage_metadata(&root, &manifest, &failpoints).expect("stage v2 metadata");
+    crate::transaction::prepare_idempotency_namespaces(&root, &manifest, &failpoints)
+        .expect("prepare v2 artifact namespaces");
+    crate::transaction::stage_mutation_result(
+        &root,
+        &manifest,
+        &artifacts.result_bytes,
+        &failpoints,
+    )
+    .expect("stage v2 result");
+    crate::transaction::stage_idempotency_receipt(
+        &root,
+        &manifest,
+        &artifacts.receipt_bytes,
+        &failpoints,
+    )
+    .expect("stage v2 receipt");
+    crate::transaction::stage_mutation_audit(&root, &manifest, &artifacts.audit_bytes, &failpoints)
+        .expect("stage v2 audit");
+    assert_eq!(
+        crate::transaction::publish_record(&root, &manifest, record_identity, None, &failpoints,)
+            .expect_err("simulate v2 crash after record rename")
+            .code(),
+        StoreErrorCode::InjectedFailure
+    );
+    drop(root);
+
+    let migrated = CanonicalStore::migrate_v1alpha2(directory.path(), owner())
+        .expect("migration recovers v2 WAL before v3 marker");
+    assert_eq!(migrated.watermark().expect("watermark"), StoreRevision(1));
+    assert_eq!(migrated.metadata.audit_sequence, AuditSequence(1));
+    assert_eq!(
+        migrated
+            .get(
+                &record.id,
+                &AuthorizedScopes::new(principal_id("prn_v2_wal_migration")),
+            )
+            .expect("recovered record")
+            .result
+            .body,
+        "v2 WAL body"
+    );
+    assert_eq!(
+        fs::read_dir(directory.path().join("transactions"))
+            .expect("transactions")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn migration_recovers_a_legacy_record_transaction_before_publishing_current_v1alpha3() {
     let directory = TempDir::new().expect("temporary directory");
     let legacy = make_legacy_store(directory.path());
     let scope = MemoryScope::Principal {
@@ -3865,7 +5602,10 @@ fn every_persistence_boundary_has_a_crash_recovery_scenario() {
     .collect();
     covered.extend(MUTATION_PERSISTENCE_BOUNDARIES.iter().copied());
     covered.extend(RECOVERY_IDEMPOTENCY_BOUNDARIES.iter().copied());
+    covered.extend(FORGET_PERSISTENCE_BOUNDARIES.iter().copied());
+    covered.extend(FORGET_RECOVERY_BOUNDARIES.iter().copied());
     covered.extend(MIGRATION_PERSISTENCE_BOUNDARIES.iter().copied());
+    covered.extend(PREVIOUS_MIGRATION_RECOVERY_BOUNDARIES.iter().copied());
     let declared: BTreeSet<_> = PersistenceBoundary::ALL.iter().copied().collect();
     assert_eq!(covered, declared);
 }
@@ -3875,7 +5615,7 @@ fn v1alpha2_private_fixtures_match_strict_rust_codecs() {
     let store_id = StoreId::new("00000000-0000-4000-8000-000000000017").expect("store ID");
     let created_at = timestamp("2026-08-24T00:00:00Z");
     let base_metadata = StoreMetadata {
-        format_version: STORE_FORMAT_VERSION.to_owned(),
+        format_version: crate::metadata::PREVIOUS_STORE_FORMAT_VERSION.to_owned(),
         store_id: store_id.clone(),
         store_revision: StoreRevision(41),
         audit_sequence: AuditSequence(6),
@@ -3922,28 +5662,30 @@ fn v1alpha2_private_fixtures_match_strict_rust_codecs() {
         record.clone(),
     )
     .expect("artifacts");
-    let manifest = crate::transaction::TransactionManifest::for_record(
-        store_id.clone(),
-        binding.transaction_id.clone(),
-        crate::transaction::RecordTransaction {
-            operation: crate::transaction::RecordOperation::Create,
-            memory_id: record.id.clone(),
-            scope,
-            base_revision: None,
-            base_etag: None,
-            target_revision: record.revision,
-            target_etag: record.etag.clone(),
-            base_store_metadata: base_metadata,
-            target_store_metadata: target_metadata.clone(),
-            idempotency: Some(crate::idempotency::IdempotencyTransaction {
-                binding,
-                result_digest: artifacts.result_digest.clone(),
-                receipt_digest: artifacts.receipt_digest.clone(),
-                audit_digest: artifacts.audit_digest.clone(),
-            }),
-        },
-    )
-    .expect("manifest");
+    let manifest = crate::transaction::TransactionManifest {
+        format_version: crate::transaction::PREVIOUS_TRANSACTION_FORMAT_VERSION.to_owned(),
+        transaction_id: binding.transaction_id.clone(),
+        store_id: store_id.clone(),
+        intent: crate::transaction::TransactionIntent::Record(Box::new(
+            crate::transaction::RecordTransaction {
+                operation: crate::transaction::RecordOperation::Create,
+                memory_id: record.id.clone(),
+                scope,
+                base_revision: None,
+                base_etag: None,
+                target_revision: record.revision,
+                target_etag: record.etag.clone(),
+                base_store_metadata: base_metadata,
+                target_store_metadata: target_metadata.clone(),
+                idempotency: Some(crate::idempotency::IdempotencyTransaction {
+                    binding,
+                    result_digest: artifacts.result_digest.clone(),
+                    receipt_digest: artifacts.receipt_digest.clone(),
+                    audit_digest: artifacts.audit_digest.clone(),
+                }),
+            },
+        )),
+    };
     let genesis = crate::idempotency::AuditGenesis::new(store_id, StoreRevision(41));
     let decoded_metadata: StoreMetadata =
         serde_json::from_slice(include_bytes!("../fixtures/v1alpha2/store-metadata.json"))
@@ -3973,7 +5715,7 @@ fn v1alpha2_private_fixtures_match_strict_rust_codecs() {
                 include_bytes!("../fixtures/v1alpha2/mutation-result.json"),
             ),
             &target_metadata.store_id,
-            &artifacts.result.binding,
+            artifacts.result.binding(),
         )
         .expect("decode result fixture"),
         artifacts.result
@@ -4048,4 +5790,124 @@ fn v1alpha2_private_fixtures_match_strict_rust_codecs() {
     ] {
         assert_eq!(bytes, fixture, "fixture drift: {name}");
     }
+}
+
+#[test]
+fn v1alpha3_forget_fixtures_match_strict_rust_codecs_without_v2_drift() {
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/v1alpha3");
+    let mut observed = fs::read_dir(&fixture_root)
+        .expect("v3 fixture directory")
+        .map(|entry| {
+            entry
+                .expect("v3 fixture entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    observed.sort();
+    assert_eq!(
+        observed,
+        [
+            "forget-result.json",
+            "forget-transaction.json",
+            "idempotency-receipt.json",
+            "mutation-audit.json",
+            "store-metadata.json",
+            "tombstone.json",
+        ]
+    );
+    let store_id = StoreId::new("00000000-0000-4000-8000-000000000018").expect("store ID");
+    let base_metadata = StoreMetadata {
+        format_version: STORE_FORMAT_VERSION.to_owned(),
+        store_id: store_id.clone(),
+        store_revision: StoreRevision(50),
+        audit_sequence: AuditSequence(9),
+        created_at: timestamp("2026-08-24T00:00:00Z"),
+    };
+    let target_metadata = StoreMetadata {
+        store_revision: StoreRevision(51),
+        audit_sequence: AuditSequence(10),
+        ..base_metadata.clone()
+    };
+    let scope = MemoryScope::Project {
+        project_id: project_id("prj_fixture_forget"),
+    };
+    let binding = crate::idempotency::MutationBinding {
+        receipt_id: "aa".repeat(32),
+        transaction_id: "00000000-0000-4000-8000-000000000018".to_owned(),
+        principal_digest: format!("sha256:{}", "b".repeat(64)),
+        key_digest: format!("sha256:{}", "c".repeat(64)),
+        operation: MutationOperation::Forget,
+        scope: scope.clone(),
+        request_fingerprint: format!("sha256:{}", "d".repeat(64)),
+        memory_id: memory_id("mem_fixture_forget"),
+        target_revision: Revision::new(2).expect("revision"),
+        target_etag: jiandu_core::Etag::new(format!("sha256:{}", "e".repeat(64))).expect("etag"),
+        store_revision: StoreRevision(51),
+        audit_sequence: AuditSequence(10),
+    };
+    let tombstone = crate::tombstone::ProtectedTombstone::new(
+        store_id.clone(),
+        binding.transaction_id.clone(),
+        binding.memory_id.clone(),
+        scope.clone(),
+        binding.target_revision,
+        binding.target_etag.clone(),
+        timestamp("2026-08-24T05:00:00Z"),
+        binding.store_revision,
+        binding.audit_sequence,
+    )
+    .expect("tombstone");
+    let tombstone_bytes = tombstone.canonical_bytes().expect("tombstone bytes");
+    let artifacts = crate::idempotency::MutationArtifacts::build_forget(
+        store_id.clone(),
+        binding.clone(),
+        &tombstone,
+    )
+    .expect("forget artifacts");
+    let manifest = crate::transaction::TransactionManifest::for_forget(
+        store_id,
+        binding.transaction_id.clone(),
+        crate::transaction::ForgetTransaction {
+            memory_id: binding.memory_id.clone(),
+            scope,
+            revision: binding.target_revision,
+            etag: binding.target_etag.clone(),
+            base_store_metadata: base_metadata,
+            target_store_metadata: target_metadata.clone(),
+            idempotency: crate::idempotency::IdempotencyTransaction {
+                binding,
+                result_digest: artifacts.result_digest.clone(),
+                receipt_digest: artifacts.receipt_digest.clone(),
+                audit_digest: artifacts.audit_digest.clone(),
+            },
+            tombstone_digest: crate::idempotency::content_digest(&tombstone_bytes),
+        },
+    )
+    .expect("forget manifest");
+    assert_eq!(
+        target_metadata.canonical_bytes().expect("metadata bytes"),
+        include_bytes!("../fixtures/v1alpha3/store-metadata.json")
+    );
+    assert_eq!(
+        tombstone_bytes,
+        include_bytes!("../fixtures/v1alpha3/tombstone.json")
+    );
+    assert_eq!(
+        artifacts.result_bytes,
+        include_bytes!("../fixtures/v1alpha3/forget-result.json")
+    );
+    assert_eq!(
+        artifacts.receipt_bytes,
+        include_bytes!("../fixtures/v1alpha3/idempotency-receipt.json")
+    );
+    assert_eq!(
+        artifacts.audit_bytes,
+        include_bytes!("../fixtures/v1alpha3/mutation-audit.json")
+    );
+    assert_eq!(
+        manifest.canonical_bytes().expect("manifest bytes"),
+        include_bytes!("../fixtures/v1alpha3/forget-transaction.json")
+    );
 }

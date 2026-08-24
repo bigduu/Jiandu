@@ -8,9 +8,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-/// Store format that requires every create/update to publish an idempotency
-/// receipt and one sequence-addressed audit event before acknowledgement.
-pub const STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha2";
+/// Store format that additionally protects forgotten identities with strict
+/// tombstones and a metadata-last forget transaction.
+pub const STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha3";
+pub(crate) const PREVIOUS_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha2";
 pub(crate) const LEGACY_STORE_FORMAT_VERSION: &str = "jiandu.store/v1alpha1";
 
 /// Independent monotonic address of the private mutation audit ledger.
@@ -110,8 +111,13 @@ impl StoreMetadata {
         Ok(bytes)
     }
 
-    pub(crate) fn upgraded_from_legacy(mut self) -> Result<Self, crate::StoreError> {
-        if self.format_version != LEGACY_STORE_FORMAT_VERSION || self.audit_sequence.0 != 0 {
+    pub(crate) fn upgraded_to_current(
+        mut self,
+        expected_source: &str,
+    ) -> Result<Self, crate::StoreError> {
+        if self.format_version != expected_source
+            || (expected_source == LEGACY_STORE_FORMAT_VERSION && self.audit_sequence.0 != 0)
+        {
             return Err(crate::StoreError::InvalidStoreMetadata);
         }
         self.format_version = STORE_FORMAT_VERSION.to_owned();

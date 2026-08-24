@@ -1,0 +1,22 @@
+{
+  "formatVersion": "jiandu.store.mutation-audit/v1alpha2",
+  "storeId": "00000000-0000-4000-8000-000000000018",
+  "binding": {
+    "receiptId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "transactionId": "00000000-0000-4000-8000-000000000018",
+    "principalDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "keyDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "operation": "forget",
+    "scope": {
+      "kind": "project",
+      "projectId": "prj_fixture_forget"
+    },
+    "requestFingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "memoryId": "mem_fixture_forget",
+    "targetRevision": 2,
+    "targetEtag": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "storeRevision": 51,
+    "auditSequence": 10
+  },
+  "resultDigest": "sha256:767acad1019e12f503f7be020ad6fc12a404d80d1163c59f764b0d8a4552aaf2"
+}

@@ -9,7 +9,7 @@ use crate::transaction;
 use crate::{AuditSequence, StoreError, StoreId, StoreMetadata};
 use jiandu_core::{
     Etag, IdempotencyKey, MemoryId, MemoryRecord, MemoryScope, PrincipalId, Revision,
-    StoreRevision, Validate,
+    StoreRevision, Timestamp, Validate,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub(crate) const RESULT_FORMAT_VERSION: &str = "jiandu.store.mutation-result/v1alpha1";
+pub(crate) const FORGET_RESULT_FORMAT_VERSION: &str = "jiandu.store.forget-result/v1alpha1";
 pub(crate) const RECEIPT_FORMAT_VERSION: &str = "jiandu.store.idempotency-receipt/v1alpha1";
+pub(crate) const FORGET_RECEIPT_FORMAT_VERSION: &str = "jiandu.store.idempotency-receipt/v1alpha2";
 pub(crate) const AUDIT_FORMAT_VERSION: &str = "jiandu.store.mutation-audit/v1alpha1";
+pub(crate) const FORGET_AUDIT_FORMAT_VERSION: &str = "jiandu.store.mutation-audit/v1alpha2";
 pub(crate) const GENESIS_FORMAT_VERSION: &str = "jiandu.store.audit-genesis/v1alpha1";
 
 const MAX_RESULT_BYTES: usize = 1_048_576;
@@ -35,6 +38,7 @@ const RECEIPT_ID_LENGTH: usize = 64;
 pub enum MutationOperation {
     Create,
     Update,
+    Forget,
 }
 
 impl MutationOperation {
@@ -42,15 +46,24 @@ impl MutationOperation {
         match self {
             Self::Create => "create",
             Self::Update => "update",
+            Self::Forget => "forget",
         }
     }
 
     pub(crate) const fn required_grant(self, scope: &MemoryScope) -> &'static str {
-        match scope {
-            MemoryScope::Principal { .. } => "memory:write:principal",
-            MemoryScope::Project { .. } => "memory:write:project",
-            MemoryScope::Session { .. } => "memory:write:session",
-            MemoryScope::InstanceGlobal {} => "memory:write:instance_global",
+        match (self, scope) {
+            (Self::Create | Self::Update, MemoryScope::Principal { .. }) => {
+                "memory:write:principal"
+            }
+            (Self::Create | Self::Update, MemoryScope::Project { .. }) => "memory:write:project",
+            (Self::Create | Self::Update, MemoryScope::Session { .. }) => "memory:write:session",
+            (Self::Create | Self::Update, MemoryScope::InstanceGlobal {}) => {
+                "memory:write:instance_global"
+            }
+            (Self::Forget, MemoryScope::Principal { .. }) => "memory:forget:principal",
+            (Self::Forget, MemoryScope::Project { .. }) => "memory:forget:project",
+            (Self::Forget, MemoryScope::Session { .. }) => "memory:forget:session",
+            (Self::Forget, MemoryScope::InstanceGlobal {}) => "memory:forget:instance_global",
         }
     }
 }
@@ -135,6 +148,7 @@ impl MutationBinding {
         let valid_revision = match self.operation {
             MutationOperation::Create => self.target_revision.get() == 1,
             MutationOperation::Update => self.target_revision.get() > 1,
+            MutationOperation::Forget => true,
         };
         if !valid_receipt_id(&self.receipt_id)
             || !transaction::valid_transaction_id(&self.transaction_id)
@@ -152,10 +166,10 @@ impl MutationBinding {
     }
 }
 
-/// Private body-bearing replay result. No public API lists this artifact.
+/// Historical body-bearing create/update replay result.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct DurableMutationResult {
+pub(crate) struct DurableRecordMutationResult {
     pub(crate) format_version: String,
     pub(crate) store_id: StoreId,
     pub(crate) binding: MutationBinding,
@@ -164,26 +178,7 @@ pub(crate) struct DurableMutationResult {
     pub(crate) record: MemoryRecord,
 }
 
-impl DurableMutationResult {
-    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
-        self.validate()?;
-        canonical_json(self, MAX_RESULT_BYTES)
-    }
-
-    pub(crate) fn decode(
-        file: File,
-        expected_store_id: &StoreId,
-        expected_binding: &MutationBinding,
-    ) -> Result<Self, StoreError> {
-        decode_canonical(file, MAX_RESULT_BYTES, |result: &Self| {
-            result.validate()?;
-            if &result.store_id != expected_store_id || &result.binding != expected_binding {
-                return Err(StoreError::InvalidTransaction);
-            }
-            Ok(())
-        })
-    }
-
+impl DurableRecordMutationResult {
     fn validate(&self) -> Result<(), StoreError> {
         self.binding.validate()?;
         self.record
@@ -207,6 +202,94 @@ impl DurableMutationResult {
             return Err(StoreError::InvalidTransaction);
         }
         Ok(())
+    }
+}
+
+/// Body-free exact replay result for a committed forget.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DurableForgetResult {
+    pub(crate) format_version: String,
+    pub(crate) store_id: StoreId,
+    pub(crate) binding: MutationBinding,
+    pub(crate) forgotten_at: Timestamp,
+}
+
+impl DurableForgetResult {
+    fn validate(&self) -> Result<(), StoreError> {
+        self.binding.validate()?;
+        if self.format_version != FORGET_RESULT_FORMAT_VERSION
+            || self.binding.operation != MutationOperation::Forget
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(())
+    }
+}
+
+/// Mixed historical result ledger. The untagged wrapper preserves every
+/// v1alpha2 create/update byte while admitting a separately versioned,
+/// body-free forget result only under the v1alpha3 capability gate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum DurableMutationResult {
+    Record(Box<DurableRecordMutationResult>),
+    Forget(Box<DurableForgetResult>),
+}
+
+impl DurableMutationResult {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate()?;
+        canonical_json(self, MAX_RESULT_BYTES)
+    }
+
+    pub(crate) fn decode(
+        file: File,
+        expected_store_id: &StoreId,
+        expected_binding: &MutationBinding,
+    ) -> Result<Self, StoreError> {
+        decode_canonical(file, MAX_RESULT_BYTES, |result: &Self| {
+            result.validate()?;
+            if result.store_id() != expected_store_id || result.binding() != expected_binding {
+                return Err(StoreError::InvalidTransaction);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn binding(&self) -> &MutationBinding {
+        match self {
+            Self::Record(result) => &result.binding,
+            Self::Forget(result) => &result.binding,
+        }
+    }
+
+    pub(crate) fn store_id(&self) -> &StoreId {
+        match self {
+            Self::Record(result) => &result.store_id,
+            Self::Forget(result) => &result.store_id,
+        }
+    }
+
+    pub(crate) fn into_record(self) -> Result<DurableRecordMutationResult, StoreError> {
+        match self {
+            Self::Record(result) => Ok(*result),
+            Self::Forget(_) => Err(StoreError::InvalidTransaction),
+        }
+    }
+
+    pub(crate) fn into_forget(self) -> Result<DurableForgetResult, StoreError> {
+        match self {
+            Self::Forget(result) => Ok(*result),
+            Self::Record(_) => Err(StoreError::InvalidTransaction),
+        }
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Record(result) => result.validate(),
+            Self::Forget(result) => result.validate(),
+        }
     }
 }
 
@@ -244,9 +327,13 @@ impl DurableIdempotencyReceipt {
 
     fn validate(&self) -> Result<(), StoreError> {
         self.binding.validate()?;
-        if self.format_version != RECEIPT_FORMAT_VERSION
-            || !transaction::valid_content_digest(&self.result_digest)
-        {
+        let format_matches = match self.binding.operation {
+            MutationOperation::Create | MutationOperation::Update => {
+                self.format_version == RECEIPT_FORMAT_VERSION
+            }
+            MutationOperation::Forget => self.format_version == FORGET_RECEIPT_FORMAT_VERSION,
+        };
+        if !format_matches || !transaction::valid_content_digest(&self.result_digest) {
             return Err(StoreError::InvalidTransaction);
         }
         Ok(())
@@ -287,9 +374,13 @@ impl DurableAuditEvent {
 
     fn validate(&self) -> Result<(), StoreError> {
         self.binding.validate()?;
-        if self.format_version != AUDIT_FORMAT_VERSION
-            || !transaction::valid_content_digest(&self.result_digest)
-        {
+        let format_matches = match self.binding.operation {
+            MutationOperation::Create | MutationOperation::Update => {
+                self.format_version == AUDIT_FORMAT_VERSION
+            }
+            MutationOperation::Forget => self.format_version == FORGET_AUDIT_FORMAT_VERSION,
+        };
+        if !format_matches || !transaction::valid_content_digest(&self.result_digest) {
             return Err(StoreError::InvalidTransaction);
         }
         Ok(())
@@ -356,17 +447,17 @@ impl MutationArtifacts {
         previous_revision: Option<Revision>,
         record: MemoryRecord,
     ) -> Result<Self, StoreError> {
-        let result = DurableMutationResult {
+        let result = DurableMutationResult::Record(Box::new(DurableRecordMutationResult {
             format_version: RESULT_FORMAT_VERSION.to_owned(),
             store_id: store_id.clone(),
             binding: binding.clone(),
             previous_revision,
             record,
-        };
+        }));
         let result_bytes = result.canonical_bytes()?;
         let result_digest = content_digest(&result_bytes);
         let receipt = DurableIdempotencyReceipt {
-            format_version: RECEIPT_FORMAT_VERSION.to_owned(),
+            format_version: receipt_format(binding.operation).to_owned(),
             store_id: store_id.clone(),
             binding: binding.clone(),
             result_digest: result_digest.clone(),
@@ -374,7 +465,61 @@ impl MutationArtifacts {
         let receipt_bytes = receipt.canonical_bytes()?;
         let receipt_digest = content_digest(&receipt_bytes);
         let audit = DurableAuditEvent {
-            format_version: AUDIT_FORMAT_VERSION.to_owned(),
+            format_version: audit_format(binding.operation).to_owned(),
+            store_id,
+            binding,
+            result_digest: result_digest.clone(),
+        };
+        let audit_bytes = audit.canonical_bytes()?;
+        let audit_digest = content_digest(&audit_bytes);
+        Ok(Self {
+            result,
+            result_bytes,
+            result_digest,
+            receipt,
+            receipt_bytes,
+            receipt_digest,
+            audit,
+            audit_bytes,
+            audit_digest,
+        })
+    }
+
+    pub(crate) fn build_forget(
+        store_id: StoreId,
+        binding: MutationBinding,
+        tombstone: &crate::tombstone::ProtectedTombstone,
+    ) -> Result<Self, StoreError> {
+        if binding.operation != MutationOperation::Forget
+            || tombstone.store_id != store_id
+            || tombstone.transaction_id != binding.transaction_id
+            || tombstone.memory_id != binding.memory_id
+            || tombstone.scope != binding.scope
+            || tombstone.revision != binding.target_revision
+            || tombstone.etag != binding.target_etag
+            || tombstone.store_revision != binding.store_revision
+            || tombstone.audit_sequence != binding.audit_sequence
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        let result = DurableMutationResult::Forget(Box::new(DurableForgetResult {
+            format_version: FORGET_RESULT_FORMAT_VERSION.to_owned(),
+            store_id: store_id.clone(),
+            binding: binding.clone(),
+            forgotten_at: tombstone.forgotten_at.clone(),
+        }));
+        let result_bytes = result.canonical_bytes()?;
+        let result_digest = content_digest(&result_bytes);
+        let receipt = DurableIdempotencyReceipt {
+            format_version: receipt_format(binding.operation).to_owned(),
+            store_id: store_id.clone(),
+            binding: binding.clone(),
+            result_digest: result_digest.clone(),
+        };
+        let receipt_bytes = receipt.canonical_bytes()?;
+        let receipt_digest = content_digest(&receipt_bytes);
+        let audit = DurableAuditEvent {
+            format_version: audit_format(binding.operation).to_owned(),
             store_id,
             binding,
             result_digest: result_digest.clone(),
@@ -416,6 +561,38 @@ impl MutationArtifacts {
             return Err(StoreError::InvalidTransaction);
         }
         Ok(artifacts)
+    }
+
+    pub(crate) fn from_forget_intent(
+        store_id: StoreId,
+        intent: &transaction::ForgetTransaction,
+        tombstone: &crate::tombstone::ProtectedTombstone,
+    ) -> Result<Self, StoreError> {
+        let artifacts =
+            Self::build_forget(store_id, intent.idempotency.binding.clone(), tombstone)?;
+        if artifacts.result_digest != intent.idempotency.result_digest
+            || artifacts.receipt_digest != intent.idempotency.receipt_digest
+            || artifacts.audit_digest != intent.idempotency.audit_digest
+            || crate::idempotency::content_digest(&tombstone.canonical_bytes()?)
+                != intent.tombstone_digest
+        {
+            return Err(StoreError::InvalidTransaction);
+        }
+        Ok(artifacts)
+    }
+}
+
+const fn receipt_format(operation: MutationOperation) -> &'static str {
+    match operation {
+        MutationOperation::Create | MutationOperation::Update => RECEIPT_FORMAT_VERSION,
+        MutationOperation::Forget => FORGET_RECEIPT_FORMAT_VERSION,
+    }
+}
+
+const fn audit_format(operation: MutationOperation) -> &'static str {
+    match operation {
+        MutationOperation::Create | MutationOperation::Update => AUDIT_FORMAT_VERSION,
+        MutationOperation::Forget => FORGET_AUDIT_FORMAT_VERSION,
     }
 }
 
@@ -567,6 +744,8 @@ pub(crate) fn validate_ledger(
     }
 
     let mut expected_results = BTreeSet::new();
+    let mut expected_tombstones = BTreeSet::new();
+    let mut expected_witnesses = BTreeSet::new();
     let mut receipts_by_sequence = BTreeMap::new();
     for receipt in receipts {
         let binding = &receipt.binding;
@@ -579,13 +758,52 @@ pub(crate) fn validate_ledger(
             return Err(StoreError::InvalidTransaction);
         }
         let result_path = result_relative(&binding.receipt_id)?;
-        let _result = read_result(root, &metadata.store_id, binding, &receipt.result_digest)?;
+        let result = read_result(root, &metadata.store_id, binding, &receipt.result_digest)?;
         verify_audit(root, &metadata.store_id, binding, &receipt.result_digest)?;
+        match (binding.operation, result) {
+            (
+                MutationOperation::Create | MutationOperation::Update,
+                DurableMutationResult::Record(_),
+            ) => {}
+            (MutationOperation::Forget, DurableMutationResult::Forget(result))
+                if metadata.format_version == crate::STORE_FORMAT_VERSION =>
+            {
+                let tombstone = crate::tombstone::read_exact(
+                    root,
+                    &metadata.store_id,
+                    &binding.scope,
+                    &binding.memory_id,
+                )?
+                .ok_or(StoreError::InvalidTransaction)?;
+                if tombstone.transaction_id != binding.transaction_id
+                    || tombstone.revision != binding.target_revision
+                    || tombstone.etag != binding.target_etag
+                    || tombstone.forgotten_at != result.forgotten_at
+                    || tombstone.store_revision != binding.store_revision
+                    || tombstone.audit_sequence != binding.audit_sequence
+                    || crate::mutation::record_id_exists_anywhere(root, &binding.memory_id)?
+                    || !expected_tombstones.insert(tombstone.relative_path())
+                    || !expected_witnesses.insert(transaction::erasure_witness_relative_for(
+                        &binding.scope,
+                        &binding.memory_id,
+                        &binding.transaction_id,
+                    )?)
+                {
+                    return Err(StoreError::InvalidTransaction);
+                }
+            }
+            _ => return Err(StoreError::InvalidTransaction),
+        }
         expected_results.insert(result_path);
     }
 
     validate_result_namespace(root, &expected_results)?;
-    validate_audit_namespace(root, metadata, &receipts_by_sequence)
+    validate_audit_namespace(root, metadata, &receipts_by_sequence)?;
+    if metadata.format_version == crate::STORE_FORMAT_VERSION {
+        validate_tombstone_namespace(root, metadata, &expected_tombstones)?;
+    }
+    validate_erasure_witness_namespace(root, &expected_witnesses)?;
+    Ok(())
 }
 
 fn read_all_receipts(
@@ -606,6 +824,9 @@ fn read_all_receipts(
             let operation = match operation_name.to_str() {
                 Some("create") => MutationOperation::Create,
                 Some("update") => MutationOperation::Update,
+                Some("forget") if metadata.format_version == crate::STORE_FORMAT_VERSION => {
+                    MutationOperation::Forget
+                }
                 _ => return Err(StoreError::InvalidTransaction),
             };
             let operation_directory =
@@ -644,6 +865,171 @@ fn read_all_receipts(
         }
     }
     Ok(receipts)
+}
+
+fn validate_tombstone_namespace(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+    expected: &BTreeSet<PathBuf>,
+) -> Result<(), StoreError> {
+    let tombstones = root.open_directory(Path::new(layout::TOMBSTONES_DIR))?;
+    let mut observed = BTreeSet::new();
+    let kinds = entry_names(&tombstones, "list tombstone scope kinds")?;
+    let expected_kinds: BTreeSet<_> = ["instance_global", "principal", "project", "session"]
+        .into_iter()
+        .collect();
+    let observed_kinds: BTreeSet<_> = kinds
+        .iter()
+        .map(|name| name.to_str().ok_or(StoreError::InvalidTransaction))
+        .collect::<Result<_, _>>()?;
+    if observed_kinds != expected_kinds {
+        return Err(StoreError::InvalidTransaction);
+    }
+    for kind_name in kinds {
+        let kind = kind_name.to_str().ok_or(StoreError::InvalidTransaction)?;
+        let kind_directory = StoreDirectory::open_child_directory(&tombstones, &kind_name)?;
+        if kind == "instance_global" {
+            collect_tombstone_shards(
+                root,
+                metadata,
+                &kind_directory,
+                Path::new(layout::TOMBSTONES_DIR).join(kind),
+                &mut observed,
+            )?;
+        } else {
+            for owner_name in entry_names(&kind_directory, "list tombstone owners")? {
+                layout::validate_owner_entry_name(&owner_name)?;
+                let owner_directory =
+                    StoreDirectory::open_child_directory(&kind_directory, &owner_name)?;
+                collect_tombstone_shards(
+                    root,
+                    metadata,
+                    &owner_directory,
+                    Path::new(layout::TOMBSTONES_DIR)
+                        .join(kind)
+                        .join(&owner_name),
+                    &mut observed,
+                )?;
+            }
+        }
+    }
+    if &observed == expected {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidTransaction)
+    }
+}
+
+fn validate_erasure_witness_namespace(
+    root: &StoreDirectory,
+    expected: &BTreeSet<PathBuf>,
+) -> Result<(), StoreError> {
+    let records = root.open_directory(Path::new("records"))?;
+    let mut observed = BTreeSet::new();
+    collect_erasure_witnesses(
+        &records,
+        PathBuf::from("records"),
+        0,
+        expected,
+        &mut observed,
+    )?;
+    if &observed == expected {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidTransaction)
+    }
+}
+
+fn collect_erasure_witnesses(
+    directory: &cap_std::fs::Dir,
+    relative: PathBuf,
+    depth: usize,
+    expected: &BTreeSet<PathBuf>,
+    observed: &mut BTreeSet<PathBuf>,
+) -> Result<(), StoreError> {
+    if depth > 4 {
+        return Err(StoreError::InvalidTransaction);
+    }
+    for name in entry_names(directory, "list forget erasure witnesses")? {
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|source| StoreError::io("inspect forget erasure witness", source))?;
+        let transaction_id = transaction::transaction_id_from_erasure_witness_name(&name);
+        let resembles_witness = name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".forgotten-"));
+        if metadata.is_symlink() {
+            if resembles_witness {
+                return Err(StoreError::UnsafePath);
+            }
+            continue;
+        }
+        if metadata.is_dir() {
+            if resembles_witness {
+                return Err(StoreError::InvalidTransaction);
+            }
+            let child = StoreDirectory::open_child_directory(directory, &name)?;
+            collect_erasure_witnesses(&child, relative.join(&name), depth + 1, expected, observed)?;
+            continue;
+        }
+        if transaction_id.is_some() {
+            let file = StoreDirectory::try_open_regular_in(directory, &name)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            StoreDirectory::validate_private_open_file(&file)?;
+            if file
+                .metadata()
+                .map_err(|source| StoreError::io("inspect forget erasure witness", source))?
+                .len()
+                != 0
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+            let witness = relative.join(&name);
+            if !expected.contains(&witness) || !observed.insert(witness) {
+                return Err(StoreError::InvalidTransaction);
+            }
+        } else if resembles_witness {
+            return Err(StoreError::InvalidTransaction);
+        }
+    }
+    Ok(())
+}
+
+fn collect_tombstone_shards(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+    owner_directory: &cap_std::fs::Dir,
+    owner_relative: PathBuf,
+    observed: &mut BTreeSet<PathBuf>,
+) -> Result<(), StoreError> {
+    for shard_name in entry_names(owner_directory, "list tombstone shards")? {
+        let shard = shard_name
+            .to_str()
+            .filter(|value| valid_hex(value, 2))
+            .ok_or(StoreError::InvalidTransaction)?;
+        let shard_directory = StoreDirectory::open_child_directory(owner_directory, &shard_name)?;
+        for file_name in entry_names(&shard_directory, "list protected tombstones")? {
+            let storage_key = layout::validate_tombstone_entry_name(&file_name)?;
+            if !storage_key.starts_with(shard) {
+                return Err(StoreError::InvalidTransaction);
+            }
+            let file = StoreDirectory::try_open_regular_in(&shard_directory, &file_name)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            StoreDirectory::validate_private_open_file(&file)?;
+            let tombstone = crate::tombstone::ProtectedTombstone::decode(file, &metadata.store_id)?;
+            let relative = owner_relative.join(shard).join(&file_name);
+            if tombstone.relative_path() != relative
+                || layout::record_storage_key(&tombstone.memory_id) != storage_key
+                || !observed.insert(relative)
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+        }
+    }
+    // Keep the capability-relative root in the signature so callers cannot
+    // accidentally replace this traversal with an ambient path walk.
+    let _ = root;
+    Ok(())
 }
 
 fn validate_result_namespace(
@@ -754,7 +1140,7 @@ fn valid_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn decode_canonical<T: DeserializeOwned + Serialize>(
+pub(crate) fn decode_canonical<T: DeserializeOwned + Serialize>(
     file: File,
     maximum: usize,
     validate: impl FnOnce(&T) -> Result<(), StoreError>,
@@ -777,7 +1163,10 @@ fn decode_canonical<T: DeserializeOwned + Serialize>(
     Ok(value)
 }
 
-fn canonical_json(value: &impl Serialize, maximum: usize) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn canonical_json(
+    value: &impl Serialize,
+    maximum: usize,
+) -> Result<Vec<u8>, StoreError> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| StoreError::InvalidTransaction)?;
     bytes.push(b'\n');
     if bytes.len() > maximum {

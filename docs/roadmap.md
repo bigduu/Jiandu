@@ -23,7 +23,7 @@ Tracking issues:
 - [#4 — singleton atomic CAS mutations and crash recovery](https://github.com/bigduu/Jiandu/issues/4)
 - [#5 — idempotency, audit, tombstones, and portable import/export](https://github.com/bigduu/Jiandu/issues/5) (parent tracker), split into:
   - [#17 — durable create/update idempotency and audit](https://github.com/bigduu/Jiandu/issues/17)
-  - [#18 — idempotent forget and protected tombstones](https://github.com/bigduu/Jiandu/issues/18)
+  - [#18 — idempotent forget and protected tombstones](https://github.com/bigduu/Jiandu/issues/18) — implemented in the canonical store core
   - [#19 — deterministic validation and portable export](https://github.com/bigduu/Jiandu/issues/19)
   - [#20 — committed import and recovery-safe backup metadata](https://github.com/bigduu/Jiandu/issues/20)
 
@@ -33,8 +33,10 @@ Tracking issues:
 - Add durable create/update idempotency receipts, private replay results,
   sequence-addressed audit events, and an explicit capability-gated store
   migration.
-- Add forget/tombstones, validation/export, import, and backup behavior through
-  their separate consistency slices.
+- Add independently authorized idempotent forget/protected tombstones with a
+  descriptor-erased, ledger-bound zero-length witness (done),
+  then validation/export, import, and backup behavior through their separate
+  consistency slices.
 - Implement validate, import/export, backup metadata, and migration hooks.
 
 Outcome: one local process can safely own durable memory without a model or MCP transport.
