@@ -20,6 +20,7 @@ pub(crate) const STORE_METADATA_FILE: &str = "store.json";
 pub(crate) const STORE_METADATA_INIT_FILE: &str = ".store.json.init";
 pub(crate) const STORE_LOCK_FILE: &str = "LOCK";
 pub(crate) const QUARANTINE_DIR: &str = "quarantine";
+pub(crate) const QUARANTINE_RECEIPTS_DIR: &str = "receipts/quarantine";
 
 const REQUIRED_DIRECTORIES: &[&str] = &[
     "records",
@@ -31,6 +32,7 @@ const REQUIRED_DIRECTORIES: &[&str] = &[
     "tombstones",
     "transactions",
     "receipts",
+    QUARANTINE_RECEIPTS_DIR,
     "audit",
     "index",
     QUARANTINE_DIR,
@@ -176,6 +178,12 @@ impl StoreDirectory {
     pub(crate) fn open_directory(&self, relative: &Path) -> Result<Dir, StoreError> {
         self.try_open_directory(relative)?
             .ok_or(StoreError::InvalidLayout)
+    }
+
+    pub(crate) fn root_directory(&self) -> Result<Dir, StoreError> {
+        self.root
+            .try_clone()
+            .map_err(|source| StoreError::io("clone store root handle", source))
     }
 
     pub(crate) fn try_open_directory(&self, relative: &Path) -> Result<Option<Dir>, StoreError> {
@@ -331,6 +339,23 @@ impl StoreDirectory {
             .map_err(|source| StoreError::io("remove store file", source))
     }
 
+    pub(crate) fn remove_regular_file_if_exists(
+        &self,
+        relative: &Path,
+    ) -> Result<bool, StoreError> {
+        let (parent, name) = split_relative_file(relative)?;
+        let Some(directory) = self.try_open_parent(&parent)? else {
+            return Ok(false);
+        };
+        let Some(_opened) = try_open_regular_at(&directory, &name, false)? else {
+            return Ok(false);
+        };
+        directory
+            .remove_file(&name)
+            .map_err(|source| StoreError::io("remove store file", source))?;
+        Ok(true)
+    }
+
     pub(crate) fn rename(&self, from: &Path, to: &Path) -> Result<(), StoreError> {
         let (from_parent, from_name) = split_relative_file(from)?;
         let (to_parent, to_name) = split_relative_file(to)?;
@@ -411,6 +436,20 @@ impl StoreDirectory {
         directory.open_dir_nofollow(name).map_err(|source| {
             secure_open_error(directory, name, "open child store directory", source)
         })
+    }
+
+    pub(crate) fn try_open_child_directory(
+        directory: &Dir,
+        name: &OsStr,
+    ) -> Result<Option<Dir>, StoreError> {
+        validate_normal_name(name)?;
+        match directory.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_symlink() => Err(StoreError::UnsafePath),
+            Ok(metadata) if !metadata.is_dir() => Err(StoreError::InvalidLayout),
+            Ok(_) => Self::open_child_directory(directory, name).map(Some),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StoreError::io("inspect child store directory", source)),
+        }
     }
 
     pub(crate) fn rename_between(
@@ -525,7 +564,46 @@ pub(crate) fn validate_initialization_state(root: &StoreDirectory) -> Result<(),
 
 pub(crate) fn validate_layout(root: &StoreDirectory) -> Result<(), StoreError> {
     for relative in REQUIRED_DIRECTORIES {
-        root.validate_private_directory(Path::new(relative))?;
+        let relative = Path::new(relative);
+        if relative == Path::new(QUARANTINE_RECEIPTS_DIR) {
+            // Stores created by the preceding v1alpha1 reader have only the
+            // `receipts/` parent. Accept that exact legacy shape without
+            // mutating it before the writer lock is held; open migrates it
+            // through `ensure_quarantine_receipt_layout` below.
+            if let Some(directory) = root.try_open_directory(relative)? {
+                validate_private_directory_handle(&directory, StoreError::InvalidLayout)?;
+            }
+        } else {
+            root.validate_private_directory(relative)?;
+        }
+    }
+    Ok(())
+}
+
+/// Idempotently extend the original v1alpha1 layout with the namespaced
+/// quarantine receipt ledger while the caller holds the exclusive store lock.
+///
+/// An interrupted create may be observed as either absent or present on the
+/// next open. Both states converge here, and an existing directory is synced
+/// again so a prior pre-sync I/O failure cannot be mistaken for durability.
+pub(crate) fn ensure_quarantine_receipt_layout(
+    root: &StoreDirectory,
+    failpoints: &crate::failpoint::Failpoints,
+) -> Result<(), StoreError> {
+    let relative = Path::new(QUARANTINE_RECEIPTS_DIR);
+    let created = root.try_open_directory(relative)?.is_none();
+    if created {
+        root.create_directory_all(relative)?;
+        failpoints.check(crate::PersistenceBoundary::QuarantineReceiptLayoutCreated)?;
+    }
+    root.validate_private_directory(relative)?;
+    root.sync_directory(relative, "sync quarantine receipt layout")?;
+    root.sync_directory(
+        Path::new("receipts"),
+        "sync quarantine receipt layout parent",
+    )?;
+    if created {
+        failpoints.check(crate::PersistenceBoundary::QuarantineReceiptLayoutDirectorySynced)?;
     }
     Ok(())
 }
@@ -570,6 +648,15 @@ pub(crate) fn validate_record_entry_name(name: &OsStr) -> Result<String, StoreEr
         return Err(StoreError::InvalidLayout);
     }
     Ok(key.to_owned())
+}
+
+pub(crate) fn validate_owner_entry_name(name: &OsStr) -> Result<(), StoreError> {
+    let name = name.to_str().ok_or(StoreError::UnsafePath)?;
+    if valid_storage_key(name) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidLayout)
+    }
 }
 
 #[cfg(test)]

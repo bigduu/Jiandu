@@ -164,7 +164,9 @@ This gives the user-visible behavior of “deep copy through this message” wit
 ├── lineages/<target-session-key>.json
 ├── tombstones/<shard>/<memory-key>.json
 ├── transactions/<transaction-id>.json
-├── receipts/<principal-shard>/<key-hash>.json
+├── receipts/
+│   ├── quarantine/quarantine-<transaction-id>.json
+│   └── <future-idempotency-layout-from-#5>/
 ├── audit/<date>/<sequence>.jsonl
 ├── index/lexical.sqlite           # derived and rebuildable
 ├── quarantine/
@@ -177,20 +179,34 @@ Sharding uses the first two characters of the memory storage key only to bound d
 
 ## Atomic mutation protocol
 
-A successful mutation follows one state machine:
+The implemented #4 create/update core follows one state machine:
 
-1. authenticate the connection and authorize the requested operation;
-2. validate the public schema and canonicalize the input;
-3. find an existing idempotency receipt and replay or reject it;
-4. load the visible record and check `expectedRevision` when applicable;
-5. validate content, scope, status transitions, relations, and quotas;
-6. write and fsync a transaction manifest;
-7. write the new record or tombstone to a same-filesystem temporary file and fsync it;
-8. atomically rename canonical files, append the audit event, and mark the transaction committed;
-9. persist the idempotency receipt before acknowledging success;
-10. update the derived index asynchronously from the committed store revision.
+1. the host resolves an `AuthorizedScope`, validates the public command, and
+   canonicalizes the target record;
+2. create checks the globally unique ID by exact private key without parsing
+   another tenant's body; update loads the exact authorized record, holds its
+   file identity, and checks `expectedRevision`;
+3. Jiandu durably publishes a strict, body/path-free versioned transaction
+   manifest;
+4. it writes and fsyncs a same-shard record temp and a root metadata temp, then
+   syncs their directories;
+5. it atomically replaces the record, syncs its shard, atomically replaces
+   `store.json`, and syncs the root;
+6. it removes and syncs the manifest before acknowledging the canonical
+   create/update result.
 
-Startup recovery examines transaction state and either completes an unambiguous committed mutation or rolls back temporary artifacts. A response is never considered successful before its canonical mutation and idempotency receipt are durable.
+Startup recovery compares both record state (base/target/ambiguous) and store
+metadata state (base/target/ambiguous). It rolls back only base/base, completes
+target/base or target/target, and fails closed for impossible or unknown
+combinations. A post-boundary error poisons the current handle until this
+startup path runs. Full byte/state/failpoint details are committed in
+[the store-format document](store-format-v1alpha1.md).
+
+Issue #5 will extend this same pre-acknowledgement transaction with durable
+idempotency receipts, audit entries, and tombstones. The current commit result
+is deliberately not called an idempotency receipt: adding a fallible
+post-commit callback would falsely claim atomicity. Derived index maintenance
+also remains asynchronous and non-authoritative in its own milestone.
 
 ## External edits
 

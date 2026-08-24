@@ -15,6 +15,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -57,6 +58,19 @@ impl AuthorizedScopes {
     pub const fn with_instance_global(mut self) -> Self {
         self.instance_global = true;
         self
+    }
+
+    /// Resolve an exact scope into a capability that mutation APIs accept.
+    /// No model-selected Principal identity can be introduced here.
+    #[must_use]
+    pub fn authorize_exact(&self, scope: &MemoryScope) -> Option<AuthorizedScope> {
+        let allowed = match scope {
+            MemoryScope::Principal { principal_id } => principal_id == &self.principal_id,
+            MemoryScope::Project { project_id } => self.project_ids.contains(project_id),
+            MemoryScope::Session { session_id } => self.session_ids.contains(session_id),
+            MemoryScope::InstanceGlobal {} => self.instance_global,
+        };
+        allowed.then(|| AuthorizedScope(scope.clone()))
     }
 
     fn all_scopes(&self) -> Vec<MemoryScope> {
@@ -110,6 +124,17 @@ impl AuthorizedScopes {
     }
 }
 
+/// Host-authorized exact mutation scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedScope(MemoryScope);
+
+impl AuthorizedScope {
+    #[must_use]
+    pub fn as_scope(&self) -> &MemoryScope {
+        &self.0
+    }
+}
+
 /// One result observed at an authoritative store watermark.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoreRead<T> {
@@ -118,6 +143,33 @@ pub struct StoreRead<T> {
 }
 
 pub type StoreWatermark = StoreRevision;
+
+/// Construction options used by deterministic fault-injection tests.
+/// Production callers should use `Default` or the shorter `open`/`initialize`
+/// constructors.
+#[derive(Clone, Default)]
+pub struct StoreOptions {
+    pub(crate) failpoints: crate::failpoint::Failpoints,
+    pub(crate) forced_unsupported_durability: Option<&'static str>,
+}
+
+impl StoreOptions {
+    #[must_use]
+    pub fn with_failpoint_injector(injector: Arc<dyn crate::PersistenceFailpointInjector>) -> Self {
+        Self {
+            failpoints: crate::failpoint::Failpoints::new(injector),
+            forced_unsupported_durability: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_forced_unsupported_durability(capability: &'static str) -> Self {
+        Self {
+            failpoints: crate::failpoint::Failpoints::default(),
+            forced_unsupported_durability: Some(capability),
+        }
+    }
+}
 
 /// Path-free receipt for an explicit operator quarantine action.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,9 +180,13 @@ pub struct QuarantineReceipt {
 
 /// Exclusively owned handle to one supported canonical store.
 pub struct CanonicalStore {
-    root: layout::StoreDirectory,
-    metadata: StoreMetadata,
-    _lock: crate::lock::StoreLock,
+    pub(crate) root: layout::StoreDirectory,
+    pub(crate) metadata: StoreMetadata,
+    pub(crate) lock: crate::lock::StoreLock,
+    pub(crate) failpoints: crate::failpoint::Failpoints,
+    pub(crate) poisoned: bool,
+    pub(crate) quarantine_receipts: Vec<QuarantineReceipt>,
+    pub(crate) forced_unsupported_durability: Option<&'static str>,
 }
 
 impl fmt::Debug for CanonicalStore {
@@ -148,6 +204,14 @@ impl CanonicalStore {
     pub fn initialize(
         data_dir: impl AsRef<Path>,
         owner: crate::LockOwner,
+    ) -> Result<Self, StoreError> {
+        Self::initialize_with_options(data_dir, owner, StoreOptions::default())
+    }
+
+    pub fn initialize_with_options(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+        options: StoreOptions,
     ) -> Result<Self, StoreError> {
         let root = layout::StoreDirectory::open(data_dir.as_ref(), true)?;
         if root.regular_file_exists(Path::new(layout::STORE_METADATA_FILE))? {
@@ -170,10 +234,19 @@ impl CanonicalStore {
         commit_initial_metadata(&root)?;
         root.validate_ambient_identity()?;
         lock.validate_ownership(&root)?;
+        crate::durability::probe(
+            &root,
+            &options.failpoints,
+            options.forced_unsupported_durability,
+        )?;
         Ok(Self {
             root,
             metadata,
-            _lock: lock,
+            lock,
+            failpoints: options.failpoints,
+            poisoned: false,
+            quarantine_receipts: Vec::new(),
+            forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }
 
@@ -182,6 +255,14 @@ impl CanonicalStore {
     /// The format is inspected before opening or updating `LOCK`, so a future
     /// store format fails closed without mutating any entry in the directory.
     pub fn open(data_dir: impl AsRef<Path>, owner: crate::LockOwner) -> Result<Self, StoreError> {
+        Self::open_with_options(data_dir, owner, StoreOptions::default())
+    }
+
+    pub fn open_with_options(
+        data_dir: impl AsRef<Path>,
+        owner: crate::LockOwner,
+        options: StoreOptions,
+    ) -> Result<Self, StoreError> {
         let root = layout::StoreDirectory::open(data_dir.as_ref(), false)?;
         root.validate_private_root()?;
         let (metadata, original_metadata_bytes) = read_store_metadata(&root)?;
@@ -198,10 +279,21 @@ impl CanonicalStore {
         }
         root.validate_ambient_identity()?;
         lock.publish_owner(&root, &owner)?;
+        layout::ensure_quarantine_receipt_layout(&root, &options.failpoints)?;
+        let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
+        crate::durability::probe(
+            &root,
+            &options.failpoints,
+            options.forced_unsupported_durability,
+        )?;
         Ok(Self {
             root,
-            metadata,
-            _lock: lock,
+            metadata: recovered.metadata,
+            lock,
+            failpoints: options.failpoints,
+            poisoned: false,
+            quarantine_receipts: recovered.quarantine_receipts,
+            forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }
 
@@ -210,9 +302,23 @@ impl CanonicalStore {
         &self.metadata.store_id
     }
 
-    #[must_use]
-    pub const fn watermark(&self) -> StoreWatermark {
-        self.metadata.store_revision
+    /// Return the authoritative in-memory watermark only while this handle is
+    /// still safe to serve. A post-boundary failure requires reopen/recovery
+    /// instead of exposing a potentially stale value.
+    pub fn watermark(&self) -> Result<StoreWatermark, StoreError> {
+        self.validate_ownership()?;
+        Ok(self.metadata.store_revision)
+    }
+
+    /// Re-run the same path-free filesystem capability probe required before
+    /// startup readiness.
+    pub fn doctor(&self) -> Result<crate::StoreDoctorReport, StoreError> {
+        self.validate_ownership()?;
+        crate::durability::probe(
+            &self.root,
+            &self.failpoints,
+            self.forced_unsupported_durability,
+        )
     }
 
     /// Read exactly one record visible in `authorized`.
@@ -244,7 +350,7 @@ impl CanonicalStore {
             &layout::record_shard(id),
         )?;
         Ok(StoreRead {
-            store_revision: self.watermark(),
+            store_revision: self.watermark()?,
             result: record,
         })
     }
@@ -264,7 +370,7 @@ impl CanonicalStore {
             Some(cursor) => crate::cursor::decode(
                 cursor,
                 &self.metadata.store_id,
-                self.watermark(),
+                self.watermark()?,
                 &fingerprint,
             )?,
             None => 0,
@@ -295,7 +401,7 @@ impl CanonicalStore {
         let next_cursor = if has_more {
             Some(crate::cursor::encode(
                 &self.metadata.store_id,
-                self.watermark(),
+                self.watermark()?,
                 &fingerprint,
                 end,
             )?)
@@ -316,7 +422,7 @@ impl CanonicalStore {
             reason: InvalidRecordReason::ValidationFailed,
         })?;
         Ok(StoreRead {
-            store_revision: self.watermark(),
+            store_revision: self.watermark()?,
             result,
         })
     }
@@ -354,24 +460,46 @@ impl CanonicalStore {
         }
 
         let quarantine_token = Uuid::new_v4().simple().to_string();
-        let destination_name =
-            format!("{}.{}.md", layout::record_storage_key(id), quarantine_token);
+        let source_digest = crate::transaction::raw_file_digest(
+            file.try_clone()
+                .map_err(|source| StoreError::io("clone quarantine source handle", source))?,
+        )?;
+        let manifest = crate::transaction::TransactionManifest::for_quarantine(
+            self.metadata.store_id.clone(),
+            crate::transaction::QuarantineTransaction {
+                memory_id: id.clone(),
+                scope: scope.clone(),
+                quarantine_token: quarantine_token.clone(),
+                source_digest,
+            },
+        )?;
+        let destination = match &manifest.intent {
+            crate::transaction::TransactionIntent::Quarantine(quarantine) => {
+                crate::transaction::quarantine_relative(quarantine)?
+            }
+            crate::transaction::TransactionIntent::Record(_) => {
+                return Err(StoreError::InvalidTransaction);
+            }
+        };
+        let destination_name = destination
+            .file_name()
+            .ok_or(StoreError::InvalidTransaction)?;
         let quarantine_directory = self
             .root
             .open_directory(Path::new(layout::QUARANTINE_DIR))?;
-        if layout::StoreDirectory::try_open_regular_in(
-            &quarantine_directory,
-            OsStr::new(&destination_name),
-        )?
-        .is_some()
+        if layout::StoreDirectory::try_open_regular_in(&quarantine_directory, destination_name)?
+            .is_some()
         {
             return Err(StoreError::InvalidLayout);
         }
+
+        self.poisoned = true;
+        crate::transaction::persist_manifest(&self.root, &manifest, &self.failpoints)?;
         layout::StoreDirectory::rename_between(
             &source_directory,
             source_name,
             &quarantine_directory,
-            OsStr::new(&destination_name),
+            destination_name,
         )
         .map_err(|error| match error {
             StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
@@ -379,10 +507,10 @@ impl CanonicalStore {
             }
             other => other,
         })?;
-        let moved = layout::StoreDirectory::try_open_regular_in(
-            &quarantine_directory,
-            OsStr::new(&destination_name),
-        );
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineRenamed)?;
+        let moved =
+            layout::StoreDirectory::try_open_regular_in(&quarantine_directory, destination_name);
         let moved_matches = match moved.as_ref() {
             Ok(Some(moved)) => layout::FileIdentity::from_file(moved)? == source_identity,
             Ok(None) | Err(_) => false,
@@ -394,13 +522,38 @@ impl CanonicalStore {
             if layout::StoreDirectory::try_open_regular_in(&source_directory, source_name)?
                 .is_none()
             {
-                let _ = layout::StoreDirectory::rename_between(
+                layout::StoreDirectory::rename_between(
                     &quarantine_directory,
-                    OsStr::new(&destination_name),
+                    destination_name,
                     &source_directory,
                     source_name,
-                );
+                )?;
             }
+            let source_restored =
+                layout::StoreDirectory::try_open_regular_in(&source_directory, source_name)?
+                    .is_some();
+            let destination_removed = layout::StoreDirectory::try_open_regular_in(
+                &quarantine_directory,
+                destination_name,
+            )?
+            .is_none();
+            if !source_restored || !destination_removed {
+                return Err(StoreError::UnsafePath);
+            }
+            layout::StoreDirectory::sync_open_directory(
+                &quarantine_directory,
+                "sync quarantine race rollback",
+            )?;
+            layout::StoreDirectory::sync_open_directory(
+                &source_directory,
+                "sync quarantine source race rollback",
+            )?;
+            crate::transaction::remove_manifest(
+                &self.root,
+                &manifest,
+                &crate::failpoint::Failpoints::default(),
+            )?;
+            self.poisoned = false;
             return Err(StoreError::UnsafePath);
         }
         // Keep the verified source handle alive until identity has been
@@ -410,6 +563,8 @@ impl CanonicalStore {
             &quarantine_directory,
             "sync quarantine directory",
         )?;
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineDirectorySynced)?;
         // Persist the destination entry before the source removal. A crash
         // between directory fsyncs can then leave a duplicate, not lose the
         // only copy of an invalid operator-managed record.
@@ -417,10 +572,86 @@ impl CanonicalStore {
             &source_directory,
             "sync source shard directory",
         )?;
-        Ok(QuarantineReceipt {
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineSourceDirectorySynced)?;
+        let durable = crate::transaction::DurableQuarantineReceipt::from_manifest(&manifest)?;
+        crate::transaction::persist_quarantine_receipt(&self.root, &durable, &self.failpoints)?;
+        crate::transaction::remove_manifest(&self.root, &manifest, &self.failpoints)?;
+        let receipt = QuarantineReceipt {
             memory_id: id.clone(),
             quarantine_token,
-        })
+        };
+        self.quarantine_receipts.push(receipt.clone());
+        self.quarantine_receipts.sort_by(|left, right| {
+            left.memory_id
+                .cmp(&right.memory_id)
+                .then_with(|| left.quarantine_token.cmp(&right.quarantine_token))
+        });
+        self.poisoned = false;
+        Ok(receipt)
+    }
+
+    /// Durable, path-free quarantine receipts awaiting operator acknowledgement.
+    pub fn pending_quarantine_receipts(&self) -> Result<&[QuarantineReceipt], StoreError> {
+        self.validate_ownership()?;
+        Ok(&self.quarantine_receipts)
+    }
+
+    /// Acknowledge a durable quarantine receipt without deleting the
+    /// quarantined bytes. This is an operator receipt lifecycle, not the
+    /// idempotent mutation receipt contract owned by Issue #5.
+    pub fn acknowledge_quarantine_receipt(
+        &mut self,
+        memory_id: &MemoryId,
+        quarantine_token: &str,
+    ) -> Result<(), StoreError> {
+        self.validate_ownership()?;
+        let directory = self
+            .root
+            .open_directory(Path::new(layout::QUARANTINE_RECEIPTS_DIR))?;
+        let entries = directory
+            .entries()
+            .map_err(|source| StoreError::io("list quarantine receipts", source))?;
+        let mut match_path = None;
+        for entry in entries {
+            let entry =
+                entry.map_err(|source| StoreError::io("read quarantine receipt", source))?;
+            let name = entry.file_name();
+            let Some(transaction_id) = crate::transaction::transaction_id_from_receipt_name(&name)
+            else {
+                return Err(StoreError::InvalidTransaction);
+            };
+            let file = layout::StoreDirectory::try_open_regular_in(&directory, &name)?
+                .ok_or(StoreError::InvalidTransaction)?;
+            layout::StoreDirectory::validate_private_open_file(&file)?;
+            let receipt = crate::transaction::DurableQuarantineReceipt::decode(
+                file,
+                &transaction_id,
+                &self.metadata.store_id,
+            )?;
+            if &receipt.memory_id == memory_id && receipt.quarantine_token == quarantine_token {
+                if match_path.is_some() {
+                    return Err(StoreError::InvalidTransaction);
+                }
+                match_path = Some(Path::new(layout::QUARANTINE_RECEIPTS_DIR).join(name));
+            }
+        }
+        let path = match_path.ok_or(StoreError::NotFound)?;
+        self.poisoned = true;
+        self.root.remove_regular_file(&path)?;
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineReceiptAcknowledgementRemoved)?;
+        self.root.sync_directory(
+            Path::new(layout::QUARANTINE_RECEIPTS_DIR),
+            "sync quarantine receipt acknowledgement",
+        )?;
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineReceiptAcknowledgementDirectorySynced)?;
+        self.quarantine_receipts.retain(|receipt| {
+            &receipt.memory_id != memory_id || receipt.quarantine_token != quarantine_token
+        });
+        self.poisoned = false;
+        Ok(())
     }
 
     fn scan_scope(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>, StoreError> {
@@ -474,7 +705,7 @@ impl CanonicalStore {
         Ok(records)
     }
 
-    fn read_record_file(
+    pub(crate) fn read_record_file(
         file: File,
         expected_scope: &MemoryScope,
         expected_id: Option<&MemoryId>,
@@ -520,9 +751,12 @@ impl CanonicalStore {
         Ok(record)
     }
 
-    fn validate_ownership(&self) -> Result<(), StoreError> {
+    pub(crate) fn validate_ownership(&self) -> Result<(), StoreError> {
+        if self.poisoned {
+            return Err(StoreError::RecoveryRequired);
+        }
         self.root.validate_ambient_identity()?;
-        self._lock.validate_ownership(&self.root)
+        self.lock.validate_ownership(&self.root)
     }
 }
 
@@ -580,7 +814,7 @@ fn commit_initial_metadata(root: &layout::StoreDirectory) -> Result<(), StoreErr
     root.sync_root("sync committed store metadata")
 }
 
-fn read_store_metadata(
+pub(crate) fn read_store_metadata(
     root: &layout::StoreDirectory,
 ) -> Result<(StoreMetadata, Vec<u8>), StoreError> {
     let file = root

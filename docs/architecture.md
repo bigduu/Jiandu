@@ -140,14 +140,30 @@ On startup, Jiandu:
 
 1. resolves and validates the configured data directory;
 2. acquires an exclusive lock and records instance metadata;
-3. checks the store format and completes or rolls back interrupted transactions;
-4. validates index compatibility and schedules a rebuild if needed;
-5. starts the authenticated MCP transport;
-6. reports readiness only after the store is safe to serve.
+3. checks the store format and deterministically completes or rolls back the
+   single interrupted transaction, failing closed on ambiguous state;
+4. probes required file-sync and same-filesystem atomic-replace behavior and
+   fails closed if the filesystem cannot provide it;
+5. validates index compatibility and schedules a rebuild if needed;
+6. starts the authenticated MCP transport;
+7. reports readiness only after the store is safe to serve.
 
-Every successful mutation receives a monotonically increasing record revision and an opaque ETag. Retried requests with the same principal, operation, and idempotency key return the original result. Conflicting reuse of a key is rejected. Updates with a stale expected revision fail without overwriting newer data.
+The implemented canonical create/update core gives every success a monotonically
+increasing record revision, a content-bound opaque ETag, and one new store
+watermark. Updates with a stale expected revision fail without overwriting
+newer data and disclose only the current revision. Record replacement and the
+watermark are reconciled as one two-file transaction. Issue #5 adds the
+pre-acknowledgement receipt/audit extension required for retried requests with
+the same principal, operation, and idempotency key to return the original
+result and for conflicting key reuse to be rejected.
 
-Shutdown stops accepting new mutations, drains bounded in-flight work, flushes durable receipts, and releases the store lock. Crash recovery relies on write-ahead transaction manifests, same-filesystem temporary files, atomic rename, and startup reconciliation.
+Shutdown stops accepting new mutations, drains bounded in-flight work, and
+releases the store lock. Once Issue #5 lands it also flushes its durable
+idempotency/audit receipts. Crash recovery already relies on strict write-ahead
+transaction manifests, same-filesystem temporary files, file and directory
+sync boundaries, atomic replacement, and startup reconciliation. Any failure
+after write-ahead begins poisons the current handle so stale in-memory metadata
+cannot be served before restart recovery.
 
 ## Security model
 
@@ -169,7 +185,7 @@ Shutdown stops accepting new mutations, drains bounded in-flight work, flushes d
 | Revision conflict | Mutation fails with the current revision metadata. | Re-read, reconcile, and retry with a new idempotency key. |
 | Index missing/corrupt | Mark index degraded and rebuild from canonical records. | Basic exact reads remain available; search capability reports degradation. |
 | Record invalid | Fail the read with path-free validation diagnostics; move it only through an explicit operator quarantine action. | Do not inject the invalid record; ask an operator to validate/quarantine it. |
-| Client disconnects | Complete or roll back according to the transaction boundary. | Retry safely with the same idempotency key. |
+| Client disconnects | Complete or roll back canonical state according to the transaction boundary. | Until #5, re-read and reconcile an ambiguous result; after durable receipts land, retry safely with the same idempotency key. |
 
 ## Observability
 

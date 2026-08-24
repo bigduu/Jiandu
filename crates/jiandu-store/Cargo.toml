@@ -1,6 +1,6 @@
 [package]
 name = "jiandu-store"
-description = "Exclusive canonical filesystem store and validated reads for Jiandu"
+description = "Exclusive canonical store with validated reads, atomic CAS, and recovery for Jiandu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

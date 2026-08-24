@@ -1,6 +1,6 @@
 //! Stable, path-free storage diagnostics.
 
-use jiandu_core::MemoryId;
+use jiandu_core::{MemoryId, Revision};
 use std::fmt;
 use std::io;
 
@@ -23,6 +23,13 @@ pub enum StoreErrorCode {
     InvalidCursor,
     StaleCursor,
     RecordIsValid,
+    AlreadyExists,
+    RevisionConflict,
+    RevisionOverflow,
+    RecoveryRequired,
+    InvalidTransaction,
+    UnsupportedDurability,
+    InjectedFailure,
     Io,
 }
 
@@ -70,6 +77,21 @@ pub enum StoreError {
     RecordIsValid {
         id: MemoryId,
     },
+    AlreadyExists {
+        id: MemoryId,
+    },
+    RevisionConflict {
+        current_revision: Revision,
+    },
+    RevisionOverflow,
+    RecoveryRequired,
+    InvalidTransaction,
+    UnsupportedDurability {
+        capability: &'static str,
+    },
+    InjectedFailure {
+        boundary: crate::PersistenceBoundary,
+    },
     Io {
         operation: &'static str,
         source: io::Error,
@@ -95,6 +117,13 @@ impl StoreError {
             Self::InvalidCursor => StoreErrorCode::InvalidCursor,
             Self::StaleCursor => StoreErrorCode::StaleCursor,
             Self::RecordIsValid { .. } => StoreErrorCode::RecordIsValid,
+            Self::AlreadyExists { .. } => StoreErrorCode::AlreadyExists,
+            Self::RevisionConflict { .. } => StoreErrorCode::RevisionConflict,
+            Self::RevisionOverflow => StoreErrorCode::RevisionOverflow,
+            Self::RecoveryRequired => StoreErrorCode::RecoveryRequired,
+            Self::InvalidTransaction => StoreErrorCode::InvalidTransaction,
+            Self::UnsupportedDurability { .. } => StoreErrorCode::UnsupportedDurability,
+            Self::InjectedFailure { .. } => StoreErrorCode::InjectedFailure,
             Self::Io { .. } => StoreErrorCode::Io,
         }
     }
@@ -124,7 +153,7 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidLayout => formatter.write_str("invalid Jiandu store layout"),
             Self::UnsafePath => formatter.write_str("unsafe Jiandu store path"),
-            Self::InvalidRequest => formatter.write_str("invalid Jiandu store read request"),
+            Self::InvalidRequest => formatter.write_str("invalid Jiandu store request"),
             Self::InvalidRecord {
                 id: Some(id),
                 reason,
@@ -143,6 +172,24 @@ impl fmt::Display for StoreError {
                     formatter,
                     "memory record {id} is valid and was not quarantined"
                 )
+            }
+            Self::AlreadyExists { id } => write!(formatter, "memory record {id} already exists"),
+            Self::RevisionConflict { current_revision } => write!(
+                formatter,
+                "memory revision conflict; current revision is {}",
+                current_revision.get()
+            ),
+            Self::RevisionOverflow => formatter.write_str("memory or store revision overflow"),
+            Self::RecoveryRequired => formatter.write_str("store handle requires restart recovery"),
+            Self::InvalidTransaction => formatter.write_str("invalid or ambiguous transaction"),
+            Self::UnsupportedDurability { capability } => {
+                write!(
+                    formatter,
+                    "required durability capability is unavailable: {capability}"
+                )
+            }
+            Self::InjectedFailure { boundary } => {
+                write!(formatter, "injected failure after {boundary:?}")
             }
             Self::Io { operation, .. } => write!(formatter, "store I/O failed during {operation}"),
         }
