@@ -25,8 +25,8 @@ Tracking issues:
 
 - Implement data-directory initialization and exclusive ownership.
 - Add canonical record serialization, validation, and scope-safe paths.
-- Implement atomic create/update/forget with expected revisions.
-- Add durable idempotency receipts, audit events, tombstones, and crash recovery.
+- Implement atomic create/update CAS with versioned manifests, durability diagnostics, and deterministic crash recovery.
+- Add durable idempotency receipts, audit events, forget/tombstones, and portable import/export.
 - Implement validate, import/export, backup metadata, and migration hooks.
 
 Outcome: one local process can safely own durable memory without a model or MCP transport.

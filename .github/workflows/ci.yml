@@ -24,7 +24,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Validate locked workspace metadata
-        run: cargo metadata --locked --no-deps --format-version 1
+        run: cargo metadata --locked --all-features --format-version 1
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests and schema drift checks

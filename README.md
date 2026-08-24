@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and the first canonical-store slice (exclusive ownership plus validated reads). Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and a canonical-store core with exclusive ownership, validated reads, atomic create/update CAS, durability diagnostics, and deterministic crash recovery. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -39,7 +39,7 @@ Jiandu therefore separates three responsibilities:
 - Public contracts use opaque IDs, never workspace paths as identity.
 - Principal, Project, Session, and operator-global scopes remain distinct.
 - Read and write results are structured data, not pre-rendered prompt instructions.
-- Mutations use expected revisions and idempotency keys.
+- Canonical mutations use expected-revision CAS. Public mutation contracts carry idempotency keys; durable replay receipts are the next store slice.
 - Forget and purge operations are explicit, authorized, and auditable.
 - Jiandu remains useful without an LLM provider; extraction and reranking are optional later capabilities.
 - If Jiandu is unavailable, an agent can continue without recalled memory according to host policy.
@@ -71,9 +71,9 @@ crates/jiandu-core/                  agent-neutral domain types and contracts
   fixtures/v1alpha1/                 canonical valid and invalid conformance data
   schemas/v1alpha1/                  checked JSON Schemas generated from Rust types
   src/                               ordinary structs, enums, newtypes, and validation
-crates/jiandu-store/                 exclusive filesystem ownership and validated reads
+crates/jiandu-store/                 exclusive ownership, reads, atomic CAS, and recovery
   fixtures/v1alpha1/                 canonical store-document conformance data
-  src/                               private paths, strict codec, lock, cursor, and read APIs
+  src/                               private paths, strict codec, lock, reads, transactions, and recovery
 ```
 
 Future index, MCP adapter, daemon, and CLI crates are introduced only when their
@@ -86,7 +86,7 @@ Run the contract gates from the repository root:
 
 ```shell
 cargo fmt --all -- --check
-cargo metadata --locked --no-deps --format-version 1
+cargo metadata --locked --all-features --format-version 1
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
