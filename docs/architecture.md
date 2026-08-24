@@ -93,14 +93,17 @@ authority fingerprint, normalized query/filters, store/index watermarks, and a
 host-held HMAC key; an authorization change invalidates an old cursor instead
 of widening it.
 
-The fixed private `index/lexical.sqlite` file is closed before a
-same-filesystem, cross-platform atomic replacement. Missing, corrupt,
-incompatible, or stale images produce a path-free degraded diagnostic and can
-be rebuilt. They never block `CanonicalStore::get` or deterministic list
-reads. Embeddings and semantic reranking may be added behind optional
-capabilities later; they cannot become required for basic operation. The
-format, weights, tokenizer, cursor boundary, and compatibility policy are in
-[Lexical Index Format `v1alpha1`](index-format-v1alpha1.md).
+The fixed private `index/lexical.sqlite` file is published through a held
+directory capability: SQLite closes and syncs the build image, the index copies
+it into a create-new same-directory temporary, rechecks target identity, and
+uses a capability-relative cross-platform atomic rename. Ambient directory or
+target replacement races fail without redirecting writes. Missing, corrupt,
+incompatible, or stale images produce a path-free degraded diagnostic under
+the operator-only index capability and can be rebuilt. They never block
+`CanonicalStore::get` or deterministic list reads. Embeddings and semantic
+reranking may be added behind optional capabilities later; they cannot become
+required for basic operation. The format, weights, tokenizer, cursor boundary,
+and compatibility policy are in [Lexical Index Format `v1alpha1`](index-format-v1alpha1.md).
 
 ### MCP adapter
 

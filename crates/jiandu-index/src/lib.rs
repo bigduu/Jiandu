@@ -11,6 +11,7 @@ use jiandu_store::{
 };
 
 mod cursor;
+mod directory;
 mod error;
 mod format;
 mod index;

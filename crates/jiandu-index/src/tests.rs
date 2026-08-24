@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[derive(Clone)]
@@ -99,7 +100,8 @@ fn rebuild_search_is_ranked_filtered_paginated_and_scope_safe() {
     ];
     let reader = FixtureReader::new(records);
     let directory = TempDir::new().expect("temporary index directory");
-    let index = LexicalIndex::new(directory.path().join("index"));
+    let index_directory = private_index_directory(directory.path());
+    let index = LexicalIndex::new(&index_directory);
     let authority = AuthorizedScopes::new(principal.clone()).with_project(project.clone());
     let admin = index_admin(&authority, &principal);
     let report = index.rebuild(&reader, &admin).expect("rebuild succeeds");
@@ -249,11 +251,11 @@ fn equal_scores_use_memory_id_ascending_as_the_final_tie_breaker() {
         ),
     ]);
     let root = TempDir::new().expect("temporary root");
-    let index = LexicalIndex::new(root.path().join("index"));
+    let index_directory = private_index_directory(root.path());
+    let index = LexicalIndex::new(&index_directory);
     let authority = AuthorizedScopes::new(principal.clone());
-    index
-        .rebuild(&reader, &index_admin(&authority, &principal))
-        .expect("rebuild");
+    let admin = index_admin(&authority, &principal);
+    index.rebuild(&reader, &admin).expect("rebuild");
     let query = authority
         .authorize_index_query(&[ScopeSelector::Principal {}])
         .expect("query capability");
@@ -274,7 +276,7 @@ fn equal_scores_use_memory_id_ascending_as_the_final_tie_breaker() {
         .expect("delete complete disposable index");
     assert_eq!(
         index
-            .diagnose(&reader)
+            .diagnose(&reader, &admin)
             .expect("missing after delete")
             .health,
         IndexHealth::Degraded {
@@ -282,7 +284,7 @@ fn equal_scores_use_memory_id_ascending_as_the_final_tie_breaker() {
         }
     );
     index
-        .rebuild(&reader, &index_admin(&authority, &principal))
+        .rebuild(&reader, &admin)
         .expect("rebuild after complete deletion");
     assert_eq!(
         collect_principal_pages(&index, &reader, &query, &key),
@@ -358,9 +360,12 @@ fn diagnostics_expose_source_unavailable_without_touching_the_index() {
 
     let root = TempDir::new().expect("temporary root");
     let index = LexicalIndex::new(root.path().join("index"));
+    let principal = principal_id("prn_unavailable_diagnostics");
+    let authority = AuthorizedScopes::new(principal.clone());
+    let admin = index_admin(&authority, &principal);
     assert_eq!(
         index
-            .diagnose(&UnavailableReader)
+            .diagnose(&UnavailableReader, &admin)
             .expect("path-free source diagnostic")
             .health,
         IndexHealth::Degraded {
@@ -421,14 +426,17 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
         &["stable"],
     )]);
     let directory = TempDir::new().expect("temporary index directory");
-    let index_directory = directory.path().join("index");
+    let index_directory = private_index_directory(directory.path());
     let path = index_directory.join("lexical.sqlite");
     let index = LexicalIndex::new(&index_directory);
     let authority = AuthorizedScopes::new(principal.clone());
     let admin = index_admin(&authority, &principal);
 
     assert_eq!(
-        index.diagnose(&reader).expect("missing diagnostic").health,
+        index
+            .diagnose(&reader, &admin)
+            .expect("missing diagnostic")
+            .health,
         IndexHealth::Degraded {
             reason: IndexDegradedReason::Missing
         }
@@ -443,13 +451,16 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
     let second = fs::read(&path).expect("second index bytes");
     assert_eq!(first, second, "fresh rebuilds must be byte-identical");
     assert!(matches!(
-        index.diagnose(&reader).expect("ready diagnostic").health,
+        index
+            .diagnose(&reader, &admin)
+            .expect("ready diagnostic")
+            .health,
         IndexHealth::Ready(_)
     ));
     let restarted = LexicalIndex::new(&index_directory);
     assert!(matches!(
         restarted
-            .diagnose(&reader)
+            .diagnose(&reader, &admin)
             .expect("restart diagnostic")
             .health,
         IndexHealth::Ready(_)
@@ -462,7 +473,7 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
     drop(connection);
     assert_eq!(
         index
-            .diagnose(&reader)
+            .diagnose(&reader, &admin)
             .expect("extra-column diagnostic")
             .health,
         IndexHealth::Degraded {
@@ -488,7 +499,7 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
     drop(connection);
     assert_eq!(
         index
-            .diagnose(&reader)
+            .diagnose(&reader, &admin)
             .expect("constraint diagnostic")
             .health,
         IndexHealth::Degraded {
@@ -509,7 +520,7 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
     drop(connection);
     assert_eq!(
         index
-            .diagnose(&reader)
+            .diagnose(&reader, &admin)
             .expect("altered-index diagnostic")
             .health,
         IndexHealth::Degraded {
@@ -526,7 +537,10 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
         .expect("tamper index version");
     drop(connection);
     assert_eq!(
-        index.diagnose(&reader).expect("version diagnostic").health,
+        index
+            .diagnose(&reader, &admin)
+            .expect("version diagnostic")
+            .health,
         IndexHealth::Degraded {
             reason: IndexDegradedReason::IncompatibleVersion
         }
@@ -537,7 +551,10 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
 
     reader.current_revision.set(StoreRevision(8));
     assert_eq!(
-        index.diagnose(&reader).expect("stale diagnostic").health,
+        index
+            .diagnose(&reader, &admin)
+            .expect("stale diagnostic")
+            .health,
         IndexHealth::Degraded {
             reason: IndexDegradedReason::Stale
         }
@@ -547,7 +564,10 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
     bytes.truncate(bytes.len() / 2);
     fs::write(&path, bytes).expect("truncate derived index");
     assert_eq!(
-        index.diagnose(&reader).expect("corrupt diagnostic").health,
+        index
+            .diagnose(&reader, &admin)
+            .expect("corrupt diagnostic")
+            .health,
         IndexHealth::Degraded {
             reason: IndexDegradedReason::Corrupt
         }
@@ -597,7 +617,7 @@ fn canonical_store_rebuild_forget_and_degraded_index_leave_exact_reads_independe
         "Project alpha body",
     );
 
-    let derived_directory = index_directory.path().join("index");
+    let derived_directory = private_index_directory(index_directory.path());
     let index = LexicalIndex::new(&derived_directory);
     let admin = index_admin(&authority, &principal);
     let report = index.rebuild(&store, &admin).expect("real store rebuild");
@@ -672,7 +692,10 @@ fn canonical_store_rebuild_forget_and_degraded_index_leave_exact_reads_independe
         StoreErrorCode::NotFound
     );
     assert_eq!(
-        index.diagnose(&store).expect("stale after forget").health,
+        index
+            .diagnose(&store, &admin)
+            .expect("stale after forget")
+            .health,
         IndexHealth::Degraded {
             reason: IndexDegradedReason::Stale
         }
@@ -700,6 +723,7 @@ fn canonical_store_rebuild_forget_and_degraded_index_leave_exact_reads_independe
 #[cfg(unix)]
 #[test]
 fn rebuild_never_chmods_shared_parent_follows_symlink_parent_or_overwrites_other_names() {
+    use crate::directory::{TestHookPoint, install_test_hook};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     let principal = principal_id("prn_path_safety");
@@ -707,6 +731,16 @@ fn rebuild_never_chmods_shared_parent_follows_symlink_parent_or_overwrites_other
     let authority = AuthorizedScopes::new(principal.clone());
     let admin = index_admin(&authority, &principal);
     let root = TempDir::new().expect("temporary root");
+
+    let missing = root.path().join("missing-index");
+    assert!(matches!(
+        LexicalIndex::new(&missing).rebuild(&reader, &admin),
+        Err(IndexError::InvalidRequest)
+    ));
+    assert!(
+        !missing.exists(),
+        "index never creates an ambient directory"
+    );
 
     let shared = root.path().join("shared");
     fs::create_dir(&shared).expect("shared directory");
@@ -777,6 +811,83 @@ fn rebuild_never_chmods_shared_parent_follows_symlink_parent_or_overwrites_other
         fs::read(&external).expect("hardlinked external bytes"),
         b"external bytes must survive"
     );
+
+    let raced = root.path().join("raced-index");
+    fs::create_dir(&raced).expect("race directory");
+    fs::set_permissions(&raced, fs::Permissions::from_mode(0o700))
+        .expect("race directory permissions");
+    let displaced = root.path().join("displaced-index");
+    let external_directory = root.path().join("external-index-directory");
+    fs::create_dir(&external_directory).expect("external directory");
+    fs::set_permissions(&external_directory, fs::Permissions::from_mode(0o700))
+        .expect("external directory permissions");
+    let external_index = external_directory.join("lexical.sqlite");
+    fs::write(&external_index, b"external index bytes must survive").expect("external index bytes");
+    fs::set_permissions(&external_index, fs::Permissions::from_mode(0o600))
+        .expect("external index permissions");
+    let raced_for_hook = raced.clone();
+    let displaced_for_hook = displaced.clone();
+    let external_directory_for_hook = external_directory.clone();
+    install_test_hook(TestHookPoint::AfterDirectoryOpen, move || {
+        fs::rename(&raced_for_hook, &displaced_for_hook).expect("displace opened directory");
+        symlink(&external_directory_for_hook, &raced_for_hook)
+            .expect("replace ambient directory with symlink");
+    });
+    assert!(matches!(
+        LexicalIndex::new(&raced).rebuild(&reader, &admin),
+        Err(IndexError::InvalidRequest)
+    ));
+    assert_eq!(
+        fs::read(&external_index).expect("external index remains readable"),
+        b"external index bytes must survive"
+    );
+
+    let target_race = root.path().join("target-race-index");
+    fs::create_dir(&target_race).expect("target race directory");
+    fs::set_permissions(&target_race, fs::Permissions::from_mode(0o700))
+        .expect("target race directory permissions");
+    let target_race_index = LexicalIndex::new(&target_race);
+    target_race_index
+        .rebuild(&reader, &admin)
+        .expect("initial target race image");
+    let target_race_path = target_race.join("lexical.sqlite");
+    let target_race_path_for_hook = target_race_path.clone();
+    let external_for_hook = external.clone();
+    install_test_hook(TestHookPoint::BeforePublish, move || {
+        fs::remove_file(&target_race_path_for_hook).expect("remove original target");
+        symlink(&external_for_hook, &target_race_path_for_hook).expect("race target symlink");
+    });
+    assert!(matches!(
+        target_race_index.rebuild(&reader, &admin),
+        Err(IndexError::Degraded {
+            reason: IndexDegradedReason::Corrupt
+        })
+    ));
+    assert_eq!(
+        fs::read(&external).expect("raced external bytes"),
+        b"external bytes must survive"
+    );
+    assert!(
+        fs::read_dir(&target_race)
+            .expect("target race entries")
+            .all(|entry| !entry
+                .expect("target race entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lexical-"))
+    );
+}
+
+fn private_index_directory(root: &Path) -> PathBuf {
+    let directory = root.join("index");
+    fs::create_dir(&directory).expect("create private index directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("set private index directory permissions");
+    }
+    directory
 }
 
 fn record(

@@ -18,11 +18,15 @@ tombstones, store metadata, and the mutation ledger remain authoritative.
 - maximum image size accepted by the reader: 2 GiB;
 - maximum indexed records: 10,000.
 
-The caller configures only the private `index/` directory. `LexicalIndex` joins
-the fixed filename internally, refuses a symlink/non-directory/shared-mode
-parent, and never chmods an existing parent. On Unix the directory must be
-owner-private and the final file must be an owner-private, single-link regular
-file. These are local protection rules, not public identity.
+The caller configures only an existing private `index/` directory; the
+canonical store layout provisions it. `LexicalIndex` joins the fixed filename
+internally, refuses symlink, non-directory, or replaced-inode components and a
+shared-mode final directory, and never creates or chmods an ambient parent. It
+opens every component without following untrusted links, retains the final
+directory capability for all I/O, and treats later ambient namespace
+replacement as a safe failure. On Unix the final directory and file must deny
+all group/other permissions, and the file must be a single-link regular file.
+These are local protection rules, not public identity.
 
 The carrier has exactly these non-internal SQLite objects and constraints:
 
@@ -58,14 +62,19 @@ accepted by the `CanonicalRecordReader::read_index_snapshot` seam.
 stable store ID/revision or returns no snapshot. A tenant-scoped caller cannot
 choose the permanent index coverage.
 
-Rebuild sorts documents by opaque memory ID, creates a fresh SQLite image in
-the same private directory, commits and closes SQLite, fsyncs the image, and
-uses the maintained cross-platform `atomicwrites` replacement primitive. It
-then syncs the directory where the platform exposes directory fsync. No live
-SQLite connection is carried across replacement. Rebuilding identical logical
-input with this format and bundled SQLite version produces byte-identical
-output on supported platforms; CI locks an exact SQLite-image SHA-256 and runs
-the replacement path on Windows as well as Linux.
+Rebuild sorts documents by opaque memory ID and creates a fresh SQLite image in
+a separate process-private temporary directory. After SQLite commits, closes,
+and fsyncs that image, the bytes are copied into a random create-new file
+relative to the held `index/` directory capability. Rebuild fsyncs that file,
+rechecks the expected target and temporary-file identities, and performs a
+capability-relative atomic rename to `lexical.sqlite`. It then verifies the
+published inode and ambient directory identity and syncs the directory where
+the platform exposes directory fsync. A concurrent directory-to-symlink or
+target replacement cannot redirect the copy or overwrite an external file.
+No live SQLite connection is carried across replacement. Rebuilding identical
+logical input with this format and bundled SQLite version produces
+byte-identical output on supported platforms; CI locks an exact SQLite-image
+SHA-256 and runs the replacement path on Windows as well as Linux.
 
 If replacement fails, the previous complete image remains authoritative for
 health evaluation; canonical storage is unchanged. Deleting the image is safe
@@ -156,7 +165,8 @@ promoted into an authenticity mechanism.
 
 ## Health, corruption, and compatibility
 
-`LexicalIndex::diagnose` returns a path-free closed health state:
+`LexicalIndex::diagnose` requires the operator-only
+`AuthorizedIndexAdmin` capability and returns a path-free closed health state:
 
 - `Missing` — the fixed image does not exist;
 - `Corrupt` — unsafe file shape, SQLite failure, schema/row/canonical/checksum
@@ -188,5 +198,5 @@ must not silently accept a `v1alpha1` image.
 
 This slice adds no CLI, MCP transport, daemon, network request, embedding,
 semantic model, LLM/provider credential, Bamboo mapping, remote index, or
-canonical-store mutation. Admin rebuild and diagnostics are ordinary Rust APIs
-reserved as seams for later CLI/service Issues.
+canonical-store mutation. Admin rebuild and diagnostics are capability-gated
+ordinary Rust APIs reserved as seams for later CLI/service Issues.

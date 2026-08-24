@@ -8,8 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-atomicwrites.workspace = true
 base64.workspace = true
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 hmac.workspace = true
 jiandu-core = { path = "../jiandu-core" }
 jiandu-store = { path = "../jiandu-store" }
@@ -20,6 +21,11 @@ sha2.workspace = true
 tempfile.workspace = true
 time.workspace = true
 unicode-normalization.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [lints]
 workspace = true

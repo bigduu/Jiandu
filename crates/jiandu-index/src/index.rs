@@ -1,32 +1,30 @@
 //! SQLite-backed disposable index, rebuild, diagnostics, and ranked query.
 
 use crate::cursor::{CursorBinding, CursorMacKey, decode_cursor, encode_cursor};
+use crate::directory::{DirectoryOpenError, INDEX_FILE_NAME, IndexDirectory};
 use crate::error::{IndexDegradedReason, IndexError};
 use crate::format::{
-    INDEX_SQLITE_USER_VERSION, IndexDocument, IndexMetadata, MAX_INDEX_DOCUMENTS,
-    MAX_INDEX_FILE_BYTES, build_documents, index_checksum, scope_key,
+    INDEX_SQLITE_USER_VERSION, IndexDocument, IndexMetadata, MAX_INDEX_DOCUMENTS, build_documents,
+    index_checksum, scope_key,
 };
 use crate::{CanonicalRecordReader, tokenize};
-use atomicwrites::{AllowOverwrite, AtomicFile};
 use jiandu_core::{
     MemorySearchRequest, MemorySearchResult, MemorySummary, RankedMemorySummary, SearchDiagnostics,
     SearchScore, StoreRevision, Timestamp, Validate,
 };
 use jiandu_store::{AuthorizedIndexAdmin, AuthorizedIndexQuery, StoreId};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use tempfile::Builder;
+use tempfile::TempDir;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const SQLITE_APPLICATION_ID: i64 = 0x4a49_4458;
-const INDEX_FILE_NAME: &str = "lexical.sqlite";
 
 /// Path-free compatibility and freshness marker for the derived index.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,7 +74,6 @@ pub struct IndexRebuildReport {
 /// intentionally omits that ambient path.
 pub struct LexicalIndex {
     directory: PathBuf,
-    path: PathBuf,
 }
 
 impl fmt::Debug for LexicalIndex {
@@ -89,20 +86,22 @@ impl fmt::Debug for LexicalIndex {
 }
 
 impl LexicalIndex {
-    /// Configure a private derived-index directory. The filename is fixed by
-    /// this crate, so a misconfigured caller cannot overwrite an arbitrary
-    /// regular file. Construction performs no I/O.
+    /// Configure an existing private derived-index directory. The canonical
+    /// store layout provisions this directory; this crate never creates or
+    /// chmods an ambient parent. The filename is fixed internally, and
+    /// construction itself performs no I/O.
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
-        let directory = directory.into();
-        let path = directory.join(INDEX_FILE_NAME);
-        Self { directory, path }
+        Self {
+            directory: directory.into(),
+        }
     }
 
     /// Rebuild the single all-store index from one stable canonical snapshot.
     /// The separate admin capability prevents a tenant-scoped caller from
-    /// permanently omitting another tenant. The new SQLite image is built and
-    /// synced beside the target, closed, then atomically renamed.
+    /// permanently omitting another tenant. The SQLite image is built in a
+    /// separate private directory, copied into a create-new file relative to
+    /// one held directory capability, synced, then atomically renamed.
     pub fn rebuild<R: CanonicalRecordReader>(
         &self,
         reader: &R,
@@ -111,32 +110,32 @@ impl LexicalIndex {
         let snapshot = reader.read_index_snapshot(authorization)?;
         let documents = build_documents(snapshot.records)?;
         let metadata = IndexMetadata::new(snapshot.store_id, snapshot.store_revision, &documents)?;
-        create_private_directory(&self.directory)?;
-        let replaced_existing = validate_replace_target(&self.path)?;
+        let directory = IndexDirectory::open(&self.directory).map_err(rebuild_directory_error)?;
+        #[cfg(test)]
+        crate::directory::run_test_hook(crate::directory::TestHookPoint::AfterDirectoryOpen);
+        let replacement_target = directory.replacement_target()?;
 
-        let temporary = Builder::new()
-            .prefix(".jiandu-index-")
-            .suffix(".tmp")
-            .tempfile_in(&self.directory)
-            .map_err(|_| IndexError::io("create index temporary file"))?;
-        set_private_file(temporary.as_file())?;
-        let temporary_path = temporary.into_temp_path();
-        write_database(&temporary_path, &metadata, &documents)?;
-        sync_file(&temporary_path)?;
-        publish_atomically(&temporary_path, &self.path)?;
-        sync_directory(&self.directory)?;
+        let build_directory =
+            TempDir::new().map_err(|_| IndexError::io("create private index build directory"))?;
+        let build_path = build_directory.path().join(INDEX_FILE_NAME);
+        write_database(&build_path, &metadata, &documents)?;
+        sync_file(&build_path)?;
+        directory.publish(&build_path, replacement_target)?;
 
         Ok(IndexRebuildReport {
             watermark: IndexWatermark::from(&metadata),
-            replaced_existing,
+            replaced_existing: replacement_target.existed(),
         })
     }
 
     /// Inspect format, SQLite integrity, exact contents, checksum, and store
-    /// freshness without changing the index or canonical store.
+    /// freshness under the same operator-only administrative capability used
+    /// for rebuild. This prevents all-store counts and watermarks from
+    /// becoming an unauthenticated diagnostic side channel.
     pub fn diagnose<R: CanonicalRecordReader>(
         &self,
         reader: &R,
+        _authorization: &AuthorizedIndexAdmin,
     ) -> Result<IndexDiagnostic, IndexError> {
         let current = match reader.current_store_watermark() {
             Ok(current) => current,
@@ -149,7 +148,18 @@ impl LexicalIndex {
                 });
             }
         };
-        let health = match load_and_validate_all(&self.path) {
+        let directory = match IndexDirectory::open(&self.directory) {
+            Ok(directory) => directory,
+            Err(error) => {
+                return Ok(IndexDiagnostic {
+                    health: IndexHealth::Degraded {
+                        reason: directory_degraded_reason(error),
+                    },
+                    rebuild_supported: true,
+                });
+            }
+        };
+        let health = match load_and_validate_all(&directory) {
             Ok((metadata, _))
                 if metadata.source_store_id == current.0
                     && metadata.source_store_revision == current.1 =>
@@ -192,8 +202,12 @@ impl LexicalIndex {
         }
 
         let begin = reader.current_store_watermark().map_err(IndexError::from)?;
-        let (connection, metadata, documents) =
-            open_validated_all(&self.path).map_err(|reason| IndexError::Degraded { reason })?;
+        let directory =
+            IndexDirectory::open(&self.directory).map_err(|error| IndexError::Degraded {
+                reason: directory_degraded_reason(error),
+            })?;
+        let (metadata, documents) =
+            open_validated_all(&directory).map_err(|reason| IndexError::Degraded { reason })?;
         if metadata.source_store_id != begin.0 || metadata.source_store_revision != begin.1 {
             return Err(IndexError::Degraded {
                 reason: IndexDegradedReason::Stale,
@@ -258,7 +272,11 @@ impl LexicalIndex {
             None
         };
 
-        drop(connection);
+        directory
+            .validate_ambient_identity()
+            .map_err(|_| IndexError::Degraded {
+                reason: IndexDegradedReason::Corrupt,
+            })?;
         let finish = reader.current_store_watermark().map_err(IndexError::from)?;
         if begin != finish {
             return Err(IndexError::Degraded {
@@ -352,22 +370,21 @@ fn write_database(
 }
 
 fn load_and_validate_all(
-    path: &Path,
+    directory: &IndexDirectory,
 ) -> Result<(IndexMetadata, Vec<IndexDocument>), IndexDegradedReason> {
-    let (connection, metadata, documents) = open_validated_all(path)?;
-    drop(connection);
-    Ok((metadata, documents))
+    open_validated_all(directory)
 }
 
 fn open_validated_all(
-    path: &Path,
-) -> Result<(Connection, IndexMetadata, Vec<IndexDocument>), IndexDegradedReason> {
-    validate_existing_file(path)?;
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| IndexDegradedReason::Corrupt)?;
+    directory: &IndexDirectory,
+) -> Result<(IndexMetadata, Vec<IndexDocument>), IndexDegradedReason> {
+    let mut image = directory.open_image()?;
+    let image_length = usize::try_from(image.length).map_err(|_| IndexDegradedReason::Corrupt)?;
+    let mut connection = Connection::open_in_memory().map_err(|_| IndexDegradedReason::Corrupt)?;
+    connection
+        .deserialize_read_exact(MAIN_DB, &mut image.file, image_length, true)
+        .map_err(|_| IndexDegradedReason::Corrupt)?;
+    directory.revalidate_open_image(&image)?;
     connection
         .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN;")
         .map_err(|_| IndexDegradedReason::Corrupt)?;
@@ -390,7 +407,14 @@ fn open_validated_all(
     {
         return Err(IndexDegradedReason::Corrupt);
     }
-    Ok((connection, metadata, documents))
+    directory.revalidate_open_image(&image)?;
+    directory
+        .validate_ambient_identity()
+        .map_err(|_| IndexDegradedReason::Corrupt)?;
+    connection
+        .close()
+        .map_err(|_| IndexDegradedReason::Corrupt)?;
+    Ok((metadata, documents))
 }
 
 fn validate_sqlite_header(connection: &Connection) -> Result<(), IndexDegradedReason> {
@@ -658,84 +682,6 @@ fn request_fingerprint(
     Ok(lower_hex(&hasher.finalize()))
 }
 
-fn validate_existing_file(path: &Path) -> Result<(), IndexDegradedReason> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(IndexDegradedReason::Missing);
-        }
-        Err(_) => return Err(IndexDegradedReason::Corrupt),
-    };
-    if !metadata.file_type().is_file() || metadata.len() > MAX_INDEX_FILE_BYTES {
-        return Err(IndexDegradedReason::Corrupt);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
-            return Err(IndexDegradedReason::Corrupt);
-        }
-    }
-    Ok(())
-}
-
-fn validate_replace_target(path: &Path) -> Result<bool, IndexError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            validate_existing_file(path).map_err(|reason| IndexError::Degraded { reason })?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(IndexError::io("inspect index replacement target")),
-    }
-}
-
-fn create_private_directory(path: &Path) -> Result<(), IndexError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_private_directory_metadata(&metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(path)
-                    .map_err(|_| IndexError::io("create index directory"))?;
-            }
-            #[cfg(not(unix))]
-            fs::create_dir(path).map_err(|_| IndexError::io("create index directory"))?;
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|_| IndexError::io("inspect index directory"))?;
-            validate_private_directory_metadata(&metadata)
-        }
-        Err(_) => Err(IndexError::io("inspect index directory")),
-    }
-}
-
-fn validate_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), IndexError> {
-    if !metadata.file_type().is_dir() {
-        return Err(IndexError::InvalidRequest);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(IndexError::InvalidRequest);
-        }
-    }
-    Ok(())
-}
-
-fn set_private_file(file: &std::fs::File) -> Result<(), IndexError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| IndexError::io("set index file permissions"))?;
-    }
-    Ok(())
-}
-
 fn sync_file(path: &Path) -> Result<(), IndexError> {
     OpenOptions::new()
         .read(true)
@@ -745,33 +691,18 @@ fn sync_file(path: &Path) -> Result<(), IndexError> {
         .map_err(|_| IndexError::io("sync rebuilt index"))
 }
 
-fn publish_atomically(source: &Path, target: &Path) -> Result<(), IndexError> {
-    AtomicFile::new(target, AllowOverwrite)
-        .write(|output| -> Result<(), io::Error> {
-            let mut input = OpenOptions::new().read(true).open(source)?;
-            io::copy(&mut input, output)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                output.set_permissions(fs::Permissions::from_mode(0o600))?;
-            }
-            Ok(())
-        })
-        .map_err(|_| IndexError::io("publish rebuilt index"))
+fn rebuild_directory_error(error: DirectoryOpenError) -> IndexError {
+    match error {
+        DirectoryOpenError::Missing | DirectoryOpenError::Unsafe => IndexError::InvalidRequest,
+        DirectoryOpenError::Io => IndexError::io("open private index directory"),
+    }
 }
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), IndexError> {
-    OpenOptions::new()
-        .read(true)
-        .open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| IndexError::io("sync index directory"))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), IndexError> {
-    Ok(())
+const fn directory_degraded_reason(error: DirectoryOpenError) -> IndexDegradedReason {
+    match error {
+        DirectoryOpenError::Missing => IndexDegradedReason::Missing,
+        DirectoryOpenError::Unsafe | DirectoryOpenError::Io => IndexDegradedReason::Corrupt,
+    }
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
