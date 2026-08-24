@@ -1,2 +1,3 @@
 crates/jiandu-store/fixtures/*/valid/*.md text eol=lf whitespace=-blank-at-eof
 crates/jiandu-store/fixtures/*/invalid/*.md -text whitespace=-blank-at-eof
+crates/jiandu-store/fixtures/**/*.json text eol=lf
