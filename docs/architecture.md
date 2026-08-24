@@ -66,7 +66,10 @@ The store is the source of truth. It provides:
 - optimistic concurrency through `expectedRevision`;
 - idempotency receipts for retried mutations;
 - schema and store-format migrations;
-- tombstones, audit entries, import, export, and validation.
+- tombstones and audit entries;
+- bounded side-effect-free validation and deterministic authorized portable
+  export; and
+- explicit import and backup seams in later consistency slices.
 
 Human inspection is supported. Direct mutation is not part of the public consistency contract; changes should go through MCP or the administrative CLI.
 
@@ -92,7 +95,40 @@ jiandu import
 jiandu doctor
 ```
 
-Administrative operations use the same core commands as the MCP adapter. They do not bypass validation or revision rules.
+Administrative mutations use the same core commands as the MCP adapter and do
+not bypass validation or revision rules. Store validation/export are currently
+host/operator Rust APIs, not MCP tools; transport and CLI wiring are separate
+milestones.
+
+### Read-only validation and portable export
+
+The canonical store has one pure inspection engine with two coordination
+paths. A live daemon borrows its already-owned `CanonicalStore` root and lock;
+an offline `ReadOnlyStoreInspector` acquires the same kernel lock without
+rewriting owner diagnostics and therefore runs only while the daemon is
+stopped. Neither path initializes, migrates, recovers, quarantines, repairs, or
+publishes anything.
+
+Both paths bind the beginning and ending store/audit watermarks, root and lock
+identity, opened file identity, and directory entry sets. A supported stable
+snapshot yields canonical, byte-deterministic output. Active WAL, ambiguous
+private ledger state during an admin whole-store operation, concurrent
+replacement, unsupported export source, or a bounded validation finding
+refuses export rather than producing a normalized or mixed bundle.
+
+Scoped inspection traverses and decodes record/tombstone contents only beneath
+explicitly authorized owner segments. To preserve the `v1alpha3` global
+non-resurrection guarantee, it separately performs one bounded, namespace-only
+collection of domain-separated tombstone storage keys before opening any
+authorized candidate body. That pass checks strict entry names and filesystem
+type/link/permission metadata without opening a tombstone. It never decodes or reports an unauthorized
+tombstone's scope, ID, metadata, or count. Whole-store validation/export require
+distinct private-field admin capabilities and grants. Full output, format,
+bound, and compatibility rules are specified in
+[Validation Report and Portable Export `v1alpha1`](portable-export-v1alpha1.md).
+Private replay/audit/witness artifacts cannot be safely partitioned by memory
+scope, so scoped inspection never traverses that ledger; its exact invariants
+are checked only by the admin whole-store mode.
 
 ## Integration flows
 

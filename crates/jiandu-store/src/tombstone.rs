@@ -117,6 +117,7 @@ impl ProtectedTombstone {
             || !transaction::valid_content_digest(self.etag.as_str())
             || self.store_revision.0 == 0
             || self.audit_sequence.0 == 0
+            || self.audit_sequence.0 > self.store_revision.0
         {
             return Err(StoreError::InvalidTransaction);
         }
@@ -250,8 +251,39 @@ pub(crate) fn read_exact(
     scope: &MemoryScope,
     memory_id: &MemoryId,
 ) -> Result<Option<ProtectedTombstone>, StoreError> {
+    read_exact_inner(root, store_id, scope, memory_id, &mut |_| Ok(()))
+}
+
+pub(crate) fn read_exact_bounded(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    scope: &MemoryScope,
+    memory_id: &MemoryId,
+    budget: &mut impl crate::idempotency::LedgerScanBudget,
+) -> Result<Option<ProtectedTombstone>, StoreError> {
+    read_exact_inner(root, store_id, scope, memory_id, &mut |file| {
+        let length = file
+            .metadata()
+            .map_err(|source| StoreError::io("inspect bounded tombstone", source))?
+            .len();
+        if budget.consume_bytes(length) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidRequest)
+        }
+    })
+}
+
+fn read_exact_inner(
+    root: &StoreDirectory,
+    store_id: &StoreId,
+    scope: &MemoryScope,
+    memory_id: &MemoryId,
+    before_decode: &mut impl FnMut(&File) -> Result<(), StoreError>,
+) -> Result<Option<ProtectedTombstone>, StoreError> {
     root.try_open_regular(&layout::tombstone_relative_path(scope, memory_id), false)?
         .map(|file| {
+            before_decode(&file)?;
             StoreDirectory::validate_private_open_file(&file)?;
             let tombstone = ProtectedTombstone::decode(file, store_id)?;
             if &tombstone.scope != scope

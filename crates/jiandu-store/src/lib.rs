@@ -11,6 +11,7 @@ mod durability;
 mod error;
 mod failpoint;
 mod idempotency;
+mod inspection;
 mod layout;
 mod lock;
 mod metadata;
@@ -24,6 +25,13 @@ pub use durability::{DirectoryDurability, StoreDoctorReport};
 pub use error::{InvalidRecordReason, StoreError, StoreErrorCode};
 pub use failpoint::{PersistenceBoundary, PersistenceFailpointInjector};
 pub use idempotency::MutationOperation;
+pub use inspection::{
+    AuthorizedExportAdmin, AuthorizedValidationAdmin, ExportDigest, PORTABLE_EXPORT_FORMAT_VERSION,
+    PORTABLE_TOMBSTONE_FORMAT_VERSION, PortableExportBundle, PortableMemoryRecord,
+    PortableProvenance, PortableTombstone, ReadOnlyStoreInspector, SnapshotWatermark,
+    VALIDATION_REPORT_FORMAT_VERSION, ValidationArtifact, ValidationCode, ValidationFinding,
+    ValidationMode, ValidationReport, generated_inspection_schemas,
+};
 pub use lock::{LockOwner, LockOwnerDiagnostics};
 pub use metadata::{AuditSequence, STORE_FORMAT_VERSION, StoreId, StoreMetadata};
 pub use mutation::{ForgetCommit, MutationCommit};

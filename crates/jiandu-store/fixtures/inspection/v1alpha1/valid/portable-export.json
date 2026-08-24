@@ -1,0 +1,117 @@
+{
+  "formatVersion": "jiandu.portable-export/v1alpha1",
+  "sourceStoreFormat": "jiandu.store/v1alpha3",
+  "sourceStoreId": "019d2a4a-7b00-7000-8000-000000000019",
+  "snapshot": {
+    "storeRevision": 4,
+    "auditSequence": 4
+  },
+  "scopes": [
+    {
+      "kind": "project",
+      "projectId": "prj_portable_export"
+    },
+    {
+      "kind": "session",
+      "sessionId": "ses_portable_export"
+    }
+  ],
+  "records": [
+    {
+      "schema": "jiandu.dev/memory/v1alpha1",
+      "id": "mem_portable_a_range",
+      "revision": 1,
+      "etag": "sha256:6389d7206603cc3ddfa647183bb7a3f329d4731b81962cf4719c3438fff9f579",
+      "scope": {
+        "kind": "session",
+        "sessionId": "ses_portable_export"
+      },
+      "type": "decision",
+      "status": "active",
+      "title": "Title for mem_portable_a_range",
+      "summary": "Summary for mem_portable_a_range",
+      "body": "portable range provenance body",
+      "tags": [
+        "architecture"
+      ],
+      "createdAt": "2026-08-24T06:02:00Z",
+      "updatedAt": "2026-08-24T06:02:00Z",
+      "provenance": {
+        "createdBy": "host",
+        "agentId": "agent:portable-range",
+        "sessionId": "ses_portable_export",
+        "branchId": "br_portable_range",
+        "messageRange": {
+          "firstMessageId": "msg_portable_range_1",
+          "lastMessageId": "msg_portable_range_9"
+        },
+        "sourceUri": "https://example.invalid/range",
+        "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "extraction": {
+          "method": "host_rule",
+          "extractorVersion": "extractor-range-v1"
+        },
+        "confidence": 0.8
+      },
+      "relations": []
+    },
+    {
+      "schema": "jiandu.dev/memory/v1alpha1",
+      "id": "mem_portable_complete",
+      "revision": 1,
+      "etag": "sha256:e1398643740ad4e0942e74200f3cdd5cb898740f3e02ec04492aa1fda76f0c35",
+      "scope": {
+        "kind": "project",
+        "projectId": "prj_portable_export"
+      },
+      "type": "decision",
+      "status": "active",
+      "title": "Title for mem_portable_complete",
+      "summary": "Summary for mem_portable_complete",
+      "body": "portable body\nwith exact markdown\n",
+      "tags": [
+        "architecture"
+      ],
+      "createdAt": "2026-08-24T06:00:00Z",
+      "updatedAt": "2026-08-24T06:00:00Z",
+      "provenance": {
+        "createdBy": "host",
+        "agentId": "agent:portable",
+        "sessionId": "ses_portable_export",
+        "branchId": "br_portable",
+        "messageIds": [
+          "msg_portable_1"
+        ],
+        "sourceUri": "https://example.invalid/source",
+        "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "extraction": {
+          "method": "explicit",
+          "extractorVersion": "extractor-v1"
+        },
+        "confidence": 0.75
+      },
+      "relations": [
+        {
+          "kind": "related_to",
+          "targetMemoryId": "mem_portable_related"
+        }
+      ]
+    }
+  ],
+  "tombstones": [
+    {
+      "formatVersion": "jiandu.portable-tombstone/v1alpha1",
+      "memoryId": "mem_portable_forgotten",
+      "scope": {
+        "kind": "project",
+        "projectId": "prj_portable_export"
+      },
+      "revision": 1,
+      "etag": "sha256:88eadaa921394541a23a94ed5bdf72c52d3c336338ddf7950206a1353c07a0e9",
+      "forgottenAt": "2026-08-24T06:01:00Z",
+      "storeRevision": 3,
+      "auditSequence": 3
+    }
+  ],
+  "digest": "sha256:72cdb84afa2d2c830080610c6dac8a895bf20e3301ff65fd8adad005dbebf926"
+}

@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and a canonical-store core with exclusive ownership, validated reads, atomic create/update CAS, idempotent single-record forget, protected tombstones, durable replay, sequence-addressed audit, explicit format migration, durability diagnostics, and deterministic crash recovery. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, and a canonical-store core with exclusive ownership, validated reads, atomic create/update CAS, idempotent single-record forget, protected tombstones, durable replay, sequence-addressed audit, explicit format migration, deterministic crash recovery, side-effect-free validation, and authorized portable export. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -41,6 +41,7 @@ Jiandu therefore separates three responsibilities:
 - Read and write results are structured data, not pre-rendered prompt instructions.
 - Canonical create/update uses expected-revision CAS plus principal/operation-scoped durable receipts. Identical retries replay the original result without another mutation or audit event.
 - Ordinary forget is exact-scope, revision-aware, independently destructive-authorized, idempotent, and audited; it retains a descriptor-erased zero-length logical witness rather than claiming secure physical erasure. Restore/hard-purge remain separate administrative lifecycles.
+- Live owners and coordinated offline inspectors share one bounded, read-only validation engine. Portable export is canonical, deterministic, scope-authorized, complete for public record/provenance fields, and excludes paths and private replay/WAL/audit/witness bytes.
 - Jiandu remains useful without an LLM provider; extraction and reranking are optional later capabilities.
 - If Jiandu is unavailable, an agent can continue without recalled memory according to host policy.
 
@@ -60,6 +61,7 @@ MCP does not force a client to inject context. Jiandu returns memory records; th
 - [MCP API v0](docs/mcp-api-v0.md)
 - [Data model, filesystem, scopes, and lineage](docs/data-model.md)
 - [Canonical store format v1alpha3](docs/store-format-v1alpha3.md)
+- [Validation report and portable export v1alpha1](docs/portable-export-v1alpha1.md)
 - [Historical create/update store format v1alpha2](docs/store-format-v1alpha2.md)
 - [Bamboo integration and migration](docs/integrations/bamboo.md)
 - [Delivery roadmap](docs/roadmap.md)
@@ -77,7 +79,9 @@ crates/jiandu-store/                 exclusive ownership, reads, atomic CAS, and
   fixtures/v1alpha1/                 canonical store-document conformance data
   fixtures/v1alpha2/                 strict metadata, WAL, receipt, result, and audit fixtures
   fixtures/v1alpha3/                 strict forget WAL, tombstone, result, receipt, and audit fixtures
-  src/                               private paths, strict codec, lock, tombstones, logical-erasure witnesses, transactions, and recovery
+  fixtures/inspection/v1alpha1/      deterministic validation/export fixtures
+  schemas/inspection/v1alpha1/       generated strict report/export JSON Schemas
+  src/                               private paths, strict codec, lock, inspection, tombstones, logical-erasure witnesses, transactions, and recovery
 ```
 
 Future index, MCP adapter, daemon, and CLI crates are introduced only when their

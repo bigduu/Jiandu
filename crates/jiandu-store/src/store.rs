@@ -1292,13 +1292,40 @@ fn ensure_audit_genesis(
     failpoints.check(crate::PersistenceBoundary::MigrationGenesisDirectorySynced)
 }
 
-fn validate_audit_genesis(
+pub(crate) fn validate_audit_genesis(
     root: &layout::StoreDirectory,
     metadata: &StoreMetadata,
+) -> Result<(), StoreError> {
+    validate_audit_genesis_inner(root, metadata, &mut |_| Ok(()))
+}
+
+pub(crate) fn validate_audit_genesis_bounded(
+    root: &layout::StoreDirectory,
+    metadata: &StoreMetadata,
+    budget: &mut impl crate::idempotency::LedgerScanBudget,
+) -> Result<(), StoreError> {
+    validate_audit_genesis_inner(root, metadata, &mut |file| {
+        let length = file
+            .metadata()
+            .map_err(|source| StoreError::io("inspect bounded audit genesis", source))?
+            .len();
+        if budget.consume_bytes(length) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidRequest)
+        }
+    })
+}
+
+fn validate_audit_genesis_inner(
+    root: &layout::StoreDirectory,
+    metadata: &StoreMetadata,
+    before_decode: &mut impl FnMut(&std::fs::File) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     let file = root
         .try_open_regular(Path::new(layout::AUDIT_GENESIS_FILE), false)?
         .ok_or(StoreError::InvalidStoreMetadata)?;
+    before_decode(&file)?;
     layout::StoreDirectory::validate_private_open_file(&file)?;
     let genesis = crate::idempotency::AuditGenesis::decode(file, &metadata.store_id)?;
     if genesis.base_store_revision.0 > metadata.store_revision.0 {

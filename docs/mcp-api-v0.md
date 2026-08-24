@@ -227,6 +227,41 @@ model tool. The current store can produce a non-executing, bounded, explicit
 target dry-run plan behind separate admin grants; bulk deletion remains absent
 from the public MCP surface.
 
+## Host/operator validation and portable export
+
+Issue #19 implements validation and export at the canonical-store Rust
+boundary; it does not add model-visible MCP tools or transport request schemas.
+Scoped calls use the host's `AuthorizedScopes` and explicit exact scopes.
+Whole-store calls require independent, principal-bound
+`memory:admin:validate_store` and `memory:admin:export_all` grants. Authenticated
+principal/client identity remains trusted context and is never accepted from a
+model argument.
+
+Scoped inspection does not traverse another tenant's record owner or open or
+decode another tenant's record/tombstone content. Before reading an authorized
+candidate body it does one bounded global tombstone namespace pass that
+collects only hashed storage keys. It checks strict names and filesystem
+type/link/permission metadata without opening the file. This narrow,
+non-decoding check is required by the `v1alpha3`
+cross-scope non-resurrection rule; it exposes no unauthorized tombstone
+scope/metadata/count and cannot add one to a report or bundle.
+
+Private receipt/result/audit/witness artifacts are not safely partitionable by
+memory scope. Scoped calls therefore do not traverse that ledger; its exact
+cross-artifact invariant is checked only by the separately authorized
+whole-store validation/export path. This prevents a scoped caller from probing
+foreign replay state.
+
+Validation is bounded and side-effect free. Portable export contains canonical
+public records and full portable provenance plus body-free protected tombstone
+projections. It adds no internal path/storage-key fields, host/store credential
+fields, queries, raw idempotency keys, private replay
+results/receipts/audit/WAL, logical-erasure witness bytes, or forgotten body.
+Authorized public record fields remain exact user content and are not a
+path- or credential-redaction boundary. Exact formats, stable finding codes,
+snapshot/read-only coordination, schemas, and compatibility rules are defined
+in [Validation Report and Portable Export `v1alpha1`](portable-export-v1alpha1.md).
+
 ## MCP resources
 
 Jiandu may expose addressable, authorized records as resources:
