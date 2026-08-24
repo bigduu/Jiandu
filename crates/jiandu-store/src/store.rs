@@ -623,6 +623,7 @@ impl CanonicalStore {
             };
             let file = layout::StoreDirectory::try_open_regular_in(&directory, &name)?
                 .ok_or(StoreError::InvalidTransaction)?;
+            layout::StoreDirectory::validate_private_open_file(&file)?;
             let receipt = crate::transaction::DurableQuarantineReceipt::decode(
                 file,
                 &transaction_id,
@@ -636,14 +637,20 @@ impl CanonicalStore {
             }
         }
         let path = match_path.ok_or(StoreError::NotFound)?;
+        self.poisoned = true;
         self.root.remove_regular_file(&path)?;
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineReceiptAcknowledgementRemoved)?;
         self.root.sync_directory(
             Path::new(layout::QUARANTINE_RECEIPTS_DIR),
             "sync quarantine receipt acknowledgement",
         )?;
+        self.failpoints
+            .check(crate::PersistenceBoundary::QuarantineReceiptAcknowledgementDirectorySynced)?;
         self.quarantine_receipts.retain(|receipt| {
             &receipt.memory_id != memory_id || receipt.quarantine_token != quarantine_token
         });
+        self.poisoned = false;
         Ok(())
     }
 

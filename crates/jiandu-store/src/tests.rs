@@ -1860,6 +1860,14 @@ fn stale_error_text(error: &StoreError) -> String {
     error.to_string()
 }
 
+fn assert_recovery_required<T: std::fmt::Debug>(result: Result<T, StoreError>, context: &str) {
+    assert_eq!(
+        result.expect_err(context).code(),
+        StoreErrorCode::RecoveryRequired,
+        "{context}"
+    );
+}
+
 #[test]
 fn concurrent_current_updates_serialize_to_one_commit_and_one_conflict() {
     let directory = TempDir::new().expect("temporary directory");
@@ -2532,6 +2540,171 @@ fn rollback_and_quarantine_recovery_boundaries_are_restartable() {
 }
 
 #[test]
+fn quarantine_receipt_acknowledgement_is_restartable_and_poisons_every_service_entry() {
+    let scenarios = [
+        (
+            PersistenceBoundary::QuarantineReceiptAcknowledgementRemoved,
+            false,
+        ),
+        (
+            PersistenceBoundary::QuarantineReceiptAcknowledgementRemoved,
+            true,
+        ),
+        (
+            PersistenceBoundary::QuarantineReceiptAcknowledgementDirectorySynced,
+            false,
+        ),
+    ];
+    for (boundary, restore_unflushed_receipt) in scenarios {
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = MemoryScope::Principal {
+            principal_id: principal_id("prn_ack_recovery"),
+        };
+        let authority = AuthorizedScopes::new(principal_id("prn_ack_recovery"));
+        let authorized_scope = authority.authorize_exact(&scope).expect("authorize scope");
+        let mut initial =
+            CanonicalStore::initialize(directory.path(), owner()).expect("initialize store");
+        let valid = initial
+            .create(
+                &authorized_scope,
+                create_input("mem_ack_valid", "stable canonical body"),
+            )
+            .expect("create valid record");
+        drop(initial);
+
+        let invalid_id = memory_id("mem_ack_invalid");
+        write_raw_record(
+            directory.path(),
+            &scope,
+            &invalid_id,
+            include_bytes!("../fixtures/v1alpha1/invalid/truncated.md"),
+        );
+        let mut quarantine_store =
+            CanonicalStore::open(directory.path(), owner()).expect("open quarantine store");
+        let receipt = quarantine_store
+            .quarantine_invalid(&scope, &invalid_id)
+            .expect("quarantine invalid record");
+        drop(quarantine_store);
+
+        let receipt_directory = directory.path().join(layout::QUARANTINE_RECEIPTS_DIR);
+        let receipt_path = fs::read_dir(&receipt_directory)
+            .expect("receipt directory")
+            .next()
+            .expect("one receipt")
+            .expect("receipt entry")
+            .path();
+        let receipt_bytes = fs::read(&receipt_path).expect("durable receipt bytes");
+        let quarantine_before = tree_snapshot(&directory.path().join("quarantine"));
+
+        let injector = FailOnce::at(boundary);
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(injector.clone()),
+        )
+        .expect("open acknowledgement store");
+        assert_eq!(
+            store
+                .acknowledge_quarantine_receipt(&receipt.memory_id, &receipt.quarantine_token)
+                .expect_err("acknowledgement boundary injects failure")
+                .code(),
+            StoreErrorCode::InjectedFailure,
+            "{boundary:?}"
+        );
+        assert!(injector.fired.load(Ordering::SeqCst), "{boundary:?}");
+
+        assert_recovery_required(
+            store.pending_quarantine_receipts(),
+            "poisoned receipt ledger read",
+        );
+        assert_recovery_required(store.watermark(), "poisoned watermark read");
+        assert_recovery_required(store.doctor(), "poisoned doctor");
+        assert_recovery_required(
+            store.get(&valid.record.id, &authority),
+            "poisoned exact read",
+        );
+        assert_recovery_required(
+            store.list(
+                &list_request(vec![ScopeSelector::Principal {}], 10),
+                &authority,
+            ),
+            "poisoned list read",
+        );
+        assert_recovery_required(
+            store.create(
+                &authorized_scope,
+                create_input("mem_ack_poisoned_create", "must not commit"),
+            ),
+            "poisoned create",
+        );
+        assert_recovery_required(
+            store.update(
+                &authorized_scope,
+                &update_command(&valid.record.id, 1, "must not update"),
+                timestamp("2026-08-24T02:01:00Z"),
+            ),
+            "poisoned update",
+        );
+        assert_recovery_required(
+            store.quarantine_invalid(&scope, &invalid_id),
+            "poisoned quarantine",
+        );
+        assert_recovery_required(
+            store.acknowledge_quarantine_receipt(&receipt.memory_id, &receipt.quarantine_token),
+            "poisoned acknowledgement retry",
+        );
+        drop(store);
+
+        if restore_unflushed_receipt {
+            assert_eq!(
+                boundary,
+                PersistenceBoundary::QuarantineReceiptAcknowledgementRemoved
+            );
+            fs::write(&receipt_path, &receipt_bytes)
+                .expect("simulate rolled-back unflushed receipt deletion");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+                    .expect("restore private receipt permissions");
+            }
+        }
+
+        let reopened =
+            CanonicalStore::open(directory.path(), owner()).expect("reopen acknowledgement state");
+        let expected_pending = usize::from(restore_unflushed_receipt);
+        assert_eq!(
+            reopened
+                .pending_quarantine_receipts()
+                .expect("reconstructed receipt ledger")
+                .len(),
+            expected_pending,
+            "{boundary:?}, restore={restore_unflushed_receipt}"
+        );
+        assert_eq!(
+            tree_snapshot(&directory.path().join("quarantine")),
+            quarantine_before,
+            "acknowledgement never deletes quarantined bytes"
+        );
+        drop(reopened);
+
+        let reopened_again = CanonicalStore::open(directory.path(), owner())
+            .expect("repeated acknowledgement recovery converges");
+        assert_eq!(
+            reopened_again
+                .pending_quarantine_receipts()
+                .expect("stable reconstructed receipt ledger")
+                .len(),
+            expected_pending
+        );
+        assert_eq!(
+            tree_snapshot(&directory.path().join("quarantine")),
+            quarantine_before
+        );
+    }
+}
+
+#[test]
 fn recovery_fails_closed_for_impossible_record_metadata_combinations() {
     let directory = TempDir::new().expect("temporary directory");
     let injector = FailOnce::at(PersistenceBoundary::ManifestDirectorySynced);
@@ -2802,6 +2975,8 @@ fn every_persistence_boundary_has_a_crash_recovery_scenario() {
         PersistenceBoundary::QuarantineReceiptTempDirectorySynced,
         PersistenceBoundary::QuarantineReceiptPublished,
         PersistenceBoundary::QuarantineReceiptDirectorySynced,
+        PersistenceBoundary::QuarantineReceiptAcknowledgementRemoved,
+        PersistenceBoundary::QuarantineReceiptAcknowledgementDirectorySynced,
         PersistenceBoundary::QuarantineReceiptLayoutCreated,
         PersistenceBoundary::QuarantineReceiptLayoutDirectorySynced,
         PersistenceBoundary::ManifestRemoved,

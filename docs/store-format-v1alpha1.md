@@ -306,6 +306,16 @@ acknowledgement removes only the receipt, never quarantined bytes. This
 namespace is intentionally separate from Issue #5's future idempotency
 receipts.
 
+Acknowledgement is itself a durable one-file deletion. After resolving the
+exact receipt, the live handle is poisoned before unlink, the receipt directory
+is synced, the in-memory ledger is updated, and only then is the handle made
+serviceable again. Any unlink, sync, or injected-boundary failure requires
+drop/reopen. If power loss occurs before the directory sync, the receipt may
+reappear as pending or remain deleted; startup reconstructs either outcome from
+the durable namespace and never serves the failed handle's stale in-memory
+ledger. Quarantined bytes are outside this acknowledgement lifecycle and are
+not removed.
+
 The immediately preceding `v1alpha1` reader created `receipts/` without its
 `quarantine/` child. Opening accepts that exact legacy shape without mutation,
 acquires the exclusive writer lock, then idempotently creates and syncs the
