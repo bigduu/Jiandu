@@ -106,6 +106,21 @@ Input:
 
 Output contains memory summaries, deterministic pagination metadata, and query diagnostics that disclose no inaccessible record.
 
+Issue #6 implements the retrieval engine and host-facing Rust APIs, not this
+MCP transport adapter. An adapter must first ask `jiandu-store` to mint an
+`AuthorizedIndexQuery` for the exact request selectors; passing an arbitrary
+vector of scopes to the index is not supported. Search validates the complete
+private derived image but only authorized scope intersections can become hits.
+The stable order is integer relevance descending and memory ID ascending.
+
+The opaque cursor uses a host-held HMAC-SHA256 key and binds the complete fresh
+authority fingerprint, normalized query/filters/limit, source store
+ID/revision, and index checksum. Its embedded unkeyed checksum detects storage
+or transport corruption only and is never an authorization mechanism. Key
+rotation, authority change, or watermark change invalidates the cursor safely.
+Exact weights, tokenization, format compatibility, and degraded behavior are
+defined in [Lexical Index Format `v1alpha1`](index-format-v1alpha1.md).
+
 ### `memory_get`
 
 Read one record by opaque memory ID. The output includes the complete record, provenance allowed by policy, revision, and ETag. An inaccessible record is not distinguishable from a nonexistent one unless operator policy explicitly permits that distinction.

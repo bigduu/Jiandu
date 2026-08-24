@@ -393,6 +393,13 @@ pub struct AuthorizedValidationAdmin {
     principal_id: PrincipalId,
 }
 
+/// Private-field all-store derived-index rebuild capability, independently
+/// grantable from export, validation, ordinary reads, and mutations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedIndexAdmin {
+    principal_id: PrincipalId,
+}
+
 impl crate::AuthorizedScopes {
     /// Authorize an operator-only export across every canonical scope.
     pub fn authorize_all_scope_export(
@@ -412,6 +419,17 @@ impl crate::AuthorizedScopes {
     ) -> Result<AuthorizedValidationAdmin, StoreError> {
         authorize_admin(context, &self.principal_id, "memory:admin:validate_store")?;
         Ok(AuthorizedValidationAdmin {
+            principal_id: context.principal_id.clone(),
+        })
+    }
+
+    /// Authorize rebuilding the single all-store derived lexical index.
+    pub fn authorize_index_rebuild(
+        &self,
+        context: &TrustedRequestContext,
+    ) -> Result<AuthorizedIndexAdmin, StoreError> {
+        authorize_admin(context, &self.principal_id, "memory:admin:rebuild_index")?;
+        Ok(AuthorizedIndexAdmin {
             principal_id: context.principal_id.clone(),
         })
     }
@@ -513,6 +531,25 @@ impl ReadOnlyStoreInspector {
 }
 
 impl CanonicalStore {
+    /// Read the complete canonical record set at one stable watermark under
+    /// the separate index-rebuild grant. This all-or-error seam prevents a
+    /// tenant-scoped caller from deciding the permanent contents of the
+    /// process-wide derived index.
+    pub fn read_index_snapshot(
+        &self,
+        authorization: &AuthorizedIndexAdmin,
+    ) -> Result<crate::CanonicalIndexSnapshot, StoreError> {
+        let _ = &authorization.principal_id;
+        self.validate_ownership()?;
+        let bundle = export(&self.root, Selection::All, Some(&self.metadata))?;
+        self.validate_ownership()?;
+        Ok(crate::CanonicalIndexSnapshot {
+            store_id: bundle.source_store_id,
+            store_revision: bundle.snapshot.store_revision,
+            records: bundle.records.into_iter().map(Into::into).collect(),
+        })
+    }
+
     /// Validate explicit scopes using the live owner's already-held lock.
     pub fn validate_scopes(
         &self,

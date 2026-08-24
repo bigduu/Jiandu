@@ -76,7 +76,34 @@ Human inspection is supported. Direct mutation is not part of the public consist
 
 ### Derived index
 
-The first index is deterministic lexical retrieval over canonical records and metadata. It can always be deleted and rebuilt from the store. Embeddings and semantic reranking may be added behind optional capabilities later; they cannot become required for basic operation.
+The first index is the implemented `jiandu-index` deterministic lexical
+retrieval layer over canonical records and metadata. One operator-only
+`memory:admin:rebuild_index` capability asks `CanonicalStore` for a path-free,
+all-or-error, all-store record snapshot at one watermark. This creates a single
+all-store derived index; it is not a tenant-view cache whose first caller can
+permanently omit other scopes. The store remains authoritative and does not
+depend on this crate.
+
+Ordinary queries receive an `AuthorizedIndexQuery` minted by the store from
+fresh host authority and the exact requested selectors. The capability carries
+private resolved scopes plus a fingerprint of the complete authority. The
+index first verifies its complete private image, then emits hits only from the
+intersection represented by that capability. Public cursors bind this full
+authority fingerprint, normalized query/filters, store/index watermarks, and a
+host-held HMAC key; an authorization change invalidates an old cursor instead
+of widening it.
+
+The fixed private `index/lexical.sqlite` file is published through a held
+directory capability: SQLite closes and syncs the build image, the index copies
+it into a create-new same-directory temporary, rechecks target identity, and
+uses a capability-relative cross-platform atomic rename. Ambient directory or
+target replacement races fail without redirecting writes. Missing, corrupt,
+incompatible, or stale images produce a path-free degraded diagnostic under
+the operator-only index capability and can be rebuilt. They never block
+`CanonicalStore::get` or deterministic list reads. Embeddings and semantic
+reranking may be added behind optional capabilities later; they cannot become
+required for basic operation. The format, weights, tokenizer, cursor boundary,
+and compatibility policy are in [Lexical Index Format `v1alpha1`](index-format-v1alpha1.md).
 
 ### MCP adapter
 
