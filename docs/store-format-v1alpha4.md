@@ -86,6 +86,13 @@ strict WAL after the proven metadata-rename window). Symlink, hardlink,
 special/foreign entry, duplicate staged+target, missing required byte, or
 roll-forward digest mismatch fails closed.
 
+Recovery retains the opened inode identity for every exact staged or published
+target. It reopens and rechecks that identity, privacy, single-link state, and
+exact digest before a target is reused or renamed, then rechecks the complete
+published target set immediately before target metadata is published or an
+already-committed manifest is removed. A validation-to-commit inode replacement
+or added hardlink therefore fails closed instead of becoming ready state.
+
 | Metadata | Published target/artifact state | Recovery |
 | --- | --- | --- |
 | exact base | no target and no artifact | identity-check and remove exact or safe-incomplete manifest-bound temps, sync parents, remove/sync manifest; old store remains |

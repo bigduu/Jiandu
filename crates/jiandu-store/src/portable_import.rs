@@ -1777,6 +1777,17 @@ pub(crate) fn recover_import(
         if !targets_complete || !artifacts_complete || metadata_temp_state.is_some() {
             return Err(StoreError::InvalidTransaction);
         }
+        revalidate_complete_import_targets(
+            root,
+            manifest,
+            transaction,
+            &record_states,
+            &tombstone_states,
+            backup_state,
+            result_state,
+            receipt_state,
+            audit_state,
+        )?;
         crate::transaction::remove_manifest(root, manifest, failpoints)?;
         failpoints.check(crate::PersistenceBoundary::RecoveryManifestDirectorySynced)?;
         return Ok(transaction.target_store_metadata.clone());
@@ -1805,23 +1816,33 @@ pub(crate) fn recover_import(
         return Ok(transaction.base_store_metadata.clone());
     }
 
-    for (intent, state) in transaction.records.iter().zip(record_states) {
+    for (intent, state) in transaction
+        .records
+        .iter()
+        .zip(record_states.iter().copied())
+    {
         recover_publish_import_pair(
             root,
             state,
             &import_record_temp_relative(intent, &manifest.transaction_id)?,
             &import_record_relative(intent),
+            &intent.content_digest,
             crate::PersistenceBoundary::RecoveryRecordDirectorySynced,
             "recover imported record",
             failpoints,
         )?;
     }
-    for (intent, state) in transaction.tombstones.iter().zip(tombstone_states) {
+    for (intent, state) in transaction
+        .tombstones
+        .iter()
+        .zip(tombstone_states.iter().copied())
+    {
         recover_publish_import_pair(
             root,
             state,
             &import_tombstone_temp_relative(intent, &manifest.transaction_id)?,
             &import_tombstone_relative(intent),
+            &intent.content_digest,
             crate::PersistenceBoundary::RecoveryTombstoneSynced,
             "recover imported tombstone",
             failpoints,
@@ -1832,6 +1853,7 @@ pub(crate) fn recover_import(
         backup_state,
         &backup_temp,
         &backup_target,
+        &transaction.backup_digest,
         crate::PersistenceBoundary::RecoveryBackupMetadataDirectorySynced,
         "recover import backup metadata",
         failpoints,
@@ -1841,6 +1863,7 @@ pub(crate) fn recover_import(
         result_state,
         &result_temp,
         &result_target,
+        &transaction.result_digest,
         crate::PersistenceBoundary::RecoveryMutationResultDirectorySynced,
         "recover import result",
         failpoints,
@@ -1850,6 +1873,7 @@ pub(crate) fn recover_import(
         receipt_state,
         &receipt_temp,
         &receipt_target,
+        &transaction.receipt_digest,
         crate::PersistenceBoundary::RecoveryMutationReceiptDirectorySynced,
         "recover import receipt",
         failpoints,
@@ -1859,22 +1883,39 @@ pub(crate) fn recover_import(
         audit_state,
         &audit_temp,
         &audit_target,
+        &transaction.audit_digest,
         crate::PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
         "recover import audit",
         failpoints,
     )?;
+    revalidate_complete_import_targets(
+        root,
+        manifest,
+        transaction,
+        &record_states,
+        &tombstone_states,
+        backup_state,
+        result_state,
+        receipt_state,
+        audit_state,
+    )?;
     if let Some(StagedImportFile::Exact(metadata_identity)) = metadata_temp_state {
+        revalidate_exact_import_file(
+            root,
+            &metadata_temp,
+            &metadata_temp_digest,
+            metadata_identity,
+        )?;
         root.rename(
             &metadata_temp,
             Path::new(crate::layout::STORE_METADATA_FILE),
         )?;
-        if !import_file_identity_matches(
+        revalidate_exact_import_file(
             root,
             Path::new(crate::layout::STORE_METADATA_FILE),
+            &metadata_temp_digest,
             metadata_identity,
-        )? {
-            return Err(StoreError::UnsafePath);
-        }
+        )?;
         root.sync_root("recover imported store metadata")?;
         failpoints.check(crate::PersistenceBoundary::RecoveryMetadataDirectorySynced)?;
     } else if metadata_temp_state.is_none() {
@@ -1900,18 +1941,27 @@ pub(crate) fn recover_import(
 enum ImportFileState {
     Absent,
     Staged(StagedImportFile),
-    Target,
+    Target(crate::layout::FileIdentity),
 }
 
 impl ImportFileState {
     const fn is_target(&self) -> bool {
-        matches!(self, Self::Target)
+        matches!(self, Self::Target(_))
     }
 
     const fn staged_identity(self) -> Option<crate::layout::FileIdentity> {
         match self {
             Self::Staged(staged) => Some(staged.identity()),
-            Self::Absent | Self::Target => None,
+            Self::Absent | Self::Target(_) => None,
+        }
+    }
+
+    const fn published_identity(self) -> Option<crate::layout::FileIdentity> {
+        match self {
+            Self::Target(identity) | Self::Staged(StagedImportFile::Exact(identity)) => {
+                Some(identity)
+            }
+            Self::Absent | Self::Staged(StagedImportFile::Incomplete(_)) => None,
         }
     }
 }
@@ -1941,7 +1991,7 @@ fn inspect_import_file_pair(
     match (target_identity, staged_state) {
         (None, None) => Ok(ImportFileState::Absent),
         (None, Some(state)) => Ok(ImportFileState::Staged(state)),
-        (Some(_), None) => Ok(ImportFileState::Target),
+        (Some(identity), None) => Ok(ImportFileState::Target(identity)),
         (Some(_), Some(_)) => Err(StoreError::InvalidTransaction),
     }
 }
@@ -1991,6 +2041,84 @@ fn inspect_exact_file(
             Ok(identity)
         })
         .transpose()
+}
+
+fn revalidate_exact_import_file(
+    root: &crate::layout::StoreDirectory,
+    relative: &Path,
+    expected_digest: &str,
+    expected_identity: crate::layout::FileIdentity,
+) -> Result<(), StoreError> {
+    match inspect_exact_file(root, relative, expected_digest)? {
+        Some(identity) if identity == expected_identity => Ok(()),
+        Some(_) | None => Err(StoreError::UnsafePath),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn revalidate_complete_import_targets(
+    root: &crate::layout::StoreDirectory,
+    manifest: &crate::transaction::TransactionManifest,
+    transaction: &ImportTransaction,
+    record_states: &[ImportFileState],
+    tombstone_states: &[ImportFileState],
+    backup_state: ImportFileState,
+    result_state: ImportFileState,
+    receipt_state: ImportFileState,
+    audit_state: ImportFileState,
+) -> Result<(), StoreError> {
+    for (intent, state) in transaction.records.iter().zip(record_states) {
+        revalidate_exact_import_file(
+            root,
+            &import_record_relative(intent),
+            &intent.content_digest,
+            state
+                .published_identity()
+                .ok_or(StoreError::InvalidTransaction)?,
+        )?;
+    }
+    for (intent, state) in transaction.tombstones.iter().zip(tombstone_states) {
+        revalidate_exact_import_file(
+            root,
+            &import_tombstone_relative(intent),
+            &intent.content_digest,
+            state
+                .published_identity()
+                .ok_or(StoreError::InvalidTransaction)?,
+        )?;
+    }
+    for (relative, digest, state) in [
+        (
+            import_backup_relative(&manifest.transaction_id)?,
+            &transaction.backup_digest,
+            backup_state,
+        ),
+        (
+            import_result_relative(&transaction.binding.receipt_id)?,
+            &transaction.result_digest,
+            result_state,
+        ),
+        (
+            import_receipt_relative(&transaction.binding)?,
+            &transaction.receipt_digest,
+            receipt_state,
+        ),
+        (
+            import_audit_relative(transaction.binding.audit_sequence)?,
+            &transaction.audit_digest,
+            audit_state,
+        ),
+    ] {
+        revalidate_exact_import_file(
+            root,
+            &relative,
+            digest,
+            state
+                .published_identity()
+                .ok_or(StoreError::InvalidTransaction)?,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2091,22 +2219,25 @@ fn remove_import_temp(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_publish_import_pair(
     root: &crate::layout::StoreDirectory,
     state: ImportFileState,
     staged: &Path,
     target: &Path,
+    expected_digest: &str,
     boundary: crate::PersistenceBoundary,
     operation: &'static str,
     failpoints: &crate::failpoint::Failpoints,
 ) -> Result<(), StoreError> {
     match state {
-        ImportFileState::Target => Ok(()),
+        ImportFileState::Target(identity) => {
+            revalidate_exact_import_file(root, target, expected_digest, identity)
+        }
         ImportFileState::Staged(StagedImportFile::Exact(identity)) => {
+            revalidate_exact_import_file(root, staged, expected_digest, identity)?;
             root.rename(staged, target)?;
-            if !import_file_identity_matches(root, target, identity)? {
-                return Err(StoreError::UnsafePath);
-            }
+            revalidate_exact_import_file(root, target, expected_digest, identity)?;
             crate::transaction::sync_parent(root, target, operation)?;
             failpoints.check(boundary)
         }

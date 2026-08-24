@@ -9230,6 +9230,120 @@ fn import_recovery_rejects_hardlinked_record_and_body_free_artifact_temps() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn import_recovery_rechecks_published_record_and_artifact_targets_before_commit_or_cleanup() {
+    for (boundary, kind) in [
+        (
+            PersistenceBoundary::RecordDirectorySynced,
+            "record-roll-forward",
+        ),
+        (
+            PersistenceBoundary::MetadataDirectorySynced,
+            "backup-metadata-target-cleanup",
+        ),
+    ] {
+        let directory = TempDir::new().expect("target store");
+        let external = TempDir::new().expect("external hardlink witness");
+        let principal = principal_id("prn_portable_export");
+        let authority = AuthorizedScopes::new(principal.clone())
+            .with_project(project_id("prj_portable_export"))
+            .with_session(session_id("ses_portable_export"));
+        let context = TrustedRequestContext {
+            principal_id: principal,
+            client_id: ClientId::new(format!("cli_import_target_recheck_{kind}"))
+                .expect("client ID"),
+            grants: BTreeSet::from([
+                Grant::new("memory:import:project").expect("project grant"),
+                Grant::new("memory:import:session").expect("session grant"),
+            ]),
+        };
+        let bundle = include_bytes!("../fixtures/inspection/v1alpha1/valid/portable-export.json");
+        drop(CanonicalStore::initialize(directory.path(), owner()).expect("initialize"));
+        let mut store = CanonicalStore::open_with_options(
+            directory.path(),
+            owner(),
+            StoreOptions::with_failpoint_injector(FailOnce::at(boundary)),
+        )
+        .expect("open failure store");
+        let plan = store
+            .plan_import(&authority, &context, bundle)
+            .expect("plan");
+        store
+            .import_portable(
+                &authority,
+                &context,
+                bundle,
+                &plan.digest,
+                &IdempotencyKey::new(format!("import-target-recheck-{kind}"))
+                    .expect("idempotency key"),
+            )
+            .expect_err("leave a published target with an active manifest");
+        drop(store);
+
+        let (target, later_inspection) = match kind {
+            "record-roll-forward" => {
+                let target = regular_files_below(directory.path(), "records")
+                    .into_iter()
+                    .find(|relative| {
+                        relative.file_name().is_some_and(|name| {
+                            !name.to_string_lossy().starts_with(".import-record-")
+                        })
+                    })
+                    .map(|relative| directory.path().join(relative))
+                    .expect("published record target");
+                (
+                    target,
+                    only_regular_file_below(directory.path(), layout::IMPORT_BACKUPS_DIR),
+                )
+            }
+            "backup-metadata-target-cleanup" => (
+                only_regular_file_below(directory.path(), layout::IMPORT_BACKUPS_DIR),
+                only_regular_file_below(directory.path(), layout::IMPORT_RESULTS_DIR),
+            ),
+            _ => unreachable!(),
+        };
+        let target_bytes = fs::read(&target).expect("published target bytes");
+        let outside_link = external.path().join(format!("{kind}.json"));
+        let hook_target = target.clone();
+        let hook_outside = outside_link.clone();
+        let trigger_name = later_inspection
+            .file_name()
+            .expect("later inspected file name")
+            .to_os_string();
+        let hook_fired = Arc::new(AtomicBool::new(false));
+        let fired_by_hook = Arc::clone(&hook_fired);
+        layout::install_test_hook(
+            layout::TestHookPoint::RegularOpen,
+            trigger_name,
+            move || {
+                fs::hard_link(&hook_target, &hook_outside)
+                    .expect("add external hardlink after target classification");
+                fired_by_hook.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(
+            CanonicalStore::open(directory.path(), owner())
+                .expect_err("raced target identity fails closed before readiness")
+                .code(),
+            StoreErrorCode::UnsafePath,
+            "{kind}"
+        );
+        assert!(hook_fired.load(Ordering::SeqCst), "{kind}");
+        assert_eq!(
+            fs::read(&outside_link).expect("external hardlink remains untouched"),
+            target_bytes,
+            "{kind}"
+        );
+        assert_eq!(
+            regular_files_below(directory.path(), "transactions").len(),
+            1,
+            "active manifest must remain for {kind}"
+        );
+    }
+}
+
 #[test]
 fn orphan_import_record_tombstone_and_private_artifact_temps_fail_before_readiness() {
     for kind in ["record", "tombstone", "artifact"] {
