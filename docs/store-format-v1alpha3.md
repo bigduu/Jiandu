@@ -110,7 +110,8 @@ The operation-set authorization seam and the reversible mapping from an MCP
 field to v1alpha3 or v1alpha4 manifest/tombstone/result/receipt/audit codecs.
 The standalone correlation remains absent from artifacts, existing strict
 fixtures remain byte compatible, and the transaction ID remains the durable
-anchor.
+anchor. Fresh attempts use UUIDv4, while replay continues to accept every
+canonical UUID version already valid for historical transaction IDs.
 
 Executable byte fixtures are checked under
 `crates/jiandu-store/fixtures/v1alpha3/`. The separate `v1alpha2` fixture set is

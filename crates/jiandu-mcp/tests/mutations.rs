@@ -1,7 +1,7 @@
 use jiandu_core::{
     ClientId, CreationActor, ErrorEnvelope, ForgetMemoryCommand, ForgetMemoryResult, Grant,
-    IdempotencyKey, ListSort, MemoryGetRequest, MemoryListRequest, MemoryListResult, MemoryPatch,
-    MemoryRecord, MemoryScope, MemorySearchRequest, MemorySearchResult, MemoryType,
+    IdempotencyKey, ListSort, MemoryGetRequest, MemoryId, MemoryListRequest, MemoryListResult,
+    MemoryPatch, MemoryRecord, MemoryScope, MemorySearchRequest, MemorySearchResult, MemoryType,
     MutationInvocation, PageLimit, PrincipalId, ProjectId, ProvenanceInput, RememberMemoryCommand,
     RememberMemoryResult, ResultEnvelope, Revision, ScopeSelector, StoreRevision, Tag, Timestamp,
     TrustedRequestContext, UpdateMemoryCommand, UpdateMemoryResult,
@@ -28,7 +28,9 @@ use rmcp::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -844,6 +846,113 @@ async fn duplex_mutations_preserve_replay_cas_policy_correlation_and_body_free_f
 
     client.cancel().await.expect("cancel client");
     server_task.await.expect("join server");
+}
+
+#[tokio::test]
+async fn canonical_non_v4_historical_transaction_reopens_and_replays_through_mcp() {
+    let root = TempDir::new().expect("temporary historical store");
+    let principal = PrincipalId::new("prn_mcp_historical_replay").expect("principal");
+    let scopes = AuthorizedScopes::new(principal.clone());
+    let trusted = context(
+        &principal,
+        &["memory:read", "memory:write:principal"],
+        "cli_mcp_historical_replay",
+    );
+    let scope = MemoryScope::Principal {
+        principal_id: principal.clone(),
+    };
+    let authorization = scopes
+        .authorize_mutation(&trusted, &scope, MutationOperation::Create)
+        .expect("create authorization");
+    let command = remember_command(
+        "historical-non-v4-replay-key",
+        "HISTORICAL_NON_V4_BODY_SENTINEL",
+    );
+    let mut store = CanonicalStore::initialize(
+        root.path(),
+        LockOwner::for_current_process().expect("lock owner"),
+    )
+    .expect("initialize historical store");
+    let committed = store
+        .create(
+            &authorization,
+            &command,
+            MemoryId::new("mem_mcp_historical_replay").expect("memory ID"),
+            CreationActor::Host,
+            Timestamp::new("2026-08-25T00:00:00Z").expect("timestamp"),
+        )
+        .expect("commit historical record");
+    assert_eq!(committed.store_revision, StoreRevision(1));
+    drop(store);
+
+    // v1alpha2/v1alpha3/v1alpha4 define transactionId as a canonical UUID,
+    // not specifically UUIDv4. Rewrite the complete committed private ledger
+    // to a valid UUIDv1-shaped identifier and then require startup validation
+    // plus a real MCP exact replay to preserve that historical contract.
+    let historical_transaction_id = "00000000-0000-1000-8000-000000000008";
+    rewrite_committed_transaction_id(
+        root.path(),
+        &committed.transaction_id,
+        historical_transaction_id,
+    );
+
+    let reopened = CanonicalStore::open(
+        root.path(),
+        LockOwner::for_current_process().expect("reopen lock owner"),
+    )
+    .expect("canonical non-v4 transaction remains a valid committed store");
+    let index_directory = root.path().join("index");
+    let backend = Arc::new(CanonicalReadBackend::new(
+        Arc::new(RwLock::new(reopened)),
+        LexicalIndex::new(&index_directory),
+        CursorMacKey::new([0x91; 32]),
+        ReadServiceHealth::new(StoreReadHealth::Ready, IndexReadHealth::Missing),
+    ));
+    let policy = Arc::new(
+        ConfiguredMutationPolicy::allow_all(Arc::new(RecordingSecretPolicy::allow()))
+            .expect("allow historical replay policy"),
+    );
+    let server = JianduReadServer::new_with_mutations(
+        backend,
+        &scopes,
+        &trusted,
+        policy,
+        CreationActor::Host,
+    )
+    .expect("historical replay server");
+    let (server_transport, client_transport) = tokio::io::duplex(128 * 1024);
+    let server_task = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .expect("historical server starts")
+            .waiting()
+            .await
+            .expect("historical server stops");
+    });
+    let client = V2025Client
+        .serve(client_transport)
+        .await
+        .expect("historical client connects");
+    let before_replay = tree_snapshot(root.path());
+    let replay = client
+        .call_tool(
+            CallToolRequestParams::new("memory_remember").with_arguments(arguments(&command)),
+        )
+        .await
+        .expect("historical exact replay envelope");
+    let replay: ResultEnvelope<RememberMemoryResult> = success_envelope(&replay);
+    assert!(replay.result.idempotent_replay);
+    assert_eq!(replay.result.record, committed.record);
+    assert_eq!(replay.store_revision, committed.store_revision);
+    assert_eq!(
+        replay.correlation_id.as_str(),
+        "req_txn_00000000000010008000000000000008"
+    );
+    assert_eq!(tree_snapshot(root.path()), before_replay);
+
+    client.cancel().await.expect("cancel historical client");
+    server_task.await.expect("join historical server");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1912,6 +2021,52 @@ fn assert_single_commit_watermarks(root: &Path, expected: u64) {
         .expect("mutation audit directory")
         .count();
     assert_eq!(audit_count as u64, expected);
+}
+
+fn rewrite_committed_transaction_id(root: &Path, original: &str, replacement: &str) {
+    assert_eq!(original.len(), replacement.len(), "canonical UUID width");
+    let snapshot = tree_snapshot(root);
+    let mut result = None;
+    let mut dependent_artifacts = Vec::new();
+    for (relative, entry) in snapshot {
+        let Some(bytes) = entry.bytes else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if text.contains("\"formatVersion\": \"jiandu.store.mutation-result/") {
+            assert!(result.replace((relative, text)).is_none(), "one result");
+        } else if text.contains("\"formatVersion\": \"jiandu.store.idempotency-receipt/")
+            || text.contains("\"formatVersion\": \"jiandu.store.mutation-audit/")
+        {
+            dependent_artifacts.push((relative, text));
+        }
+    }
+
+    let (result_relative, result_text) = result.expect("committed mutation result artifact");
+    assert_eq!(result_text.matches(original).count(), 1);
+    let rewritten_result = result_text.replace(original, replacement);
+    let mut result_digest = String::from("sha256:");
+    for byte in Sha256::digest(rewritten_result.as_bytes()) {
+        write!(&mut result_digest, "{byte:02x}").expect("write digest hex");
+    }
+    fs::write(root.join(result_relative), rewritten_result).expect("rewrite mutation result");
+
+    assert_eq!(dependent_artifacts.len(), 2, "one receipt and one audit");
+    for (relative, text) in dependent_artifacts {
+        assert_eq!(text.matches(original).count(), 1);
+        let value: serde_json::Value = serde_json::from_str(&text).expect("private artifact JSON");
+        let original_digest = value["resultDigest"]
+            .as_str()
+            .expect("result digest")
+            .to_owned();
+        assert_eq!(text.matches(&original_digest).count(), 1);
+        let rewritten =
+            text.replacen(original, replacement, 1)
+                .replacen(&original_digest, &result_digest, 1);
+        fs::write(root.join(relative), rewritten).expect("rewrite dependent private artifact");
+    }
 }
 
 fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {

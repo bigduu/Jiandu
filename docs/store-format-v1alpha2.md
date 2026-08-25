@@ -99,7 +99,10 @@ The operation-set capability and MCP correlation mapping are runtime
 authorization/adapter seams only. They add no serialized field to the
 historical v1alpha2 manifest, receipt, result, or audit codecs; transaction ID
 remains the strict durable anchor, so checked v1alpha2 fixtures remain byte
-compatible.
+compatible. Fresh MCP attempts generate UUIDv4 anchors, but historical
+`transactionId` values remain valid for every canonical UUID version accepted
+by this codec. Replay correlation derivation must not narrow that historical
+contract by reapplying the fresh-attempt UUIDv4 rule.
 
 The receipt identity is derived from:
 

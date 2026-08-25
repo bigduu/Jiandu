@@ -196,10 +196,13 @@ A fresh call uses a strict `req_txn_` UUIDv4 correlation. Its UUID maps
 reversibly to the existing hyphenated transaction ID that strict WAL, result,
 receipt, and audit bindings already repeat, so this feature does not change the
 v1alpha4 store codec. The correlation is excluded from canonical request
-identity. Exact replay returns the original committed operation correlation
-and store revision; the current retry attempt correlation remains local to
-policy/backend diagnostics. Mutation failures carry the revision captured
-under the same store writer guard, avoiding a later mixed-watermark read.
+identity. Historical store codecs accept any canonical UUID version for
+`transactionId`; exact replay maps that durable UUID to the same `req_txn_`
+simple form without reapplying the UUIDv4-only fresh-attempt rule. It returns
+the original committed operation correlation and store revision; the current
+retry attempt correlation remains local to policy/backend diagnostics.
+Mutation failures carry the revision captured under the same store writer
+guard, avoiding a later mixed-watermark read.
 
 Canonical fsync/rename work runs on a blocking worker. MCP
 `notifications/cancelled`, an adapter future drop, or transport timeout marks

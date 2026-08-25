@@ -359,14 +359,16 @@ restart recovery.
 Jiandu emits structured, secret-safe logs and metrics for request latency,
 error codes, mutation conflicts, idempotent replays, store revisions, index
 health, rebuild progress, and recovery activity. For a fresh MCP mutation, a
-domain-separated UUID correlation maps reversibly to the transaction ID
+domain-separated UUIDv4 correlation maps reversibly to the transaction ID
 already bound by the strict WAL/result/receipt/audit codecs. Correlation is
 excluded from the request fingerprint. An exact replay returns that original
-durable operation correlation; the retry attempt's separately generated
-correlation remains local to adapter/policy diagnostics and is not persisted
-or added to the public envelope. Mutation failures carry the store revision
-captured under the same writer guard; the adapter never performs a racy second
-watermark read to build the error envelope.
+durable operation correlation, including historical transaction IDs using any
+canonical UUID version accepted by the existing store codecs; the fresh
+UUIDv4 constraint is not reapplied to replay. The retry attempt's separately
+generated correlation remains local to adapter/policy diagnostics and is not
+persisted or added to the public envelope. Mutation failures carry the store
+revision captured under the same writer guard; the adapter never performs a
+racy second watermark read to build the error envelope.
 
 Record bodies, user queries, credentials, and prompt text are excluded from logs by default.
 

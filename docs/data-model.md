@@ -362,11 +362,14 @@ full request fingerprint is read. Fresh target discovery scans only the same
 set, preserving the absent/inaccessible boundary for opaque IDs.
 
 The adapter passes a trusted, non-serializable `MutationInvocation` beside the
-core command. Its domain-separated UUID correlation maps reversibly to the
-existing transaction ID repeated in strict WAL/result/receipt/audit bindings;
-it adds no field to record or store codecs and is excluded from the
-idempotency fingerprint. A replay therefore returns the original durable
-operation correlation, while the current retry attempt remains local.
+core command. A fresh invocation requires a domain-separated UUIDv4
+correlation, which maps reversibly to the existing transaction ID repeated in
+strict WAL/result/receipt/audit bindings. Historical committed transaction IDs
+remain valid for every canonical UUID version admitted by those codecs; replay
+derives their correlation without applying the fresh UUIDv4 constraint. This
+adds no field to record or store codecs and is excluded from the idempotency
+fingerprint. A replay therefore returns the original durable operation
+correlation, while the current retry attempt remains local.
 
 Fresh remember/update admission receives the complete validated canonical
 target after replay/conflict handling and CAS; fresh forget admission receives

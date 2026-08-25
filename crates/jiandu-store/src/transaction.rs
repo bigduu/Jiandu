@@ -469,7 +469,10 @@ pub(crate) fn correlation_id_from_transaction_id(
     let correlation_id =
         CorrelationId::new(format!("{MUTATION_CORRELATION_PREFIX}{}", uuid.simple()))
             .map_err(|_| StoreError::InvalidTransaction)?;
-    MutationInvocation::new(correlation_id.clone()).map_err(|_| StoreError::InvalidTransaction)?;
+    // The durable formats have always accepted every canonical UUID version.
+    // Only a newly generated transport invocation is required to be UUIDv4;
+    // replaying a historical committed transaction must not silently tighten
+    // the existing on-disk codec by reapplying that fresh-attempt rule.
     Ok(correlation_id)
 }
 
