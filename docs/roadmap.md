@@ -64,12 +64,16 @@ Tracking issues:
 
 - [#7 — structured MCP read operations and resources](https://github.com/bigduu/Jiandu/issues/7) — implemented as a transport-independent handler
 - [#8 — authorized MCP mutation operations](https://github.com/bigduu/Jiandu/issues/8) — implemented as independently granted, idempotent single-record tools
-- [#9 — standalone MCP service](https://github.com/bigduu/Jiandu/issues/9) (parent tracker), split into:
+- [#9 — standalone MCP service](https://github.com/bigduu/Jiandu/issues/9) (thin v0.1 tracker), delivered by:
   - [#28 — authenticated singleton loopback MCP daemon](https://github.com/bigduu/Jiandu/issues/28) — implemented foundation
-  - [#29 — bounded daemon shutdown and secret-safe telemetry](https://github.com/bigduu/Jiandu/issues/29)
-  - [#30 — safe administrative CLI operations](https://github.com/bigduu/Jiandu/issues/30)
-  - [#31 — stdio proxy and local daemon packaging](https://github.com/bigduu/Jiandu/issues/31)
-- [#10 — two-client conformance and degradation coverage](https://github.com/bigduu/Jiandu/issues/10)
+  - [#33 — thin v0.1 daemon authority configuration](https://github.com/bigduu/Jiandu/issues/33) — implemented compact typed permission profile
+- [#10 — ordinary two-client public conformance](https://github.com/bigduu/Jiandu/issues/10)
+- Non-blocking service follow-ups:
+  - [#29 — bounded shutdown admission and durable drain](https://github.com/bigduu/Jiandu/issues/29)
+  - [#34 — restart, retry, and degraded-index conformance](https://github.com/bigduu/Jiandu/issues/34)
+  - [#35 — secret-safe diagnostics after integration demand](https://github.com/bigduu/Jiandu/issues/35)
+  - [#30 — administrative maintenance commands on demand](https://github.com/bigduu/Jiandu/issues/30)
+  - [#31 — stdio proxy only for clients without HTTP](https://github.com/bigduu/Jiandu/issues/31)
 
 - Expose structured read tools and resources (done).
 - Add mutation tools with independent capability grants (done).
@@ -78,12 +82,13 @@ Tracking issues:
   done).
 - Publish separate closed liveness/readiness probes without making disposable
   search health authoritative (Issue #28, done).
-- Add bounded graceful shutdown plus structured secret-safe logs and metrics
-  (Issue #29).
-- Add administrative commands without bypassing canonical authority (Issue
-  #30).
-- Provide a `stdio` proxy that connects to the daemon instead of opening the
-  store, plus local packaging (Issue #31).
+- Replace the unreleased raw grant/policy daemon inputs with one versioned,
+  typed read/write/forget permission profile and closed service defaults (Issue
+  #33, done).
+- Prove the ordinary public contract with two independent clients (Issue #10).
+- Add restart/retry/degraded-index conformance (#34), bounded shutdown (#29),
+  diagnostics (#35), administrative commands (#30), and a `stdio` proxy (#31)
+  only as separately scheduled follow-ups; none blocks the thin #9 service.
 
 Outcome: at least two independent MCP clients can use the same Jiandu service safely.
 
