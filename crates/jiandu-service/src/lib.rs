@@ -1,7 +1,7 @@
 //! Production loopback daemon composition for Jiandu.
 //!
 //! Startup configuration is read from one trusted local file. MCP requests
-//! never select filesystem paths, identities, grants, or mutation policy.
+//! never select filesystem paths, identities, permissions, or mutation policy.
 
 mod auth;
 mod config;

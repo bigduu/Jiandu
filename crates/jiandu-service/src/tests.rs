@@ -4,10 +4,11 @@ use crate::auth::bearer_digest;
 use crate::{DaemonError, LIVENESS_ROUTE, MCP_ROUTE, READINESS_ROUTE, RunningDaemon, ServeConfig};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use jiandu_core::{
-    IdempotencyKey, MemoryGetRequest, MemoryRecord, MemoryType, ProvenanceInput,
-    RememberMemoryCommand, RememberMemoryResult, ResultEnvelope, ScopeSelector, Tag,
+    ClientId, CreationActor, Grant, IdempotencyKey, MAX_BODY_BYTES, MemoryGetRequest, MemoryRecord,
+    MemoryType, PrincipalId, ProjectId, ProvenanceInput, RememberMemoryCommand,
+    RememberMemoryResult, ResultEnvelope, ScopeSelector, SessionId, Tag,
 };
-use jiandu_store::{CanonicalStore, LockOwner};
+use jiandu_store::{CanonicalStore, LockOwner, MutationOperation};
 use rmcp::model::{CallToolRequestParams, ClientInfo, JsonObject, ProtocolVersion};
 use rmcp::transport::{
     StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -16,7 +17,7 @@ use rmcp::{ClientHandler, ServiceExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -26,6 +27,8 @@ const VALID_TOKEN: &str = "daemon-e2e-token-0123456789abcdef";
 const INVALID_TOKEN: &str = "daemon-wrong-token-0123456789abcdef";
 const PRINCIPAL_SENTINEL: &str = "prn_daemon_private_identity";
 const CLIENT_SENTINEL: &str = "cli_daemon_private_identity";
+const PROJECT_SENTINEL: &str = "prj_daemon_exact_scope";
+const SESSION_SENTINEL: &str = "ses_daemon_exact_scope";
 
 #[derive(Debug, Clone)]
 struct V2025Client;
@@ -90,9 +93,145 @@ fn config_rejects_non_loopback_and_redacts_all_private_startup_material() {
 }
 
 #[test]
-fn config_rejects_malformed_or_duplicate_credentials_and_unknown_authority() {
+fn compact_profile_derives_the_equivalent_trusted_context_and_exact_mutation_authority() {
+    let root = TempDir::new().expect("temporary data parent");
+    let mut document = config_value("127.0.0.1:0", root.path(), VALID_TOKEN);
+    document["clients"][0]["scopes"] = json!({
+        "projectIds": [PROJECT_SENTINEL],
+        "sessionIds": [SESSION_SENTINEL],
+        "instanceGlobal": true
+    });
+    document["clients"][0]["permissions"] = json!({
+        "read": true,
+        "write": ["principal", "project"],
+        "forget": ["session", "instance_global"]
+    });
+    let config = ServeConfig::from_slice(&json_bytes(document)).expect("compact profile");
+    let client = &config.clients[0];
+
+    assert_eq!(
+        client.context.principal_id,
+        PrincipalId::new(PRINCIPAL_SENTINEL).expect("principal")
+    );
+    assert_eq!(
+        client.context.client_id,
+        ClientId::new(CLIENT_SENTINEL).expect("client")
+    );
+    assert_eq!(client.creation_actor, CreationActor::Host);
+    assert_eq!(
+        client.context.grants,
+        BTreeSet::from([
+            Grant::new("memory:read").expect("read grant"),
+            Grant::new("memory:write:principal").expect("principal write grant"),
+            Grant::new("memory:write:project").expect("project write grant"),
+            Grant::new("memory:forget:session").expect("session forget grant"),
+            Grant::new("memory:forget:instance_global").expect("global forget grant"),
+        ])
+    );
+    assert!(client.mutation_policy.is_some());
+    client
+        .scopes
+        .authorize_read(&client.context)
+        .expect("read permission");
+
+    let write = client
+        .scopes
+        .authorize_mutation_set(&client.context, MutationOperation::Create)
+        .expect("write authority");
+    assert!(
+        write
+            .authorize_selector(&ScopeSelector::Principal {})
+            .is_ok()
+    );
+    assert!(
+        write
+            .authorize_selector(&ScopeSelector::Project {
+                project_id: ProjectId::new(PROJECT_SENTINEL).expect("project"),
+            })
+            .is_ok()
+    );
+    assert!(
+        write
+            .authorize_selector(&ScopeSelector::Session {
+                session_id: SessionId::new(SESSION_SENTINEL).expect("session"),
+            })
+            .is_err()
+    );
+    assert!(
+        write
+            .authorize_selector(&ScopeSelector::InstanceGlobal {})
+            .is_err()
+    );
+
+    let forget = client
+        .scopes
+        .authorize_mutation_set(&client.context, MutationOperation::Forget)
+        .expect("forget authority");
+    assert!(
+        forget
+            .authorize_selector(&ScopeSelector::Session {
+                session_id: SessionId::new(SESSION_SENTINEL).expect("session"),
+            })
+            .is_ok()
+    );
+    assert!(
+        forget
+            .authorize_selector(&ScopeSelector::InstanceGlobal {})
+            .is_ok()
+    );
+    assert!(
+        forget
+            .authorize_selector(&ScopeSelector::Principal {})
+            .is_err()
+    );
+
+    let mut cross_principal = client.context.clone();
+    cross_principal.principal_id =
+        PrincipalId::new("prn_cross_principal").expect("cross principal");
+    assert!(client.scopes.authorize_read(&cross_principal).is_err());
+    assert!(
+        client
+            .scopes
+            .authorize_mutation_set(&cross_principal, MutationOperation::Create)
+            .is_err()
+    );
+
+    let mut read_only_document = config_value("127.0.0.1:0", root.path(), VALID_TOKEN);
+    read_only_document["clients"][0]["permissions"] = json!({
+        "read": true,
+        "write": [],
+        "forget": []
+    });
+    let read_only =
+        ServeConfig::from_slice(&json_bytes(read_only_document)).expect("read-only profile");
+    let read_only_client = &read_only.clients[0];
+    assert_eq!(
+        read_only_client.context.grants,
+        BTreeSet::from([Grant::new("memory:read").expect("read grant")])
+    );
+    assert!(read_only_client.mutation_policy.is_none());
+    assert!(
+        read_only_client
+            .scopes
+            .authorize_mutation_set(&read_only_client.context, MutationOperation::Create)
+            .is_err()
+    );
+    assert!(
+        read_only_client
+            .scopes
+            .authorize_mutation_set(&read_only_client.context, MutationOperation::Forget)
+            .is_err()
+    );
+}
+
+#[test]
+fn config_rejects_old_unknown_duplicate_contradictory_cross_principal_or_secret_authority() {
     let root = TempDir::new().expect("temporary data parent");
     let document = config_value("127.0.0.1:0", root.path(), VALID_TOKEN);
+
+    let mut unknown_version = document.clone();
+    unknown_version["configVersion"] = Value::String("jiandu.service.config/v9".to_owned());
+    assert!(ServeConfig::from_slice(&json_bytes(unknown_version)).is_err());
 
     let mut uppercase_digest = document.clone();
     uppercase_digest["clients"][0]["bearerTokenDigest"] =
@@ -106,9 +245,76 @@ fn config_rejects_malformed_or_duplicate_credentials_and_unknown_authority() {
     ]);
     assert!(ServeConfig::from_slice(&json_bytes(duplicate)).is_err());
 
-    let mut unknown_grant = document;
-    unknown_grant["clients"][0]["grants"] = json!(["memory:read", "daemon:admin"]);
-    assert!(ServeConfig::from_slice(&json_bytes(unknown_grant)).is_err());
+    let mut duplicate_scope = document.clone();
+    duplicate_scope["clients"][0]["permissions"]["write"] = json!(["principal", "principal"]);
+    assert!(ServeConfig::from_slice(&json_bytes(duplicate_scope)).is_err());
+
+    let mut duplicate_exact_scope = document.clone();
+    duplicate_exact_scope["clients"][0]["scopes"]["projectIds"] =
+        json!([PROJECT_SENTINEL, PROJECT_SENTINEL]);
+    assert!(ServeConfig::from_slice(&json_bytes(duplicate_exact_scope)).is_err());
+
+    let mut contradictory_scope = document.clone();
+    contradictory_scope["clients"][0]["permissions"]["write"] = json!(["project"]);
+    assert!(ServeConfig::from_slice(&json_bytes(contradictory_scope)).is_err());
+
+    let mut no_read = document.clone();
+    no_read["clients"][0]["permissions"]["read"] = Value::Bool(false);
+    assert!(ServeConfig::from_slice(&json_bytes(no_read)).is_err());
+
+    let mut unknown_permission = document.clone();
+    unknown_permission["clients"][0]["permissions"]["admin"] = Value::Bool(true);
+    assert!(ServeConfig::from_slice(&json_bytes(unknown_permission)).is_err());
+
+    let mut unknown_scope_kind = document.clone();
+    unknown_scope_kind["clients"][0]["permissions"]["write"] = json!(["tenant"]);
+    assert!(ServeConfig::from_slice(&json_bytes(unknown_scope_kind)).is_err());
+
+    let mut old_schema = document.clone();
+    old_schema
+        .as_object_mut()
+        .expect("config object")
+        .remove("configVersion");
+    let old_client = old_schema["clients"][0]
+        .as_object_mut()
+        .expect("client object");
+    old_client.remove("permissions");
+    old_client.insert("grants".to_owned(), json!(["memory:read"]));
+    old_client.insert(
+        "mutationPolicy".to_owned(),
+        json!({
+            "maxBodyBytes": 4096,
+            "allowedTypes": ["decision"],
+            "allowedScopes": ["principal"],
+            "secretContentPolicy": "allow_all"
+        }),
+    );
+    assert!(ServeConfig::from_slice(&json_bytes(old_schema)).is_err());
+
+    let mut old_policy_sources = document.clone();
+    old_policy_sources["clients"][0]["grants"] = json!(["memory:read"]);
+    old_policy_sources["clients"][0]["mutationPolicy"] = json!({
+        "maxBodyBytes": 1,
+        "allowedTypes": ["decision"],
+        "allowedScopes": ["principal"],
+        "secretContentPolicy": "allow_all"
+    });
+    assert!(ServeConfig::from_slice(&json_bytes(old_policy_sources)).is_err());
+
+    let cross_principal_sentinel = "prn_forbidden_config_injection";
+    let mut cross_principal = document.clone();
+    cross_principal["clients"][0]["scopes"]["principalId"] =
+        Value::String(cross_principal_sentinel.to_owned());
+    let error = ServeConfig::from_slice(&json_bytes(cross_principal))
+        .expect_err("cross-principal scope injection rejected");
+    assert!(!format!("{error:?} {error}").contains(cross_principal_sentinel));
+
+    let raw_token_sentinel = "RAW_BEARER_CONFIG_SECRET_SENTINEL";
+    let mut raw_token = document;
+    raw_token["clients"][0]["bearerToken"] = Value::String(raw_token_sentinel.to_owned());
+    let error =
+        ServeConfig::from_slice(&json_bytes(raw_token)).expect_err("raw bearer field rejected");
+    assert!(!format!("{error:?} {error}").contains(raw_token_sentinel));
 }
 
 #[tokio::test]
@@ -213,12 +419,13 @@ async fn authenticated_streamable_http_discovers_reads_and_durably_mutates_one_s
         ]
     );
 
+    let maximum_body = "x".repeat(MAX_BODY_BYTES);
     let remember = RememberMemoryCommand {
         scope: ScopeSelector::Principal {},
-        memory_type: MemoryType::Decision,
+        memory_type: MemoryType::Reference,
         title: "Daemon E2E decision".to_owned(),
         summary: Some("Authenticated singleton transport".to_owned()),
-        body: "DAEMON_PRIVATE_BODY_SENTINEL".to_owned(),
+        body: maximum_body.clone(),
         tags: vec![Tag::new("daemon").expect("tag")],
         provenance: ProvenanceInput::default(),
         relations: Vec::new(),
@@ -242,7 +449,7 @@ async fn authenticated_streamable_http_discovers_reads_and_durably_mutates_one_s
         .expect("get tool");
     let fetched: ResultEnvelope<MemoryRecord> = success_envelope(&fetched);
     assert_eq!(fetched.result, remembered.result.record);
-    assert_eq!(fetched.result.body, "DAEMON_PRIVATE_BODY_SENTINEL");
+    assert_eq!(fetched.result.body, maximum_body);
     assert!(daemon.handler_construction_count() > 0);
 
     let readiness = reqwest::get(format!("{base}{READINESS_ROUTE}"))
@@ -374,6 +581,7 @@ fn config(bind: &str, data_dir: &Path, token: &str) -> Result<ServeConfig, crate
 
 fn config_value(bind: &str, data_dir: &Path, token: &str) -> Value {
     json!({
+        "configVersion": "jiandu.service.config/v0.1",
         "bind": bind,
         "dataDir": data_dir,
         "cursorMacKey": format!("hmac-sha256:{}", "11".repeat(32)),
@@ -381,19 +589,17 @@ fn config_value(bind: &str, data_dir: &Path, token: &str) -> Value {
             "bearerTokenDigest": format!("sha256:{}", lower_hex(&bearer_digest(token.as_bytes()))),
             "principalId": PRINCIPAL_SENTINEL,
             "clientId": CLIENT_SENTINEL,
-            "grants": ["memory:read", "memory:write:principal", "memory:forget:principal"],
             "scopes": {
                 "projectIds": [],
                 "sessionIds": [],
                 "instanceGlobal": false
             },
-            "creationActor": "host",
-            "mutationPolicy": {
-                "maxBodyBytes": 4096,
-                "allowedTypes": ["decision"],
-                "allowedScopes": ["principal"],
-                "secretContentPolicy": "allow_all"
-            }
+            "permissions": {
+                "read": true,
+                "write": ["principal"],
+                "forget": ["principal"]
+            },
+            "creationActor": "host"
         }]
     })
 }

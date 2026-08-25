@@ -66,6 +66,7 @@ Tracking issues:
 - [#8 — authorized MCP mutation operations](https://github.com/bigduu/Jiandu/issues/8) — implemented as independently granted, idempotent single-record tools
 - [#9 — standalone MCP service](https://github.com/bigduu/Jiandu/issues/9) (parent tracker), split into:
   - [#28 — authenticated singleton loopback MCP daemon](https://github.com/bigduu/Jiandu/issues/28) — implemented foundation
+  - [#33 — thin v0.1 daemon authority configuration](https://github.com/bigduu/Jiandu/issues/33) — implemented compact typed permission profile
   - [#29 — bounded daemon shutdown and secret-safe telemetry](https://github.com/bigduu/Jiandu/issues/29)
   - [#30 — safe administrative CLI operations](https://github.com/bigduu/Jiandu/issues/30)
   - [#31 — stdio proxy and local daemon packaging](https://github.com/bigduu/Jiandu/issues/31)
@@ -78,6 +79,9 @@ Tracking issues:
   done).
 - Publish separate closed liveness/readiness probes without making disposable
   search health authoritative (Issue #28, done).
+- Replace the unreleased raw grant/policy daemon inputs with one versioned,
+  typed read/write/forget permission profile and closed service defaults (Issue
+  #33, done).
 - Add bounded graceful shutdown plus structured secret-safe logs and metrics
   (Issue #29).
 - Add administrative commands without bypassing canonical authority (Issue

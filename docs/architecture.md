@@ -271,12 +271,13 @@ classifies the disposable index, constructs one shared
 authenticated connection uses that backend and therefore the same exclusive
 store owner and writer lock.
 
-The local configuration contains only a fixed `sha256:<64 lowercase hex>`
-bearer digest, trusted principal/client/grants/scopes, creation actor, mutation
-policy, and a fixed `hmac-sha256:<64 lowercase hex>` cursor key. The raw bearer
-exists only in an HTTP request. Operators must provision bearer values with at
-least 256 bits of cryptographic entropy; the transport's minimum-length check
-is not an entropy estimator. The boundary requires exactly one well-formed
+The closed `jiandu.service.config/v0.1` local configuration contains only a
+fixed `sha256:<64 lowercase hex>` bearer digest, trusted principal/client
+identity, exact scopes, one typed permission profile, creation actor, and a
+fixed `hmac-sha256:<64 lowercase hex>` cursor key. The raw bearer exists only
+in an HTTP request. Operators must provision bearer values with at least 256
+bits of cryptographic entropy; the transport's minimum-length check is not an
+entropy estimator. The boundary requires exactly one well-formed
 `Authorization: Bearer` value, hashes it, compares fixed-size digests in
 constant time, removes the header before MCP dispatch, and selects a separate
 session manager for that credential. Missing, multiple, malformed, or invalid
@@ -295,6 +296,7 @@ An abbreviated configuration shape is:
 
 ```json
 {
+  "configVersion": "jiandu.service.config/v0.1",
   "bind": "127.0.0.1:9817",
   "dataDir": "/operator/selected/existing-store",
   "cursorMacKey": "hmac-sha256:<64-lowercase-hex>",
@@ -302,23 +304,29 @@ An abbreviated configuration shape is:
     "bearerTokenDigest": "sha256:<64-lowercase-hex>",
     "principalId": "prn_local_client",
     "clientId": "cli_local_client",
-    "grants": ["memory:read", "memory:write:principal"],
     "scopes": { "projectIds": [], "sessionIds": [], "instanceGlobal": false },
-    "creationActor": "host",
-    "mutationPolicy": {
-      "maxBodyBytes": 65536,
-      "allowedTypes": ["preference", "decision", "project", "fact", "feedback", "reference"],
-      "allowedScopes": ["principal"],
-      "secretContentPolicy": "allow_all"
-    }
+    "permissions": { "read": true, "write": ["principal"], "forget": [] },
+    "creationActor": "host"
   }]
 }
 ```
 
-`allow_all` is an explicit deployment choice meaning that the upstream trusted
-admission layer supplies no additional secret detector; core validation and
-the configured size/type/scope limits still apply. Jiandu is not a credential
-vault.
+`read` is required by the fixed MCP surface. `write` and `forget` are separate
+sets of the closed `principal | project | session | instance_global` scope
+kinds. Each selected kind must have exact authority in `scopes`; duplicate
+kinds or IDs and permission for an absent exact kind fail configuration. The
+service derives `memory:read`, the exact `memory:write:*` and
+`memory:forget:*` grants, and the mutation-policy scope union from this one
+profile. Write and forget therefore remain independent without a second
+operator-visible grant or policy source.
+
+The v0.1 service defaults admit all six current memory types up to the core
+65,536-byte body bound. Its closed secret-content policy is the existing
+`AllowAllSecretContent`, meaning that the upstream trusted admission layer
+supplies no additional secret detector; it is not a configurable daemon knob.
+Core validation still applies, and Jiandu is not a credential vault. The
+unreleased #28 `grants` and `mutationPolicy` fields are rejected as unknown;
+there is no dual-schema compatibility mode.
 
 A compatibility `stdio` command may proxy to that daemon. It must not open the canonical store as an independent writer. This preserves MCP client compatibility without creating one writer per agent process.
 

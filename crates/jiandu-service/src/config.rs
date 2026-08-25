@@ -1,7 +1,7 @@
 //! Strict, trusted local startup configuration.
 
 use jiandu_core::{
-    ClientId, CreationActor, Grant, MemoryType, PrincipalId, ProjectId, SessionId,
+    ClientId, CreationActor, Grant, MAX_BODY_BYTES, MemoryType, PrincipalId, ProjectId, SessionId,
     TrustedRequestContext,
 };
 use jiandu_index::CursorMacKey;
@@ -21,6 +21,14 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_CLIENTS: usize = 64;
 const TOKEN_DIGEST_PREFIX: &str = "sha256:";
 const CURSOR_KEY_PREFIX: &str = "hmac-sha256:";
+const SERVICE_MEMORY_TYPES: [MemoryType; 6] = [
+    MemoryType::Preference,
+    MemoryType::Decision,
+    MemoryType::Project,
+    MemoryType::Fact,
+    MemoryType::Feedback,
+    MemoryType::Reference,
+];
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct BearerDigest([u8; 32]);
@@ -82,38 +90,66 @@ impl<'de> Deserialize<'de> for CursorKeyMaterial {
 }
 
 #[derive(Clone, Copy, Deserialize)]
+enum ConfigVersion {
+    #[serde(rename = "jiandu.service.config/v0.1")]
+    V0_1,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "snake_case")]
-enum ConfiguredScopeKind {
+enum PermissionScopeKind {
     Principal,
     Project,
     Session,
     InstanceGlobal,
 }
 
-impl From<ConfiguredScopeKind> for MutationScopeKind {
-    fn from(value: ConfiguredScopeKind) -> Self {
-        match value {
-            ConfiguredScopeKind::Principal => Self::Principal,
-            ConfiguredScopeKind::Project => Self::Project,
-            ConfiguredScopeKind::Session => Self::Session,
-            ConfiguredScopeKind::InstanceGlobal => Self::InstanceGlobal,
+impl PermissionScopeKind {
+    const fn write_grant(self) -> &'static str {
+        match self {
+            Self::Principal => "memory:write:principal",
+            Self::Project => "memory:write:project",
+            Self::Session => "memory:write:session",
+            Self::InstanceGlobal => "memory:write:instance_global",
+        }
+    }
+
+    const fn forget_grant(self) -> &'static str {
+        match self {
+            Self::Principal => "memory:forget:principal",
+            Self::Project => "memory:forget:project",
+            Self::Session => "memory:forget:session",
+            Self::InstanceGlobal => "memory:forget:instance_global",
+        }
+    }
+
+    fn has_exact_scope(self, scopes: &ScopeDocument) -> bool {
+        match self {
+            Self::Principal => true,
+            Self::Project => !scopes.project_ids.is_empty(),
+            Self::Session => !scopes.session_ids.is_empty(),
+            Self::InstanceGlobal => scopes.instance_global,
         }
     }
 }
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ConfiguredSecretPolicy {
-    AllowAll,
+impl From<PermissionScopeKind> for MutationScopeKind {
+    fn from(value: PermissionScopeKind) -> Self {
+        match value {
+            PermissionScopeKind::Principal => Self::Principal,
+            PermissionScopeKind::Project => Self::Project,
+            PermissionScopeKind::Session => Self::Session,
+            PermissionScopeKind::InstanceGlobal => Self::InstanceGlobal,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MutationPolicyDocument {
-    max_body_bytes: usize,
-    allowed_types: Vec<MemoryType>,
-    allowed_scopes: Vec<ConfiguredScopeKind>,
-    secret_content_policy: ConfiguredSecretPolicy,
+struct PermissionProfile {
+    read: bool,
+    write: Vec<PermissionScopeKind>,
+    forget: Vec<PermissionScopeKind>,
 }
 
 #[derive(Deserialize)]
@@ -130,15 +166,15 @@ struct ClientDocument {
     bearer_token_digest: BearerDigest,
     principal_id: PrincipalId,
     client_id: ClientId,
-    grants: Vec<Grant>,
     scopes: ScopeDocument,
+    permissions: PermissionProfile,
     creation_actor: CreationActor,
-    mutation_policy: MutationPolicyDocument,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ServeConfigDocument {
+    config_version: ConfigVersion,
     bind: SocketAddr,
     data_dir: PathBuf,
     cursor_mac_key: CursorKeyMaterial,
@@ -150,7 +186,7 @@ pub(crate) struct ValidatedClient {
     pub(crate) context: TrustedRequestContext,
     pub(crate) scopes: AuthorizedScopes,
     pub(crate) creation_actor: CreationActor,
-    pub(crate) mutation_policy: Arc<ConfiguredMutationPolicy>,
+    pub(crate) mutation_policy: Option<Arc<ConfiguredMutationPolicy>>,
 }
 
 impl fmt::Debug for ValidatedClient {
@@ -166,7 +202,7 @@ impl fmt::Debug for ValidatedClient {
 }
 
 /// Fully validated startup configuration. Its debug form omits the data path,
-/// cursor key, credential digests, identities, grants, and scope membership.
+/// cursor key, credential digests, identities, permissions, and scope membership.
 pub struct ServeConfig {
     pub(crate) bind: SocketAddr,
     pub(crate) data_dir: PathBuf,
@@ -215,37 +251,50 @@ impl ServeConfig {
     }
 
     fn validate(document: ServeConfigDocument) -> Result<Self, ConfigError> {
-        if !document.bind.ip().is_loopback()
-            || document.data_dir.as_os_str().is_empty()
-            || document.clients.is_empty()
-            || document.clients.len() > MAX_CLIENTS
+        let ServeConfigDocument {
+            config_version,
+            bind,
+            data_dir,
+            cursor_mac_key,
+            clients: client_documents,
+        } = document;
+        let ConfigVersion::V0_1 = config_version;
+        if !bind.ip().is_loopback()
+            || data_dir.as_os_str().is_empty()
+            || client_documents.is_empty()
+            || client_documents.len() > MAX_CLIENTS
         {
             return Err(ConfigError::invalid());
         }
 
         let mut credential_digests = BTreeSet::new();
-        let mut clients = Vec::with_capacity(document.clients.len());
-        for client in document.clients {
+        let mut clients = Vec::with_capacity(client_documents.len());
+        for client in client_documents {
             if !credential_digests.insert(client.bearer_token_digest)
-                || !all_unique(&client.grants)
                 || !all_unique(&client.scopes.project_ids)
                 || !all_unique(&client.scopes.session_ids)
-                || !all_unique(&client.mutation_policy.allowed_types)
-                || !all_unique_by(
-                    &client.mutation_policy.allowed_scopes,
-                    |scope| match scope {
-                        ConfiguredScopeKind::Principal => 0_u8,
-                        ConfiguredScopeKind::Project => 1,
-                        ConfiguredScopeKind::Session => 2,
-                        ConfiguredScopeKind::InstanceGlobal => 3,
-                    },
-                )
-                || client.grants.iter().any(|grant| !supported_grant(grant))
+                || !client.permissions.read
+                || !all_unique(&client.permissions.write)
+                || !all_unique(&client.permissions.forget)
+                || client
+                    .permissions
+                    .write
+                    .iter()
+                    .chain(&client.permissions.forget)
+                    .any(|scope| !scope.has_exact_scope(&client.scopes))
             {
                 return Err(ConfigError::invalid());
             }
 
-            let grants = client.grants.into_iter().collect::<BTreeSet<_>>();
+            let mut grants =
+                BTreeSet::from([Grant::new("memory:read").map_err(|_| ConfigError::invalid())?]);
+            for scope in client.permissions.write.iter().copied() {
+                grants.insert(Grant::new(scope.write_grant()).map_err(|_| ConfigError::invalid())?);
+            }
+            for scope in client.permissions.forget.iter().copied() {
+                grants
+                    .insert(Grant::new(scope.forget_grant()).map_err(|_| ConfigError::invalid())?);
+            }
             let context = TrustedRequestContext {
                 principal_id: client.principal_id.clone(),
                 client_id: client.client_id,
@@ -265,66 +314,47 @@ impl ServeConfig {
                 .authorize_read(&context)
                 .map_err(|_| ConfigError::invalid())?;
 
-            let allowed_types = client
-                .mutation_policy
-                .allowed_types
-                .into_iter()
-                .collect::<BTreeSet<_>>();
             let allowed_scopes = client
-                .mutation_policy
-                .allowed_scopes
-                .into_iter()
+                .permissions
+                .write
+                .iter()
+                .chain(&client.permissions.forget)
+                .copied()
                 .map(MutationScopeKind::from)
                 .collect::<BTreeSet<_>>();
-            let secret_content = match client.mutation_policy.secret_content_policy {
-                ConfiguredSecretPolicy::AllowAll => Arc::new(AllowAllSecretContent),
+            let mutation_policy = if allowed_scopes.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    ConfiguredMutationPolicy::new(
+                        MAX_BODY_BYTES,
+                        BTreeSet::from(SERVICE_MEMORY_TYPES),
+                        allowed_scopes,
+                        Arc::new(AllowAllSecretContent),
+                    )
+                    .map_err(|_| ConfigError::invalid())?,
+                ))
             };
-            let mutation_policy = ConfiguredMutationPolicy::new(
-                client.mutation_policy.max_body_bytes,
-                allowed_types,
-                allowed_scopes,
-                secret_content,
-            )
-            .map_err(|_| ConfigError::invalid())?;
             clients.push(ValidatedClient {
                 bearer_digest: client.bearer_token_digest,
                 context,
                 scopes,
                 creation_actor: client.creation_actor,
-                mutation_policy: Arc::new(mutation_policy),
+                mutation_policy,
             });
         }
 
         Ok(Self {
-            bind: document.bind,
-            data_dir: document.data_dir,
-            cursor_mac_key: document.cursor_mac_key.into_key(),
+            bind,
+            data_dir,
+            cursor_mac_key: cursor_mac_key.into_key(),
             clients,
         })
     }
 }
 
-fn supported_grant(grant: &Grant) -> bool {
-    matches!(
-        grant.as_str(),
-        "memory:read"
-            | "memory:write:principal"
-            | "memory:write:project"
-            | "memory:write:session"
-            | "memory:write:instance_global"
-            | "memory:forget:principal"
-            | "memory:forget:project"
-            | "memory:forget:session"
-            | "memory:forget:instance_global"
-    )
-}
-
 fn all_unique<T: Ord + Clone>(values: &[T]) -> bool {
     values.iter().cloned().collect::<BTreeSet<_>>().len() == values.len()
-}
-
-fn all_unique_by<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> bool {
-    values.iter().map(key).collect::<BTreeSet<_>>().len() == values.len()
 }
 
 fn decode_lower_hex_32(value: &str) -> Option<[u8; 32]> {

@@ -230,16 +230,21 @@ fn client_service(
     let scopes = client.scopes;
     let context = client.context;
     let creation_actor = client.creation_actor;
-    let policy: Arc<dyn MutationPolicy> = client.mutation_policy;
+    let policy = client
+        .mutation_policy
+        .map(|policy| -> Arc<dyn MutationPolicy> { policy });
     let factory = move || {
         handler_constructions.record();
-        JianduReadServer::new_with_mutations(
-            backend.clone(),
-            &scopes,
-            &context,
-            policy.clone(),
-            creation_actor,
-        )
+        match &policy {
+            Some(policy) => JianduReadServer::new_with_mutations(
+                backend.clone(),
+                &scopes,
+                &context,
+                policy.clone(),
+                creation_actor,
+            ),
+            None => JianduReadServer::new(backend.clone(), &scopes, &context),
+        }
         .map_err(|_| io::Error::other("authenticated MCP handler unavailable"))
     };
     let transport_config = StreamableHttpServerConfig::default()

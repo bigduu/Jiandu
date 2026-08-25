@@ -8,10 +8,11 @@ transport-independent read slice in `jiandu-mcp`: `memory_search`,
 independently authorized `memory_remember`, `memory_update`, and
 `memory_forget` tools over the same handler and production store backend. Issue
 #28 now serves that adapter from the production `jiandu` process over
-authenticated loopback Streamable HTTP. Broad two-client conformance,
-operational hardening, administrative commands, and stdio proxying remain
-later issues, so the complete document is still an implementation target
-rather than a stable compatibility promise.
+authenticated loopback Streamable HTTP. Issue #33 replaces that daemon's
+unreleased startup shape with the closed thin v0.1 permission profile described
+below. Broad two-client conformance, operational hardening, administrative
+commands, and stdio proxying remain later issues, so the complete document is
+still an implementation target rather than a stable compatibility promise.
 
 The handler supports exactly MCP revision `2025-11-25`. This is
 independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests
@@ -47,13 +48,24 @@ Neither `principalId` nor `clientId` appears as a public tool argument. This pre
 canonical store and serves the fixed `/mcp` route. Startup configuration is a
 bounded regular local JSON file. It supplies an explicit loopback bind address,
 the operator-selected data directory, a cursor HMAC key, and one or more local
-client entries. Client entries contain only a fixed
-`sha256:<64 lowercase hex>` bearer digest plus trusted identity, grants,
-authorized scopes, creation actor, and mutation policy. Raw bearer credentials
-are not accepted through CLI arguments, environment variables, config fields,
-or MCP arguments. Operators must generate them with at least 256 bits of
-cryptographic entropy; satisfying the transport's minimum token length alone
-does not provide that entropy.
+client entries. The closed `jiandu.service.config/v0.1` document gives each
+entry only a fixed `sha256:<64 lowercase hex>` bearer digest, trusted identity,
+exact scopes, one typed `read`/`write`/`forget` permission profile, and creation
+actor. Raw bearer credentials are not accepted through CLI arguments,
+environment variables, config fields, or MCP arguments. Operators must
+generate them with at least 256 bits of cryptographic entropy; satisfying the
+transport's minimum token length alone does not provide that entropy.
+
+`read` is required for the fixed tool/resource surface. `write` and `forget`
+independently list closed scope kinds, each backed by at least one exact scope
+in the same entry. The service derives the trusted low-level grants and the
+admission-policy scope union from that single source. All six current memory
+types, the core 65,536-byte body limit, and `AllowAllSecretContent` are closed
+service defaults rather than operator policy fields. Unknown or duplicate
+permission values, permission for an absent exact scope kind, `read: false`,
+raw credentials, and the unreleased #28 `grants`/`mutationPolicy` fields fail
+the whole document with generic redacted diagnostics. The pre-v0.1 shape is
+not retained as a second schema.
 
 The HTTP boundary requires exactly one `Authorization` value in the strict
 `Bearer <token>` form. It hashes the request token and compares every
@@ -81,6 +93,11 @@ not query the backend. A mutation-enabled host additionally supplies the same
 store backend, the trusted connection context, a trusted `CreationActor`, and
 a configured admission policy. Missing write or forget grants reject only the
 corresponding tool call and do not make initialization or read tools fail.
+
+For `jiandu serve`, those lower-level objects are derived from the v0.1
+permission profile. They remain the transport-independent Rust seam and the
+MCP public authentication-context contract is unchanged; raw grant strings and
+mutation-policy internals are simply no longer daemon configuration inputs.
 
 All handlers require `memory:read` for the shipped read surface. Within a
 mutation-enabled handler, remember/update require the exact scope-kind
