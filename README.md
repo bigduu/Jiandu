@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, and a deterministic, disposable Unicode/CJK lexical index with authorized search and rebuild diagnostics. Service implementation is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a deterministic disposable Unicode/CJK lexical index, and a transport-independent authenticated read-only MCP handler. The daemon, HTTP transport, and mutation MCP tools remain tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and are delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -20,7 +20,8 @@ Jiandu therefore separates three responsibilities:
                             ┌──────────────────────┐
                             │       Jiandu         │
                             │ filesystem + index   │
-                            │ MCP Streamable HTTP  │
+                            │ MCP read handler     │
+                            │ transport comes next │
                             └──────────┬───────────┘
                                        │
                   ┌────────────────────┼────────────────────┐
@@ -92,10 +93,14 @@ crates/jiandu-store/                 exclusive ownership, reads, atomic CAS, and
 crates/jiandu-index/                 deterministic, derived Unicode/CJK lexical retrieval
   fixtures/v1alpha1/                 tokenizer and logical index-format conformance fixtures
   src/                               strict format, SQLite rebuild, HMAC cursor, ranking, diagnostics
+crates/jiandu-mcp/                   transport-independent authenticated read adapter
+  src/                               fixed read tools, resources, safe health, backend seam
+  tests/                             in-process protocol, authorization, schema, degradation fixtures
 ```
 
-Future MCP adapter, daemon, and CLI crates are introduced only when their
-boundary is needed. `jiandu-index` depends narrowly on `jiandu-store` and
+Future daemon and CLI crates are introduced only when their boundary is
+needed. `jiandu-mcp` depends on the three existing domain/store/index crates
+but owns no transport listener or canonical data. `jiandu-index` depends narrowly on `jiandu-store` and
 `jiandu-core`; canonical storage never depends on the index. `jiandu-core` has
 no storage, transport, Bamboo, prompt, LLM, or filesystem-path identity
 dependency. The current canonical on-disk compatibility rules are documented in

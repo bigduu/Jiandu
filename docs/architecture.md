@@ -107,7 +107,29 @@ and compatibility policy are in [Lexical Index Format `v1alpha1`](index-format-v
 
 ### MCP adapter
 
-The MCP layer translates protocol requests into authenticated domain commands. It exposes structured read and mutation operations, resources for addressable records, capability metadata, and stable domain errors. MCP protocol-version negotiation remains separate from the Jiandu API and store-format versions.
+The implemented `jiandu-mcp` crate translates MCP `2025-11-25` read requests
+into authenticated domain reads. A per-connection constructor validates the
+trusted context, principal equality, and independent `memory:read` grant, then
+retains a private-field `AuthorizedRead`; identity is never accepted from a
+tool argument. Its fixed tools are `memory_search`, `memory_get`, and
+`memory_list`. Checked core request schemas are used directly, and structured
+Jiandu envelopes remain authoritative over concise text summaries.
+
+The handler depends on a narrow synchronous `McpReadBackend` rather than owning
+daemon lifecycle. The production backend composes `CanonicalStore` behind a
+host `RwLock` with `LexicalIndex`, so a later mutation adapter can share the
+same writer without replacing the read protocol. Search reads the canonical
+watermark before and after the index result and discards any mixed snapshot.
+Missing/corrupt/stale index state yields `INDEX_DEGRADED`; exact get/list remain
+independent.
+
+Addressable resources use only opaque IDs or scope selectors, never queries or
+paths. Inaccessible and absent IDs are indistinguishable. Initialization
+metadata contains only closed ready/degraded/missing states and derived
+operation flags; it does not call admin diagnostics or expose reasons, counts,
+watermarks, or paths. Subscriptions, mutation tools, HTTP, daemon ownership,
+and prompt placement remain later boundaries. MCP protocol negotiation remains
+separate from the Jiandu API and store-format versions.
 
 ### Administrative CLI
 

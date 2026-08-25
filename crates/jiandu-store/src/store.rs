@@ -4,7 +4,7 @@ use crate::document::{MAX_CANONICAL_DOCUMENT_BYTES, decode_canonical_document};
 use crate::layout;
 use crate::{InvalidRecordReason, StoreError, StoreId, StoreMetadata};
 use jiandu_core::{
-    ListSort, MemoryId, MemoryListRequest, MemoryListResult, MemoryRecord, MemoryScope,
+    ClientId, ListSort, MemoryId, MemoryListRequest, MemoryListResult, MemoryRecord, MemoryScope,
     MemorySummary, PrincipalId, ProjectId, ScopeSelector, SessionId, StoreRevision, Timestamp,
     TrustedRequestContext, Validate,
 };
@@ -60,6 +60,32 @@ impl AuthorizedScopes {
     pub const fn with_instance_global(mut self) -> Self {
         self.instance_global = true;
         self
+    }
+
+    /// Authenticate one trusted read-only connection against this exact host
+    /// authority. The returned capability has no public constructor, is not a
+    /// wire type, and only exposes bounded canonical read operations.
+    pub fn authorize_read(
+        &self,
+        context: &TrustedRequestContext,
+    ) -> Result<AuthorizedRead, StoreError> {
+        context
+            .validate()
+            .map_err(|_| StoreError::Unauthenticated)?;
+        if context.principal_id != self.principal_id {
+            return Err(StoreError::Forbidden);
+        }
+        if !context
+            .grants
+            .iter()
+            .any(|grant| grant.as_str() == "memory:read")
+        {
+            return Err(StoreError::Forbidden);
+        }
+        Ok(AuthorizedRead {
+            scopes: self.clone(),
+            client_id: context.client_id.clone(),
+        })
     }
 
     /// Resolve an exact scope into a capability that mutation APIs accept.
@@ -228,6 +254,57 @@ impl AuthorizedScopes {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// Trusted per-connection read capability. Private fields and the absence of
+/// serde implementations prevent model-visible input from constructing or
+/// widening it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthorizedRead {
+    scopes: AuthorizedScopes,
+    client_id: ClientId,
+}
+
+impl fmt::Debug for AuthorizedRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedRead")
+            .field("authority", &"[REDACTED]")
+            .field("connection", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl AuthorizedRead {
+    /// Read exactly one visible record without exposing the underlying scope
+    /// authority to the adapter.
+    pub fn get(
+        &self,
+        store: &CanonicalStore,
+        id: &MemoryId,
+    ) -> Result<StoreRead<MemoryRecord>, StoreError> {
+        store.get(id, &self.scopes)
+    }
+
+    /// List records selected by a validated public request after requiring
+    /// every selector to be in the authority captured by this capability.
+    pub fn list(
+        &self,
+        store: &CanonicalStore,
+        request: &MemoryListRequest,
+    ) -> Result<StoreRead<MemoryListResult>, StoreError> {
+        self.scopes.authorize_index_query(&request.scopes)?;
+        store.list(request, &self.scopes)
+    }
+
+    /// Resolve one public search request into the unforgeable index-query
+    /// capability that binds the complete current authority.
+    pub fn authorize_index_query(
+        &self,
+        request: &jiandu_core::MemorySearchRequest,
+    ) -> Result<AuthorizedIndexQuery, StoreError> {
+        self.scopes.authorize_index_query(&request.scopes)
     }
 }
 

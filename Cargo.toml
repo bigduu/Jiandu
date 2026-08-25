@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/jiandu-core", "crates/jiandu-store", "crates/jiandu-index"]
+members = [
+    "crates/jiandu-core",
+    "crates/jiandu-store",
+    "crates/jiandu-index",
+    "crates/jiandu-mcp",
+]
 resolver = "3"
 
 [workspace.package]
@@ -13,6 +18,7 @@ repository = "https://github.com/bigduu/Jiandu"
 base64 = "0.23.1"
 hmac = "0.13.0"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "serialize"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["macros", "server"] }
 schemars = { version = "1.2.2", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
@@ -20,6 +26,7 @@ serde_yaml_ng = "0.10.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
+tokio = { version = "1.48.0", features = ["io-util", "macros", "rt-multi-thread"] }
 unicode-normalization = "0.1.25"
 uuid = { version = "1.25.0", features = ["v4"] }
 
