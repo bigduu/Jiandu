@@ -134,12 +134,40 @@ fn tools_publish_the_checked_core_request_schemas_without_identity_or_path_field
         authorization,
     );
     let checked = jiandu_core::generated_contract_schemas();
-    for (tool_name, schema_name) in [
-        ("memory_search", "memory-search-request.schema.json"),
-        ("memory_get", "memory-get-request.schema.json"),
-        ("memory_list", "memory-list-request.schema.json"),
+    for (tool_name, schema_name, read_only, destructive) in [
+        (
+            "memory_search",
+            "memory-search-request.schema.json",
+            true,
+            false,
+        ),
+        ("memory_get", "memory-get-request.schema.json", true, false),
+        (
+            "memory_list",
+            "memory-list-request.schema.json",
+            true,
+            false,
+        ),
+        (
+            "memory_remember",
+            "remember-memory-command.schema.json",
+            false,
+            false,
+        ),
+        (
+            "memory_update",
+            "update-memory-command.schema.json",
+            false,
+            false,
+        ),
+        (
+            "memory_forget",
+            "forget-memory-command.schema.json",
+            false,
+            true,
+        ),
     ] {
-        let tool = server.get_tool(tool_name).expect("fixed read tool");
+        let tool = server.get_tool(tool_name).expect("fixed memory tool");
         let actual = Value::Object(tool.input_schema.as_ref().clone());
         assert_eq!(actual, checked[schema_name], "{tool_name} schema drift");
         let bytes = serde_json::to_string(&actual).expect("schema JSON");
@@ -155,15 +183,13 @@ fn tools_publish_the_checked_core_request_schemas_without_identity_or_path_field
                 "{tool_name} exposed {forbidden}"
             );
         }
-        let annotations = tool.annotations.expect("read-only annotations");
-        assert_eq!(annotations.read_only_hint, Some(true));
-        assert_eq!(annotations.destructive_hint, Some(false));
+        let annotations = tool.annotations.expect("tool annotations");
+        assert_eq!(annotations.read_only_hint, Some(read_only));
+        assert_eq!(annotations.destructive_hint, Some(destructive));
+        assert_eq!(annotations.idempotent_hint, Some(true));
         assert_eq!(annotations.open_world_hint, Some(false));
         assert!(tool.output_schema.is_some());
     }
-    assert!(server.get_tool("memory_remember").is_none());
-    assert!(server.get_tool("memory_update").is_none());
-    assert!(server.get_tool("memory_forget").is_none());
 }
 
 #[test]

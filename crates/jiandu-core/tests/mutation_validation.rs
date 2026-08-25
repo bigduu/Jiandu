@@ -1,8 +1,30 @@
 use jiandu_core::{
-    ForgetMemoryCommand, MemoryRecord, RememberMemoryCommand, UpdateMemoryCommand, Validate,
-    ValidationCode,
+    CorrelationId, ForgetMemoryCommand, MemoryRecord, MutationInvocation, RememberMemoryCommand,
+    UpdateMemoryCommand, Validate, ValidationCode,
 };
 use serde_json::json;
+
+#[test]
+fn trusted_mutation_invocation_accepts_only_domain_separated_uuid_v4_correlations() {
+    let valid = CorrelationId::new("req_txn_123456789abc4def8abc123456789abc")
+        .expect("correlation ID grammar");
+    let invocation = MutationInvocation::new(valid.clone()).expect("UUIDv4 invocation");
+    assert_eq!(invocation.correlation_id(), &valid);
+
+    for invalid in [
+        "req_mcp_123456789abc4def8abc123456789abc",
+        "req_txn_123456789abc1def8abc123456789abc",
+        "req_txn_123456789abc4def7abc123456789abc",
+        "req_txn_123456789ABC4DEF8ABC123456789ABC",
+        "req_txn_short",
+    ] {
+        assert!(
+            MutationInvocation::new(CorrelationId::new(invalid).expect("core correlation grammar"))
+                .is_err(),
+            "accepted invalid trusted correlation {invalid}"
+        );
+    }
+}
 
 fn valid_record() -> MemoryRecord {
     serde_json::from_value(json!({

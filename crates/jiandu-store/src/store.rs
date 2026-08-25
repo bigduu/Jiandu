@@ -171,8 +171,46 @@ impl AuthorizedScopes {
         }
         Ok(AuthorizedMutation {
             principal_id: context.principal_id.clone(),
+            client_id: context.client_id.clone(),
             scope: exact.0,
             operation,
+        })
+    }
+
+    /// Mint the complete exact-scope authority set for one mutation
+    /// operation. Authentication, principal equality, and every scope-specific
+    /// grant are resolved before a private receipt can be inspected.
+    pub fn authorize_mutation_set(
+        &self,
+        context: &TrustedRequestContext,
+        operation: crate::MutationOperation,
+    ) -> Result<AuthorizedMutationSet, StoreError> {
+        context
+            .validate()
+            .map_err(|_| StoreError::Unauthenticated)?;
+        if context.principal_id != self.principal_id {
+            return Err(StoreError::Forbidden);
+        }
+        let mut scopes = self
+            .all_scopes()
+            .into_iter()
+            .filter(|scope| {
+                let required = operation.required_grant(scope);
+                context
+                    .grants
+                    .iter()
+                    .any(|grant| grant.as_str() == required)
+            })
+            .collect::<Vec<_>>();
+        scopes.sort_by_key(scope_fingerprint_key);
+        if scopes.is_empty() {
+            return Err(StoreError::Forbidden);
+        }
+        Ok(AuthorizedMutationSet {
+            principal_id: context.principal_id.clone(),
+            client_id: context.client_id.clone(),
+            operation,
+            scopes,
         })
     }
 
@@ -409,11 +447,23 @@ impl AuthorizedScope {
 
 /// Fresh authenticated and operation-authorized exact mutation capability.
 /// Private fields prevent a model-visible command from selecting a principal.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthorizedMutation {
     pub(crate) principal_id: PrincipalId,
+    pub(crate) client_id: ClientId,
     pub(crate) scope: MemoryScope,
     pub(crate) operation: crate::MutationOperation,
+}
+
+impl fmt::Debug for AuthorizedMutation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMutation")
+            .field("identity", &"[REDACTED]")
+            .field("scope", &"[REDACTED]")
+            .field("operation", &self.operation)
+            .finish()
+    }
 }
 
 impl AuthorizedMutation {
@@ -427,9 +477,95 @@ impl AuthorizedMutation {
         &self.principal_id
     }
 
+    /// Trusted client identity for non-serializable admission policy context.
+    #[must_use]
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
     #[must_use]
     pub const fn operation(&self) -> crate::MutationOperation {
         self.operation
+    }
+}
+
+/// Fresh principal- and operation-authorized scope set used to resolve an
+/// update/forget target without accepting a model-supplied scope. Private
+/// fields prevent widening or serialization across the MCP boundary.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthorizedMutationSet {
+    principal_id: PrincipalId,
+    client_id: ClientId,
+    operation: crate::MutationOperation,
+    scopes: Vec<MemoryScope>,
+}
+
+impl fmt::Debug for AuthorizedMutationSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMutationSet")
+            .field("identity", &"[REDACTED]")
+            .field("scopes", &"[REDACTED]")
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
+impl AuthorizedMutationSet {
+    /// Resolve the create command's public selector only when it names an
+    /// exact scope already present in this operation-specific capability.
+    pub fn authorize_selector(
+        &self,
+        selector: &ScopeSelector,
+    ) -> Result<AuthorizedMutation, StoreError> {
+        let scope = self
+            .scopes
+            .iter()
+            .find(|scope| selector_resolves_to_scope(selector, scope))
+            .ok_or(StoreError::Forbidden)?;
+        Ok(self.for_scope(scope))
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> crate::MutationOperation {
+        self.operation
+    }
+
+    pub(crate) fn principal_id(&self) -> &PrincipalId {
+        &self.principal_id
+    }
+
+    pub(crate) fn scopes(&self) -> &[MemoryScope] {
+        &self.scopes
+    }
+
+    pub(crate) fn for_scope(&self, scope: &MemoryScope) -> AuthorizedMutation {
+        AuthorizedMutation {
+            principal_id: self.principal_id.clone(),
+            client_id: self.client_id.clone(),
+            scope: scope.clone(),
+            operation: self.operation,
+        }
+    }
+}
+
+fn selector_resolves_to_scope(selector: &ScopeSelector, scope: &MemoryScope) -> bool {
+    match (selector, scope) {
+        (ScopeSelector::Principal {}, MemoryScope::Principal { .. }) => true,
+        (
+            ScopeSelector::Project {
+                project_id: selected,
+            },
+            MemoryScope::Project { project_id },
+        ) => selected == project_id,
+        (
+            ScopeSelector::Session {
+                session_id: selected,
+            },
+            MemoryScope::Session { session_id },
+        ) => selected == session_id,
+        (ScopeSelector::InstanceGlobal {}, MemoryScope::InstanceGlobal {}) => true,
+        _ => false,
     }
 }
 
@@ -509,6 +645,7 @@ pub struct CanonicalStore {
     pub(crate) failpoints: crate::failpoint::Failpoints,
     pub(crate) poisoned: bool,
     pub(crate) quarantine_receipts: Vec<QuarantineReceipt>,
+    pub(crate) mutation_transaction_ids: BTreeSet<String>,
     pub(crate) forced_unsupported_durability: Option<&'static str>,
 }
 
@@ -557,6 +694,8 @@ impl CanonicalStore {
         ensure_audit_genesis(&root, &metadata, &options.failpoints, false)?;
         commit_initial_metadata(&root)?;
         crate::idempotency::validate_ledger(&root, &metadata)?;
+        let mutation_transaction_ids =
+            crate::idempotency::committed_transaction_ids(&root, &metadata)?;
         root.validate_ambient_identity()?;
         lock.validate_ownership(&root)?;
         crate::durability::probe(
@@ -571,6 +710,7 @@ impl CanonicalStore {
             failpoints: options.failpoints,
             poisoned: false,
             quarantine_receipts: Vec::new(),
+            mutation_transaction_ids,
             forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }
@@ -616,6 +756,8 @@ impl CanonicalStore {
         let recovered = crate::recovery::recover(&root, locked_metadata, &options.failpoints)?;
         validate_audit_genesis(&root, &recovered.metadata)?;
         crate::idempotency::validate_ledger(&root, &recovered.metadata)?;
+        let mutation_transaction_ids =
+            crate::idempotency::committed_transaction_ids(&root, &recovered.metadata)?;
         crate::durability::probe(
             &root,
             &options.failpoints,
@@ -628,6 +770,7 @@ impl CanonicalStore {
             failpoints: options.failpoints,
             poisoned: false,
             quarantine_receipts: recovered.quarantine_receipts,
+            mutation_transaction_ids,
             forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }
@@ -714,6 +857,8 @@ impl CanonicalStore {
         layout::validate_layout(&root)?;
         validate_audit_genesis(&root, &target_metadata)?;
         crate::idempotency::validate_ledger(&root, &target_metadata)?;
+        let mutation_transaction_ids =
+            crate::idempotency::committed_transaction_ids(&root, &target_metadata)?;
         crate::durability::probe(
             &root,
             &options.failpoints,
@@ -726,6 +871,7 @@ impl CanonicalStore {
             failpoints: options.failpoints,
             poisoned: false,
             quarantine_receipts: recovered.quarantine_receipts,
+            mutation_transaction_ids,
             forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }
@@ -799,6 +945,8 @@ impl CanonicalStore {
         layout::validate_layout(&root)?;
         validate_audit_genesis(&root, &target_metadata)?;
         crate::idempotency::validate_ledger(&root, &target_metadata)?;
+        let mutation_transaction_ids =
+            crate::idempotency::committed_transaction_ids(&root, &target_metadata)?;
         crate::durability::probe(
             &root,
             &options.failpoints,
@@ -811,6 +959,7 @@ impl CanonicalStore {
             failpoints: options.failpoints,
             poisoned: false,
             quarantine_receipts: recovered.quarantine_receipts,
+            mutation_transaction_ids,
             forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }
@@ -875,6 +1024,8 @@ impl CanonicalStore {
         layout::validate_layout(&root)?;
         validate_audit_genesis(&root, &target_metadata)?;
         crate::idempotency::validate_ledger(&root, &target_metadata)?;
+        let mutation_transaction_ids =
+            crate::idempotency::committed_transaction_ids(&root, &target_metadata)?;
         crate::durability::probe(
             &root,
             &options.failpoints,
@@ -887,6 +1038,7 @@ impl CanonicalStore {
             failpoints: options.failpoints,
             poisoned: false,
             quarantine_receipts: recovered.quarantine_receipts,
+            mutation_transaction_ids,
             forced_unsupported_durability: options.forced_unsupported_durability,
         })
     }

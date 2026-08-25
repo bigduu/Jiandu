@@ -2,13 +2,14 @@ use super::*;
 use crate::document::{decode_canonical_document, encode_canonical_document};
 use crate::layout;
 use jiandu_core::{
-    AgentId, BranchId, ClientId, CommittedMessageRange, Confidence, ContentDigest, CreationActor,
-    ExtractionMethod, ExtractionProvenance, ForgetMemoryCommand, FrontmatterProvenance,
-    FrontmatterScope, Grant, IdempotencyKey, ListSort, MemoryFrontmatterV1Alpha1, MemoryId,
-    MemoryListRequest, MemoryPatch, MemoryRelation, MemorySchema, MemoryScope, MemoryStatus,
-    MemoryType, MessageId, PageCursor, PageLimit, PrincipalId, ProjectId, ProvenanceInput,
-    RelationKind, RememberMemoryCommand, Revision, ScopeSelector, SessionId, SourceUri,
-    StoreRevision, Tag, TagPatch, Timestamp, TrustedRequestContext, UpdateMemoryCommand,
+    AgentId, BranchId, ClientId, CommittedMessageRange, Confidence, ContentDigest, CorrelationId,
+    CreationActor, ExtractionMethod, ExtractionProvenance, ForgetMemoryCommand,
+    FrontmatterProvenance, FrontmatterScope, Grant, IdempotencyKey, ListSort,
+    MemoryFrontmatterV1Alpha1, MemoryId, MemoryListRequest, MemoryPatch, MemoryRelation,
+    MemorySchema, MemoryScope, MemoryStatus, MemoryType, MessageId, MutationInvocation, PageCursor,
+    PageLimit, PrincipalId, ProjectId, ProvenanceInput, RelationKind, RememberMemoryCommand,
+    Revision, ScopeSelector, SessionId, SourceUri, StoreRevision, Tag, TagPatch, Timestamp,
+    TrustedRequestContext, UpdateMemoryCommand,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -41,6 +42,11 @@ fn session_id(value: &str) -> SessionId {
 
 fn timestamp(value: &str) -> Timestamp {
     Timestamp::new(value).expect("test timestamp is valid")
+}
+
+fn mutation_invocation(value: &str) -> MutationInvocation {
+    MutationInvocation::new(CorrelationId::new(value).expect("test correlation ID"))
+        .expect("test mutation invocation")
 }
 
 #[cfg(windows)]
@@ -241,42 +247,8 @@ impl PersistenceFailpointInjector for FailOnce {
     }
 }
 
-const MUTATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
-    PersistenceBoundary::ManifestTempWritten,
-    PersistenceBoundary::ManifestTempSynced,
-    PersistenceBoundary::ManifestTempDirectorySynced,
-    PersistenceBoundary::ManifestPublished,
-    PersistenceBoundary::ManifestDirectorySynced,
-    PersistenceBoundary::RecordNamespacePrepared,
-    PersistenceBoundary::RecordTempWritten,
-    PersistenceBoundary::RecordTempSynced,
-    PersistenceBoundary::RecordTempDirectorySynced,
-    PersistenceBoundary::MetadataTempWritten,
-    PersistenceBoundary::MetadataTempSynced,
-    PersistenceBoundary::MetadataTempDirectorySynced,
-    PersistenceBoundary::IdempotencyNamespacePrepared,
-    PersistenceBoundary::MutationResultTempWritten,
-    PersistenceBoundary::MutationResultTempSynced,
-    PersistenceBoundary::MutationResultTempDirectorySynced,
-    PersistenceBoundary::MutationReceiptTempWritten,
-    PersistenceBoundary::MutationReceiptTempSynced,
-    PersistenceBoundary::MutationReceiptTempDirectorySynced,
-    PersistenceBoundary::MutationAuditTempWritten,
-    PersistenceBoundary::MutationAuditTempSynced,
-    PersistenceBoundary::MutationAuditTempDirectorySynced,
-    PersistenceBoundary::RecordRenamed,
-    PersistenceBoundary::RecordDirectorySynced,
-    PersistenceBoundary::MutationResultPublished,
-    PersistenceBoundary::MutationResultDirectorySynced,
-    PersistenceBoundary::MutationReceiptPublished,
-    PersistenceBoundary::MutationReceiptDirectorySynced,
-    PersistenceBoundary::MutationAuditPublished,
-    PersistenceBoundary::MutationAuditDirectorySynced,
-    PersistenceBoundary::MetadataRenamed,
-    PersistenceBoundary::MetadataDirectorySynced,
-    PersistenceBoundary::ManifestRemoved,
-    PersistenceBoundary::ManifestRemovalDirectorySynced,
-];
+const MUTATION_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] =
+    PersistenceBoundary::CREATE_UPDATE_TRANSACTION;
 
 const RECOVERY_IDEMPOTENCY_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::RecoveryIdempotencyNamespacePrepared,
@@ -285,46 +257,8 @@ const RECOVERY_IDEMPOTENCY_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::RecoveryMutationAuditDirectorySynced,
 ];
 
-const FORGET_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] = &[
-    PersistenceBoundary::ManifestTempWritten,
-    PersistenceBoundary::ManifestTempSynced,
-    PersistenceBoundary::ManifestTempDirectorySynced,
-    PersistenceBoundary::ManifestPublished,
-    PersistenceBoundary::ManifestDirectorySynced,
-    PersistenceBoundary::TombstoneNamespacePrepared,
-    PersistenceBoundary::TombstoneTempWritten,
-    PersistenceBoundary::TombstoneTempSynced,
-    PersistenceBoundary::TombstoneTempDirectorySynced,
-    PersistenceBoundary::MetadataTempWritten,
-    PersistenceBoundary::MetadataTempSynced,
-    PersistenceBoundary::MetadataTempDirectorySynced,
-    PersistenceBoundary::IdempotencyNamespacePrepared,
-    PersistenceBoundary::MutationResultTempWritten,
-    PersistenceBoundary::MutationResultTempSynced,
-    PersistenceBoundary::MutationResultTempDirectorySynced,
-    PersistenceBoundary::MutationReceiptTempWritten,
-    PersistenceBoundary::MutationReceiptTempSynced,
-    PersistenceBoundary::MutationReceiptTempDirectorySynced,
-    PersistenceBoundary::MutationAuditTempWritten,
-    PersistenceBoundary::MutationAuditTempSynced,
-    PersistenceBoundary::MutationAuditTempDirectorySynced,
-    PersistenceBoundary::TombstonePublished,
-    PersistenceBoundary::TombstoneDirectorySynced,
-    PersistenceBoundary::RecordRenamedForForget,
-    PersistenceBoundary::ForgetRecordDirectorySynced,
-    PersistenceBoundary::ForgottenBodyErased,
-    PersistenceBoundary::ForgottenBodySynced,
-    PersistenceBoundary::MutationResultPublished,
-    PersistenceBoundary::MutationResultDirectorySynced,
-    PersistenceBoundary::MutationReceiptPublished,
-    PersistenceBoundary::MutationReceiptDirectorySynced,
-    PersistenceBoundary::MutationAuditPublished,
-    PersistenceBoundary::MutationAuditDirectorySynced,
-    PersistenceBoundary::MetadataRenamed,
-    PersistenceBoundary::MetadataDirectorySynced,
-    PersistenceBoundary::ManifestRemoved,
-    PersistenceBoundary::ManifestRemovalDirectorySynced,
-];
+const FORGET_PERSISTENCE_BOUNDARIES: &[PersistenceBoundary] =
+    PersistenceBoundary::FORGET_TRANSACTION;
 
 const FORGET_RECOVERY_BOUNDARIES: &[PersistenceBoundary] = &[
     PersistenceBoundary::RecoveryTombstoneSynced,
@@ -3606,6 +3540,355 @@ fn create_replays_exact_result_across_generated_values_and_restart_without_write
     assert_eq!(replay.store_revision, StoreRevision(1));
     assert_eq!(reopened.metadata.audit_sequence, AuditSequence(1));
     assert_eq!(tree_snapshot(directory.path()), before_restart_replay);
+}
+
+#[test]
+fn trusted_mutation_correlation_is_the_exact_wal_receipt_result_and_audit_anchor() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_correlation_anchor"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_correlation_anchor"));
+    let authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let command = remember_command(&scope, "correlation-anchor", "private body sentinel");
+    let correlation =
+        CorrelationId::new("req_txn_123456789abc4def8abc123456789abc").expect("correlation");
+    let invocation = MutationInvocation::new(correlation.clone()).expect("invocation");
+    let transaction_id = "12345678-9abc-4def-8abc-123456789abc";
+
+    let store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    drop(store);
+    let mut interrupted = CanonicalStore::open_with_options(
+        directory.path(),
+        owner(),
+        StoreOptions::with_failpoint_injector(FailOnce::at(
+            PersistenceBoundary::ManifestDirectorySynced,
+        )),
+    )
+    .expect("open failpoint writer");
+    let error = interrupted
+        .create_with_invocation(
+            &authorization,
+            &command,
+            memory_id("mem_correlation_anchor"),
+            CreationActor::Model,
+            timestamp("2026-08-24T02:00:00Z"),
+            &invocation,
+        )
+        .expect_err("interrupt after durable WAL");
+    assert_eq!(error.code(), StoreErrorCode::InjectedFailure);
+    let manifest_file = fs::File::open(
+        directory
+            .path()
+            .join(transaction::manifest_relative(transaction_id).expect("manifest path")),
+    )
+    .expect("open durable manifest");
+    let manifest = transaction::TransactionManifest::decode(
+        manifest_file,
+        transaction_id,
+        interrupted.store_id(),
+    )
+    .expect("decode durable manifest");
+    let transaction::TransactionIntent::Record(record_intent) = manifest.intent else {
+        panic!("create uses record transaction")
+    };
+    let wal_binding = record_intent.idempotency.expect("mutation binding").binding;
+    assert_eq!(wal_binding.transaction_id, transaction_id);
+    drop(interrupted);
+
+    let mut recovered = CanonicalStore::open(directory.path(), owner()).expect("recover old state");
+    let committed = recovered
+        .create_with_invocation(
+            &authorization,
+            &command,
+            memory_id("mem_correlation_anchor"),
+            CreationActor::Model,
+            timestamp("2026-08-24T02:00:00Z"),
+            &invocation,
+        )
+        .expect("commit with same trusted anchor");
+    assert_eq!(committed.transaction_id, transaction_id);
+    assert_eq!(
+        committed.correlation_id().expect("correlation"),
+        correlation
+    );
+    let identity = crate::idempotency::ReceiptIdentity::derive(
+        authorization.principal_id(),
+        MutationOperation::Create,
+        &command.idempotency_key,
+    );
+    let receipt = crate::idempotency::read_receipt(
+        &recovered.root,
+        recovered.store_id(),
+        &identity,
+        MutationOperation::Create,
+    )
+    .expect("read receipt")
+    .expect("committed receipt");
+    assert_eq!(receipt.binding.transaction_id, transaction_id);
+    assert_eq!(receipt.binding, wal_binding);
+    let result_file =
+        fs::File::open(directory.path().join(
+            crate::idempotency::result_relative(&receipt.binding.receipt_id).expect("result"),
+        ))
+        .expect("open result");
+    let result = crate::idempotency::DurableMutationResult::decode(
+        result_file,
+        recovered.store_id(),
+        &receipt.binding,
+    )
+    .expect("strict result");
+    assert_eq!(result.binding().transaction_id, transaction_id);
+    let audit_file =
+        fs::File::open(directory.path().join(
+            crate::idempotency::audit_relative(receipt.binding.audit_sequence).expect("audit"),
+        ))
+        .expect("open audit");
+    let audit = crate::idempotency::DurableAuditEvent::decode(
+        audit_file,
+        recovered.store_id(),
+        receipt.binding.audit_sequence,
+    )
+    .expect("strict audit");
+    assert_eq!(audit.binding.transaction_id, transaction_id);
+
+    let retry_invocation = MutationInvocation::new(
+        CorrelationId::new("req_txn_aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa").expect("retry correlation"),
+    )
+    .expect("retry invocation");
+    let before_replay = tree_snapshot(directory.path());
+    let replay = recovered
+        .create_with_invocation(
+            &authorization,
+            &command,
+            memory_id("mem_generated_ignored"),
+            CreationActor::Model,
+            timestamp("2026-08-24T09:00:00Z"),
+            &retry_invocation,
+        )
+        .expect("exact retry");
+    assert!(replay.idempotent_replay);
+    assert_eq!(
+        replay.correlation_id().expect("replay correlation"),
+        correlation
+    );
+    assert_eq!(replay.store_revision, committed.store_revision);
+    assert_eq!(replay.record, committed.record);
+    assert_eq!(tree_snapshot(directory.path()), before_replay);
+
+    drop(recovered);
+    let mut recovered = CanonicalStore::open(directory.path(), owner())
+        .expect("restart rebuilds transaction anchor set");
+    let before_collision = tree_snapshot(directory.path());
+    let mut different_key = command;
+    different_key.idempotency_key = IdempotencyKey::new("different-anchor-key").expect("key");
+    assert_eq!(
+        recovered
+            .create_with_invocation(
+                &authorization,
+                &different_key,
+                memory_id("mem_collision_attempt"),
+                CreationActor::Model,
+                timestamp("2026-08-24T10:00:00Z"),
+                &invocation,
+            )
+            .expect_err("committed transaction anchor cannot be reused")
+            .code(),
+        StoreErrorCode::InvalidTransaction
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_collision);
+}
+
+#[test]
+fn fresh_admission_runs_after_replay_conflict_and_cas_but_before_any_wal_write() {
+    let directory = TempDir::new().expect("temporary directory");
+    let scope = MemoryScope::Principal {
+        principal_id: principal_id("prn_admission_order"),
+    };
+    let authority = AuthorizedScopes::new(principal_id("prn_admission_order"));
+    let create_authorization = authorized_mutation(&authority, &scope, MutationOperation::Create);
+    let update_authorization = authorized_mutation(&authority, &scope, MutationOperation::Update);
+    let forget_authorization = authorized_mutation(&authority, &scope, MutationOperation::Forget);
+    let mut store = CanonicalStore::initialize(directory.path(), owner()).expect("initialize");
+    let create = remember_command(&scope, "admission-order", "target-body-sentinel");
+    let create_invocation = mutation_invocation("req_txn_10000000000040008000000000000001");
+
+    let before_create_denial = tree_snapshot(directory.path());
+    let denied = store
+        .create_with_invocation_and_admission(
+            &create_authorization,
+            &create,
+            crate::FreshRecordMetadata {
+                memory_id: memory_id("mem_admission_order"),
+                created_by: CreationActor::Model,
+                created_at: timestamp("2026-08-24T02:00:00Z"),
+            },
+            &create_invocation,
+            |target| {
+                assert_eq!(target.body, "target-body-sentinel");
+                assert_eq!(target.memory_type, MemoryType::Decision);
+                Err(StoreError::Forbidden)
+            },
+        )
+        .expect_err("fresh create policy denial");
+    assert_eq!(denied.code(), StoreErrorCode::Forbidden);
+    assert_eq!(store.watermark().expect("watermark"), StoreRevision(0));
+    assert_eq!(store.metadata.audit_sequence, AuditSequence(0));
+    assert_eq!(tree_snapshot(directory.path()), before_create_denial);
+
+    let created = store
+        .create_with_invocation_and_admission(
+            &create_authorization,
+            &create,
+            crate::FreshRecordMetadata {
+                memory_id: memory_id("mem_admission_order"),
+                created_by: CreationActor::Model,
+                created_at: timestamp("2026-08-24T02:00:00Z"),
+            },
+            &create_invocation,
+            |_| Ok(()),
+        )
+        .expect("admitted create");
+    let replay_tree = tree_snapshot(directory.path());
+    let replay = store
+        .create_with_invocation_and_admission(
+            &create_authorization,
+            &create,
+            crate::FreshRecordMetadata {
+                memory_id: memory_id("mem_ignored_replay_id"),
+                created_by: CreationActor::Host,
+                created_at: timestamp("2026-08-24T08:00:00Z"),
+            },
+            &mutation_invocation("req_txn_20000000000040008000000000000002"),
+            |_| panic!("exact replay must not re-run fresh admission"),
+        )
+        .expect("exact create replay");
+    assert!(replay.idempotent_replay);
+    assert_eq!(replay.record, created.record);
+    assert_eq!(tree_snapshot(directory.path()), replay_tree);
+    let mut conflicting_create = create.clone();
+    conflicting_create.body = "different body".to_owned();
+    assert_eq!(
+        store
+            .create_with_invocation_and_admission(
+                &create_authorization,
+                &conflicting_create,
+                crate::FreshRecordMetadata {
+                    memory_id: memory_id("mem_conflict_ignored"),
+                    created_by: CreationActor::Model,
+                    created_at: timestamp("2026-08-24T08:00:00Z"),
+                },
+                &mutation_invocation("req_txn_30000000000040008000000000000003"),
+                |_| panic!("idempotency conflict must precede admission"),
+            )
+            .expect_err("changed input conflicts")
+            .code(),
+        StoreErrorCode::IdempotencyConflict
+    );
+    assert_eq!(tree_snapshot(directory.path()), replay_tree);
+
+    let mut update = update_command(&created.record.id, 1, "admitted update");
+    update.patch.body = Some("updated-target-body".to_owned());
+    let update_invocation = mutation_invocation("req_txn_40000000000040008000000000000004");
+    let before_update_denial = tree_snapshot(directory.path());
+    assert_eq!(
+        store
+            .update_with_invocation_and_admission(
+                &update_authorization,
+                &update,
+                timestamp("2026-08-24T09:00:00Z"),
+                &update_invocation,
+                |target| {
+                    assert_eq!(target.body, "updated-target-body");
+                    assert_eq!(target.revision.get(), 2);
+                    Err(StoreError::InvalidRequest)
+                },
+            )
+            .expect_err("fresh update policy denial")
+            .code(),
+        StoreErrorCode::InvalidRequest
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_update_denial);
+    let updated = store
+        .update_with_invocation_and_admission(
+            &update_authorization,
+            &update,
+            timestamp("2026-08-24T09:00:00Z"),
+            &update_invocation,
+            |_| Ok(()),
+        )
+        .expect("admitted update");
+    let after_update = tree_snapshot(directory.path());
+    let mut stale = update_command(&updated.record.id, 1, "stale update");
+    stale.idempotency_key = IdempotencyKey::new("stale-admission-key").expect("key");
+    assert_eq!(
+        store
+            .update_with_invocation_and_admission(
+                &update_authorization,
+                &stale,
+                timestamp("2026-08-24T10:00:00Z"),
+                &mutation_invocation("req_txn_50000000000040008000000000000005"),
+                |_| panic!("stale CAS must precede admission"),
+            )
+            .expect_err("stale CAS")
+            .code(),
+        StoreErrorCode::RevisionConflict
+    );
+    assert_eq!(tree_snapshot(directory.path()), after_update);
+    let replay = store
+        .update_with_invocation_and_admission(
+            &update_authorization,
+            &update,
+            timestamp("2026-08-24T11:00:00Z"),
+            &mutation_invocation("req_txn_60000000000040008000000000000006"),
+            |_| panic!("update replay must not re-run admission"),
+        )
+        .expect("update replay");
+    assert!(replay.idempotent_replay);
+
+    let forget = forget_command(
+        &updated.record.id,
+        updated.record.revision.get(),
+        "forget-admission-key",
+        "body-free forget admission",
+    );
+    let forget_invocation = mutation_invocation("req_txn_70000000000040008000000000000007");
+    let before_forget_denial = tree_snapshot(directory.path());
+    assert_eq!(
+        store
+            .forget_with_invocation_and_admission(
+                &forget_authorization,
+                &forget,
+                timestamp("2026-08-24T12:00:00Z"),
+                &forget_invocation,
+                || Err(StoreError::Forbidden),
+            )
+            .expect_err("fresh forget policy denial")
+            .code(),
+        StoreErrorCode::Forbidden
+    );
+    assert_eq!(tree_snapshot(directory.path()), before_forget_denial);
+    store
+        .forget_with_invocation_and_admission(
+            &forget_authorization,
+            &forget,
+            timestamp("2026-08-24T12:00:00Z"),
+            &forget_invocation,
+            || Ok(()),
+        )
+        .expect("admitted forget");
+    let after_forget = tree_snapshot(directory.path());
+    let replay = store
+        .forget_with_invocation_and_admission(
+            &forget_authorization,
+            &forget,
+            timestamp("2026-08-24T13:00:00Z"),
+            &mutation_invocation("req_txn_80000000000040008000000000000008"),
+            || panic!("forget replay must not re-run admission"),
+        )
+        .expect("forget replay");
+    assert!(replay.idempotent_replay);
+    assert_eq!(tree_snapshot(directory.path()), after_forget);
 }
 
 #[test]

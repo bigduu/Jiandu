@@ -4,11 +4,14 @@
 
 This document defines the Jiandu `v1alpha1` public contract. Issue #7 ships the
 transport-independent read slice in `jiandu-mcp`: `memory_search`,
-`memory_get`, `memory_list`, and read-only resources. Mutation tools, a daemon,
-HTTP, and two-client conformance remain later issues, so the complete document
-is still an implementation target rather than a stable compatibility promise.
+`memory_get`, `memory_list`, and read-only resources. Issue #8 adds the
+independently authorized `memory_remember`, `memory_update`, and
+`memory_forget` tools over the same handler and production store backend. A
+daemon, HTTP, and two-client conformance remain later issues, so the complete
+document is still an implementation target rather than a stable compatibility
+promise.
 
-The read handler supports exactly MCP revision `2025-11-25`. This is
+The handler supports exactly MCP revision `2025-11-25`. This is
 independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests
 prevent the values from being conflated.
 
@@ -35,6 +38,23 @@ Before a tool is invoked, the MCP session establishes:
 ```
 
 Neither `principalId` nor `clientId` appears as a public tool argument. This prevents a model from impersonating another principal. A host may pass opaque Project and Session IDs only within the scopes authorized for that identity.
+
+### Connection capability configurations
+
+The fixed tool list is identical for read-only and mutation-enabled handlers.
+A read-only host constructs the handler with only an `AuthorizedRead`; valid
+remember/update/forget calls return `FORBIDDEN` with store revision zero and do
+not query the backend. A mutation-enabled host additionally supplies the same
+store backend, the trusted connection context, a trusted `CreationActor`, and
+a configured admission policy. Missing write or forget grants reject only the
+corresponding tool call and do not make initialization or read tools fail.
+
+All handlers require `memory:read` for the shipped read surface. Within a
+mutation-enabled handler, remember/update require the exact scope-kind
+`memory:write:*` grant and forget requires the separate exact scope-kind
+`memory:forget:*` grant. A write-only grant cannot forget; a forget-only grant
+cannot remember or update. The model cannot select `CreationActor`, identity,
+policy, or the operation capability set.
 
 ## Common types
 
@@ -113,7 +133,8 @@ Input:
 Output contains memory summaries, deterministic pagination metadata, and query diagnostics that disclose no inaccessible record.
 
 Issue #6 implements the retrieval engine and host-facing Rust APIs. Issue #7
-adds the read-only MCP adapter. The adapter first asks `jiandu-store` to mint an
+adds this MCP read surface; Issue #8 extends the same handler with mutations
+without changing read semantics. For search, the adapter first asks `jiandu-store` to mint an
 `AuthorizedIndexQuery` for the exact request selectors; passing an arbitrary
 vector of scopes to the index is not supported. Search validates the complete
 private derived image but only authorized scope intersections can become hits.
@@ -143,13 +164,54 @@ List memories using structured filters without a free-text relevance query. This
 
 Input supports one or more authorized scopes, record type, status, tags, update watermark, limit, cursor, and a stable sort order.
 
-For all three read tools, the checked `jiandu-core` request schema is the MCP
-`inputSchema` without an adapter-owned identity wrapper. The handler strictly
-decodes and runs the core validator before calling its backend. Every success
-uses `ResultEnvelope` as authoritative `structuredContent`; every routed
-domain/input failure uses `ErrorEnvelope`. The accompanying text is only a
-short body/query/ID-free summary. Mixed authorized and inaccessible selector
-sets fail as a whole instead of silently returning a narrower page.
+For all six tools, the checked `jiandu-core` v1alpha1 request/command schema is
+the MCP `inputSchema` without an adapter-owned identity wrapper. The handler
+strictly decodes and runs the core validator before calling its backend. Every
+success uses `ResultEnvelope` as authoritative `structuredContent`; every
+routed domain/input failure uses `ErrorEnvelope`. The accompanying text is
+only a short body/query/ID-free summary. Mixed authorized and inaccessible
+selector sets fail as a whole instead of silently returning a narrower page.
+
+### Mutation authorization, admission, and correlation
+
+For each mutation call, the adapter validates the public core command, then
+uses trusted connection state to mint a nonempty operation-specific set of
+exact authorized scopes. This happens before private receipt metadata is read.
+On a receipt hit, its bound scope must be in that set before the private result,
+audit, or full fingerprint can be inspected. On a receipt miss, update/forget
+target discovery examines only canonical paths in that set; inaccessible and
+absent IDs both return `NOT_FOUND`.
+
+Idempotency replay/conflict is decided before fresh admission. On a fresh
+remember/update, the store constructs and validates the complete target record
+(and performs update CAS) before calling the configured policy; fresh forget
+passes only its validated command and never passes the old body. Policy is
+local, synchronous, bounded, non-reentrant, panic-free, network-free, and executes under
+the writer guard before the first WAL byte. Exact replay and conflicting key
+reuse do not invoke policy again. Policy receives trusted principal/client,
+exact scope, operation, and the current attempt correlation, none of which is
+serialized into the tool command or idempotency fingerprint.
+
+A fresh call uses a strict `req_txn_` UUIDv4 correlation. Its UUID maps
+reversibly to the existing hyphenated transaction ID that strict WAL, result,
+receipt, and audit bindings already repeat, so this feature does not change the
+v1alpha4 store codec. The correlation is excluded from canonical request
+identity. Historical store codecs accept any canonical UUID version for
+`transactionId`; exact replay maps that durable UUID to the same `req_txn_`
+simple form without reapplying the UUIDv4-only fresh-attempt rule. It returns
+the original committed operation correlation and store revision; the current
+retry attempt correlation remains local to policy/backend diagnostics.
+Mutation failures carry the revision captured under the same store writer
+guard, avoiding a later mixed-watermark read.
+
+Canonical fsync/rename work runs on a blocking worker. MCP
+`notifications/cancelled`, an adapter future drop, or transport timeout marks
+the response unused but does not abort the worker after WAL work begins. The
+caller retries the identical command and key after timeout/disconnect. Tests
+pause at every authoritative create/update/forget live persistence boundary,
+send a real cancellation, release the worker, close/reopen the store, and
+verify one audit/revision plus exact replay. Separate exhaustive store
+failpoint/recovery matrices cover old-or-complete crash states.
 
 ### `memory_remember`
 
@@ -173,8 +235,9 @@ Input:
 }
 ```
 
-The service validates current exact-scope authority and content policy, then
-returns the created record. Repeating an identical request with the same
+The service validates current exact-scope authority, resolves receipt
+replay/conflict, then applies content policy only to a fresh complete target
+before returning the created record. Repeating an identical request with the same
 authenticated principal, operation, idempotency key, and canonical input
 returns the original result with `idempotentReplay: true`. Reusing the key for
 different canonical input returns `IDEMPOTENCY_CONFLICT` before a persistent
@@ -238,9 +301,11 @@ Input:
 ```
 
 The normal operation requires a destructive `memory:forget:{scope-kind}` grant
-that is independent from `memory:write:*`. It authenticates and resolves exact
-scope before receipt lookup, fingerprints scope/ID/revision/reason, and looks up
-an exact retry before record lookup or CAS. A committed retry returns the
+that is independent from `memory:write:*`. It authenticates and resolves the
+complete operation-specific exact-scope set before receipt lookup, requires a
+receipt hit's bound scope to remain in that set, and fingerprints
+scope/ID/revision/reason. A receipt miss scans only that set for the target; an
+exact retry is decided before fresh record lookup or CAS. A committed retry returns the
 original body-free ID/revision/ETag/`forgottenAt` result without another audit;
 conflicting key reuse fails before a write. The metadata-last transaction
 publishes a protected tombstone before renaming the held record to a private
@@ -342,7 +407,7 @@ notifications in this revision. Resource results use the `2025-11-25` wire
 shape and therefore do not emit later `resultType`, `cacheScope`, or `ttlMs`
 fields.
 
-## Read-handler initialization metadata
+## Handler initialization metadata
 
 The official `rmcp` `ServerHandler` exposes only tools, resources, and this
 safe authenticated snapshot under `capabilities.experimental.jiandu`:

@@ -107,29 +107,52 @@ and compatibility policy are in [Lexical Index Format `v1alpha1`](index-format-v
 
 ### MCP adapter
 
-The implemented `jiandu-mcp` crate translates MCP `2025-11-25` read requests
-into authenticated domain reads. A per-connection constructor validates the
-trusted context, principal equality, and independent `memory:read` grant, then
-retains a private-field `AuthorizedRead`; identity is never accepted from a
-tool argument. Its fixed tools are `memory_search`, `memory_get`, and
-`memory_list`. Checked core request schemas are used directly, and structured
-Jiandu envelopes remain authoritative over concise text summaries.
+The implemented `jiandu-mcp` crate translates MCP `2025-11-25` read and
+single-record mutation requests into authenticated domain operations. A
+per-connection constructor validates the trusted context, principal equality,
+and `memory:read` grant, then retains a private-field `AuthorizedRead`;
+identity is never accepted from a tool argument. Its fixed tools are
+`memory_search`, `memory_get`, `memory_list`, `memory_remember`,
+`memory_update`, and `memory_forget`. Checked core request schemas are used
+directly, and structured Jiandu envelopes remain authoritative over concise
+text summaries.
 
-The handler depends on a narrow synchronous `McpReadBackend` rather than owning
-daemon lifecycle. The production backend composes `CanonicalStore` behind a
-host `RwLock` with `LexicalIndex`, so a later mutation adapter can share the
-same writer without replacing the read protocol. Search reads the canonical
-watermark before and after the index result and discards any mixed snapshot.
-Missing/corrupt/stale index state yields `INDEX_DEGRADED`; exact get/list remain
-independent.
+The handler depends on narrow synchronous `McpReadBackend` and
+`McpMutationBackend` seams rather than owning daemon lifecycle. The production
+backend composes `CanonicalStore` behind a host `RwLock` with `LexicalIndex`, so
+reads and mutations share one writer without coupling the adapter to a daemon
+lock strategy. Search reads the canonical watermark before and after the index
+result and discards any mixed snapshot. A fresh mutation changes a ready index
+to degraded until rebuild; a missing index remains missing. In either case
+search yields `INDEX_DEGRADED` while exact get/list remain independent.
+
+Mutation-enabled construction retains trusted connection context, a host
+chosen `CreationActor`, and a synchronous bounded admission policy beside the
+backend. `memory:write:{scope-kind}` grants independently authorize remember
+and update; `memory:forget:{scope-kind}` independently authorizes forget.
+Read-only construction remains valid and all three mutation tools return a
+zero-I/O `FORBIDDEN` envelope instead of making connection initialization
+fail. Mutation calls execute in a blocking worker because canonical sync and
+rename boundaries are synchronous. An MCP cancellation or transport timeout
+marks the response unused but does not cooperatively abort a worker after WAL
+work has begun; the client retries the identical command and key to recover
+the old-or-complete result.
+
+Conformance has two complementary exhaustive matrices. Store tests fail and
+reopen at every create/update/forget persistence and recovery boundary.
+In-process MCP tests use the same authoritative live-boundary lists, pause the
+blocking worker at every boundary, send a real `notifications/cancelled`, then
+release, close the owner, reopen, and retry the same key. Together they prove
+transport cancellation never becomes a second commit and crash recovery never
+fabricates an acknowledgement.
 
 Addressable resources use only opaque IDs or scope selectors, never queries or
 paths. Inaccessible and absent IDs are indistinguishable. Initialization
 metadata contains only closed ready/degraded/missing states and derived
 operation flags; it does not call admin diagnostics or expose reasons, counts,
-watermarks, or paths. Subscriptions, mutation tools, HTTP, daemon ownership,
-and prompt placement remain later boundaries. MCP protocol negotiation remains
-separate from the Jiandu API and store-format versions.
+watermarks, or paths. Subscriptions, HTTP, daemon ownership, and prompt
+placement remain later boundaries. MCP protocol negotiation remains separate
+from the Jiandu API and store-format versions.
 
 ### Administrative CLI
 
@@ -270,10 +293,19 @@ increasing record revision and content-bound opaque ETag, and every committed
 create/update/forget one new store watermark, one durable receipt/private
 result, and one sequence-addressed audit event; each committed portable-import
 batch likewise advances target metadata and audit sequence exactly once. The
-host authenticates and authorizes an exact operation/scope before
-private receipt lookup. Identical principal/operation/key/input retries return
-the original success even after disconnect/restart and advance no watermark;
-conflicting reuse fails before record lookup, CAS, or a write. Updates with a
+host first authenticates principal/client context and mints a nonempty,
+operation-specific set of exact authorized scopes before private receipt
+lookup. Receipt hits must bind a scope inside that set before result/audit or
+the full fingerprint is read; receipt misses inspect only those scopes. This
+lets update/forget resolve a model-supplied opaque ID without accepting its
+scope or disclosing an inaccessible target. Identical
+principal/operation/key/input retries return the original success even after
+disconnect/restart and advance no watermark; conflicting reuse fails before
+record lookup, CAS, policy, or a write. Fresh remember/update admission sees
+the complete canonical target after CAS/target construction; fresh forget
+admission sees only the validated command and never receives the old body. All
+admission is local, synchronous, bounded, non-reentrant, panic-free, network-free, and
+runs before the first WAL byte while the writer guard is held. Updates with a
 stale expected revision otherwise fail without overwriting newer data and
 disclose only the current revision.
 
@@ -324,7 +356,19 @@ restart recovery.
 
 ## Observability
 
-Jiandu emits structured, secret-safe logs and metrics for request latency, error codes, mutation conflicts, idempotent replays, store revisions, index health, rebuild progress, and recovery activity. A correlation ID follows a request from transport through core, store, and audit records.
+Jiandu emits structured, secret-safe logs and metrics for request latency,
+error codes, mutation conflicts, idempotent replays, store revisions, index
+health, rebuild progress, and recovery activity. For a fresh MCP mutation, a
+domain-separated UUIDv4 correlation maps reversibly to the transaction ID
+already bound by the strict WAL/result/receipt/audit codecs. Correlation is
+excluded from the request fingerprint. An exact replay returns that original
+durable operation correlation, including historical transaction IDs using any
+canonical UUID version accepted by the existing store codecs; the fresh
+UUIDv4 constraint is not reapplied to replay. The retry attempt's separately
+generated correlation remains local to adapter/policy diagnostics and is not
+persisted or added to the public envelope. Mutation failures carry the store
+revision captured under the same writer guard; the adapter never performs a
+racy second watermark read to build the error envelope.
 
 Record bodies, user queries, credentials, and prompt text are excluded from logs by default.
 

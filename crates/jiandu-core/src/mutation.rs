@@ -1,7 +1,8 @@
 //! Revision-aware and idempotent memory mutation contracts.
 
 use crate::ids::{
-    AgentId, BranchId, Etag, IdempotencyKey, MemoryId, MessageId, Revision, SessionId, Timestamp,
+    AgentId, BranchId, CorrelationId, Etag, IdempotencyKey, MemoryId, MessageId, Revision,
+    SessionId, Timestamp,
 };
 use crate::memory::{
     CommittedMessageRange, Confidence, ContentDigest, CreationActor, ExtractionProvenance,
@@ -16,6 +17,58 @@ use crate::validation::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+/// Domain-separated correlation prefix for one durable mutation transaction.
+///
+/// The suffix is a canonical lowercase UUIDv4 in simple form. This trusted
+/// invocation value is passed beside a model-visible command and is never part
+/// of a command schema or idempotency fingerprint.
+pub const MUTATION_CORRELATION_PREFIX: &str = "req_txn_";
+
+/// Trusted, non-serializable invocation metadata for one mutation attempt.
+///
+/// A committed replay returns the correlation of the original durable
+/// transaction rather than replacing it with the retry attempt's value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationInvocation {
+    correlation_id: CorrelationId,
+}
+
+impl MutationInvocation {
+    /// Validate a transport-generated mutation correlation identifier.
+    pub fn new(correlation_id: CorrelationId) -> Result<Self, ValidationIssue> {
+        let Some(uuid) = correlation_id
+            .as_str()
+            .strip_prefix(MUTATION_CORRELATION_PREFIX)
+        else {
+            return Err(invalid_mutation_correlation());
+        };
+        let bytes = uuid.as_bytes();
+        if bytes.len() != 32
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            || bytes[12] != b'4'
+            || !matches!(bytes[16], b'8' | b'9' | b'a' | b'b')
+        {
+            return Err(invalid_mutation_correlation());
+        }
+        Ok(Self { correlation_id })
+    }
+
+    #[must_use]
+    pub fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
+}
+
+fn invalid_mutation_correlation() -> ValidationIssue {
+    ValidationIssue::new(
+        "correlationId",
+        ValidationCode::InvalidFormat,
+        "must be a trusted req_txn_ UUIDv4 correlation identifier",
+    )
+}
 
 /// Caller-supplied portable provenance for a newly remembered record.
 ///

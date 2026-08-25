@@ -1,6 +1,6 @@
 [package]
 name = "jiandu-mcp"
-description = "Transport-independent read-only MCP adapter for Jiandu"
+description = "Transport-independent authenticated MCP adapter for Jiandu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,12 +15,14 @@ rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client"] }
+sha2.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

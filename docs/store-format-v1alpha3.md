@@ -55,8 +55,13 @@ Forget requires an independently grantable destructive permission:
 - `memory:forget:instance_global`
 
 `memory:write:*` cannot forget, and `memory:forget:*` cannot create or update.
-The host authenticates the trusted principal, resolves an exact authoritative
-scope, validates the command, and only then looks up a private receipt.
+The host authenticates trusted principal/client context, validates the command,
+and mints the nonempty forget-specific set of exact authoritative scopes before
+looking up private receipt metadata. A receipt hit's bound scope must remain
+in that set before its result, audit, or full fingerprint is loaded. On a miss,
+target discovery scans only the set and then narrows to one exact mutation
+capability; an out-of-set receipt or target returns the same `NotFound` as an
+absent opaque ID.
 For a new commit, the trusted `forgottenAt` value must be at or after the
 record's current `updatedAt`; an exact committed replay returns its original
 time before consulting current record state.
@@ -99,6 +104,14 @@ query, credential, ambient/canonical path, and correlation metadata are absent
 from all five artifacts and from diagnostics. Historical `v1alpha2`
 create/update results remain the only private artifacts allowed to carry a
 record body.
+
+The operation-set authorization seam and the reversible mapping from an MCP
+`req_txn_` UUID correlation to the already persisted transaction ID add no
+field to v1alpha3 or v1alpha4 manifest/tombstone/result/receipt/audit codecs.
+The standalone correlation remains absent from artifacts, existing strict
+fixtures remain byte compatible, and the transaction ID remains the durable
+anchor. Fresh attempts use UUIDv4, while replay continues to accept every
+canonical UUID version already valid for historical transaction IDs.
 
 Executable byte fixtures are checked under
 `crates/jiandu-store/fixtures/v1alpha3/`. The separate `v1alpha2` fixture set is
