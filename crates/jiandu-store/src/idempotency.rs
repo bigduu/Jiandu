@@ -771,6 +771,26 @@ pub(crate) fn validate_ledger(
     }
 }
 
+/// Build the committed mutation transaction-anchor set once while opening a
+/// store. Ordinary mutations consult the resulting in-memory set instead of
+/// rescanning the private receipt ledger on every write.
+///
+/// The exact receipt decoder remains authoritative. Duplicate anchors are an
+/// impossible ledger state and therefore fail closed during startup.
+pub(crate) fn committed_transaction_ids(
+    root: &StoreDirectory,
+    metadata: &StoreMetadata,
+) -> Result<BTreeSet<String>, StoreError> {
+    let mut budget = UnlimitedLedgerBudget;
+    let mut transaction_ids = BTreeSet::new();
+    for receipt in read_all_receipts(root, metadata, &mut budget)? {
+        if !transaction_ids.insert(receipt.binding.transaction_id) {
+            return Err(StoreError::InvalidTransaction);
+        }
+    }
+    Ok(transaction_ids)
+}
+
 /// Stage-specific view over the exact same ledger invariant used by startup.
 /// The set is intentionally closed and carries no artifact names or contents.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

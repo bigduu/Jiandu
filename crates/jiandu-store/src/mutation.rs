@@ -6,17 +6,20 @@ use crate::idempotency::{
 };
 use crate::layout::{self, FileIdentity};
 use crate::transaction::{self, RecordOperation, RecordTransaction, TransactionIntent};
-use crate::{AuthorizedMutation, CanonicalStore, MutationOperation, StoreError};
+use crate::{
+    AuthorizedMutation, AuthorizedMutationSet, CanonicalStore, MutationOperation, StoreError,
+};
 use jiandu_core::{
-    CreationActor, Etag, ForgetMemoryCommand, MemoryId, MemoryPatch, MemoryRecord, MemoryRelation,
-    MemorySchema, MemoryScope, MemoryStatus, MemoryType, Provenance, ProvenanceInput,
-    RememberMemoryCommand, Revision, ScopeSelector, StoreRevision, Tag, Timestamp,
-    UpdateMemoryCommand, Validate,
+    CorrelationId, CreationActor, Etag, ForgetMemoryCommand, IdempotencyKey, MemoryId, MemoryPatch,
+    MemoryRecord, MemoryRelation, MemorySchema, MemoryScope, MemoryStatus, MemoryType,
+    MutationInvocation, Provenance, ProvenanceInput, RememberMemoryCommand, Revision,
+    ScopeSelector, StoreRevision, Tag, Timestamp, UpdateMemoryCommand, Validate,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -108,6 +111,30 @@ pub struct ForgetCommit {
     pub idempotent_replay: bool,
 }
 
+/// Trusted generated values used only when a remember command is fresh.
+/// Grouping them keeps the admission API narrow without creating a wire DTO.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreshRecordMetadata {
+    pub memory_id: MemoryId,
+    pub created_by: CreationActor,
+    pub created_at: Timestamp,
+}
+
+impl MutationCommit {
+    /// Correlation identifier durably anchored by this transaction's strict
+    /// WAL/result/receipt/audit binding.
+    pub fn correlation_id(&self) -> Result<CorrelationId, StoreError> {
+        transaction::correlation_id_from_transaction_id(&self.transaction_id)
+    }
+}
+
+impl ForgetCommit {
+    /// Correlation identifier durably anchored by this forget transaction.
+    pub fn correlation_id(&self) -> Result<CorrelationId, StoreError> {
+        transaction::correlation_id_from_transaction_id(&self.transaction_id)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RememberFingerprint<'a> {
@@ -142,6 +169,67 @@ struct ForgetFingerprint<'a> {
 }
 
 impl CanonicalStore {
+    /// Resolve the exact current scope for an update/forget command from a
+    /// capability that was already authenticated and filtered by operation
+    /// grants. Receipt metadata is inspected only after that authorization;
+    /// inaccessible and absent targets remain indistinguishable.
+    pub fn resolve_existing_mutation(
+        &self,
+        authorization: &AuthorizedMutationSet,
+        memory_id: &MemoryId,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<AuthorizedMutation, StoreError> {
+        self.validate_ownership()?;
+        let operation = authorization.operation();
+        if !matches!(
+            operation,
+            MutationOperation::Update | MutationOperation::Forget
+        ) {
+            return Err(StoreError::InvalidRequest);
+        }
+        let identity =
+            ReceiptIdentity::derive(authorization.principal_id(), operation, idempotency_key);
+        if let Some(receipt) = crate::idempotency::read_receipt(
+            &self.root,
+            &self.metadata.store_id,
+            &identity,
+            operation,
+        )? {
+            let binding = &receipt.binding;
+            if binding.receipt_id != identity.receipt_id
+                || binding.principal_digest != identity.principal_digest
+                || binding.key_digest != identity.key_digest
+                || binding.operation != operation
+            {
+                return Err(StoreError::InvalidTransaction);
+            }
+            return authorization
+                .scopes()
+                .iter()
+                .find(|scope| **scope == binding.scope)
+                .map(|scope| authorization.for_scope(scope))
+                .ok_or(StoreError::NotFound);
+        }
+        if crate::tombstone::id_exists_anywhere(&self.root, memory_id)? {
+            return Err(StoreError::NotFound);
+        }
+        let mut candidate = None;
+        for scope in authorization.scopes() {
+            let relative = layout::record_relative_path(scope, memory_id);
+            if self.root.try_open_regular(&relative, false)?.is_some() {
+                if candidate.is_some() {
+                    return Err(StoreError::DuplicateMemoryId {
+                        id: memory_id.clone(),
+                    });
+                }
+                candidate = Some(scope);
+            }
+        }
+        candidate
+            .map(|scope| authorization.for_scope(scope))
+            .ok_or(StoreError::NotFound)
+    }
+
     /// Idempotently create one canonical memory. Receipt lookup occurs after
     /// operation authorization and validation, but before generated ID/time or
     /// any existing-record check can affect the outcome.
@@ -153,6 +241,77 @@ impl CanonicalStore {
         created_by: CreationActor,
         created_at: Timestamp,
     ) -> Result<MutationCommit, StoreError> {
+        self.create_inner(
+            authorization,
+            command,
+            FreshRecordMetadata {
+                memory_id,
+                created_by,
+                created_at,
+            },
+            None,
+            |_| Ok(()),
+        )
+    }
+
+    /// Create with a trusted transport correlation that becomes the durable
+    /// transaction anchor. The invocation is not part of request identity.
+    pub fn create_with_invocation(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &RememberMemoryCommand,
+        memory_id: MemoryId,
+        created_by: CreationActor,
+        created_at: Timestamp,
+        invocation: &MutationInvocation,
+    ) -> Result<MutationCommit, StoreError> {
+        self.create_inner(
+            authorization,
+            command,
+            FreshRecordMetadata {
+                memory_id,
+                created_by,
+                created_at,
+            },
+            Some(invocation),
+            |_| Ok(()),
+        )
+    }
+
+    /// Create with a synchronous admission hook that runs only for a fresh
+    /// target, after replay/conflict handling and canonical target construction
+    /// but before the first WAL byte.
+    pub fn create_with_invocation_and_admission<A>(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &RememberMemoryCommand,
+        generated: FreshRecordMetadata,
+        invocation: &MutationInvocation,
+        admission: A,
+    ) -> Result<MutationCommit, StoreError>
+    where
+        A: FnOnce(&MemoryRecord) -> Result<(), StoreError>,
+    {
+        self.create_inner(
+            authorization,
+            command,
+            generated,
+            Some(invocation),
+            admission,
+        )
+    }
+
+    fn create_inner<A>(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &RememberMemoryCommand,
+        generated: FreshRecordMetadata,
+        invocation: Option<&MutationInvocation>,
+        admission: A,
+    ) -> Result<MutationCommit, StoreError>
+    where
+        A: FnOnce(&MemoryRecord) -> Result<(), StoreError>,
+    {
         self.validate_ownership()?;
         require_operation(authorization, MutationOperation::Create)?;
         command.validate().map_err(|_| StoreError::InvalidRequest)?;
@@ -185,10 +344,10 @@ impl CanonicalStore {
 
         let input = CreateMemoryInput::from_remember_command(
             command,
-            memory_id,
+            generated.memory_id,
             authorization,
-            created_by,
-            created_at,
+            generated.created_by,
+            generated.created_at,
         )?;
         let (record, bytes) = input.into_record(authorization.as_scope().clone())?;
         if crate::tombstone::id_exists_anywhere(&self.root, &record.id)? {
@@ -199,9 +358,10 @@ impl CanonicalStore {
                 id: record.id.clone(),
             });
         }
+        admission(&record)?;
         self.ensure_metadata_current()?;
         let target_metadata = next_store_metadata(&self.metadata)?;
-        let transaction_id = transaction::new_transaction_id();
+        let transaction_id = self.available_transaction_id(invocation)?;
         let binding = MutationBinding {
             receipt_id: receipt_identity.receipt_id,
             transaction_id: transaction_id.clone(),
@@ -254,6 +414,57 @@ impl CanonicalStore {
         command: &UpdateMemoryCommand,
         updated_at: Timestamp,
     ) -> Result<MutationCommit, StoreError> {
+        self.update_inner(authorization, command, updated_at, None, |_| Ok(()))
+    }
+
+    /// Update with a trusted transport correlation that becomes the durable
+    /// transaction anchor for a fresh commit.
+    pub fn update_with_invocation(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &UpdateMemoryCommand,
+        updated_at: Timestamp,
+        invocation: &MutationInvocation,
+    ) -> Result<MutationCommit, StoreError> {
+        self.update_inner(authorization, command, updated_at, Some(invocation), |_| {
+            Ok(())
+        })
+    }
+
+    /// Update with a fresh-write admission hook. Exact replay and conflicting
+    /// key reuse are resolved before the hook; fresh CAS and canonical target
+    /// construction precede it, and WAL persistence follows it.
+    pub fn update_with_invocation_and_admission<A>(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &UpdateMemoryCommand,
+        updated_at: Timestamp,
+        invocation: &MutationInvocation,
+        admission: A,
+    ) -> Result<MutationCommit, StoreError>
+    where
+        A: FnOnce(&MemoryRecord) -> Result<(), StoreError>,
+    {
+        self.update_inner(
+            authorization,
+            command,
+            updated_at,
+            Some(invocation),
+            admission,
+        )
+    }
+
+    fn update_inner<A>(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &UpdateMemoryCommand,
+        updated_at: Timestamp,
+        invocation: Option<&MutationInvocation>,
+        admission: A,
+    ) -> Result<MutationCommit, StoreError>
+    where
+        A: FnOnce(&MemoryRecord) -> Result<(), StoreError>,
+    {
         self.validate_ownership()?;
         require_operation(authorization, MutationOperation::Update)?;
         command.validate().map_err(|_| StoreError::InvalidRequest)?;
@@ -310,9 +521,10 @@ impl CanonicalStore {
         }
         let target_record = apply_patch(current.clone(), &command.patch, updated_at)?;
         let (target_record, bytes) = canonicalize_record(&target_record)?;
+        admission(&target_record)?;
         self.ensure_metadata_current()?;
         let target_metadata = next_store_metadata(&self.metadata)?;
-        let transaction_id = transaction::new_transaction_id();
+        let transaction_id = self.available_transaction_id(invocation)?;
         let binding = MutationBinding {
             receipt_id: receipt_identity.receipt_id,
             transaction_id: transaction_id.clone(),
@@ -373,6 +585,61 @@ impl CanonicalStore {
         command: &ForgetMemoryCommand,
         forgotten_at: Timestamp,
     ) -> Result<ForgetCommit, StoreError> {
+        self.forget_inner(authorization, command, forgotten_at, None, || Ok(()))
+    }
+
+    /// Forget with a trusted transport correlation that becomes the durable
+    /// transaction anchor for a fresh commit.
+    pub fn forget_with_invocation(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &ForgetMemoryCommand,
+        forgotten_at: Timestamp,
+        invocation: &MutationInvocation,
+    ) -> Result<ForgetCommit, StoreError> {
+        self.forget_inner(
+            authorization,
+            command,
+            forgotten_at,
+            Some(invocation),
+            || Ok(()),
+        )
+    }
+
+    /// Forget with a body-free fresh-write admission hook. Receipt replay and
+    /// conflict handling, exact scope resolution, and CAS all precede the hook;
+    /// the hook never receives the old body and runs before the WAL.
+    pub fn forget_with_invocation_and_admission<A>(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &ForgetMemoryCommand,
+        forgotten_at: Timestamp,
+        invocation: &MutationInvocation,
+        admission: A,
+    ) -> Result<ForgetCommit, StoreError>
+    where
+        A: FnOnce() -> Result<(), StoreError>,
+    {
+        self.forget_inner(
+            authorization,
+            command,
+            forgotten_at,
+            Some(invocation),
+            admission,
+        )
+    }
+
+    fn forget_inner<A>(
+        &mut self,
+        authorization: &AuthorizedMutation,
+        command: &ForgetMemoryCommand,
+        forgotten_at: Timestamp,
+        invocation: Option<&MutationInvocation>,
+        admission: A,
+    ) -> Result<ForgetCommit, StoreError>
+    where
+        A: FnOnce() -> Result<(), StoreError>,
+    {
         self.validate_ownership()?;
         require_operation(authorization, MutationOperation::Forget)?;
         command.validate().map_err(|_| StoreError::InvalidRequest)?;
@@ -421,9 +688,10 @@ impl CanonicalStore {
         if timestamp_nanos(&forgotten_at)? < timestamp_nanos(&current.updated_at)? {
             return Err(StoreError::InvalidRequest);
         }
+        admission()?;
         self.ensure_metadata_current()?;
         let target_metadata = next_store_metadata(&self.metadata)?;
-        let transaction_id = transaction::new_transaction_id();
+        let transaction_id = self.available_transaction_id(invocation)?;
         let tombstone = crate::tombstone::ProtectedTombstone::new(
             self.metadata.store_id.clone(),
             transaction_id.clone(),
@@ -557,6 +825,9 @@ impl CanonicalStore {
         transaction::publish_metadata(&self.root, &manifest, metadata_identity, &self.failpoints)?;
         self.metadata = target_metadata;
         transaction::remove_manifest(&self.root, &manifest, &self.failpoints)?;
+        if !self.mutation_transaction_ids.insert(transaction_id.clone()) {
+            return Err(StoreError::InvalidTransaction);
+        }
         self.poisoned = false;
         Ok(ForgetCommit {
             transaction_id,
@@ -640,6 +911,9 @@ impl CanonicalStore {
         transaction::publish_metadata(&self.root, &manifest, metadata_identity, &self.failpoints)?;
         self.metadata = target_metadata;
         transaction::remove_manifest(&self.root, &manifest, &self.failpoints)?;
+        if !self.mutation_transaction_ids.insert(transaction_id.clone()) {
+            return Err(StoreError::InvalidTransaction);
+        }
         self.poisoned = false;
         Ok(MutationCommit {
             transaction_id,
@@ -770,6 +1044,34 @@ impl CanonicalStore {
             forgotten_at: result.forgotten_at,
             idempotent_replay: true,
         }))
+    }
+
+    fn available_transaction_id(
+        &self,
+        invocation: Option<&MutationInvocation>,
+    ) -> Result<String, StoreError> {
+        let transaction_id = invocation.map_or_else(
+            || Ok(transaction::new_transaction_id()),
+            transaction::transaction_id_from_invocation,
+        )?;
+        let import_backup =
+            PathBuf::from(layout::IMPORT_BACKUPS_DIR).join(format!("{transaction_id}.json"));
+        let in_use = self.mutation_transaction_ids.contains(&transaction_id)
+            || self
+                .root
+                .regular_file_exists(&transaction::manifest_relative(&transaction_id)?)?
+            || self
+                .root
+                .regular_file_exists(&transaction::manifest_temp_relative(&transaction_id)?)?
+            || self
+                .root
+                .regular_file_exists(&transaction::receipt_relative(&transaction_id)?)?
+            || self.root.regular_file_exists(&import_backup)?;
+        if in_use {
+            Err(StoreError::InvalidTransaction)
+        } else {
+            Ok(transaction_id)
+        }
     }
 
     fn ensure_metadata_current(&self) -> Result<(), StoreError> {

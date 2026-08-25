@@ -101,7 +101,14 @@ async fn duplex_tools_match_direct_store_and_index_results_with_safe_pagination(
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>(),
-        ["memory_get", "memory_list", "memory_search"]
+        [
+            "memory_forget",
+            "memory_get",
+            "memory_list",
+            "memory_remember",
+            "memory_search",
+            "memory_update",
+        ]
     );
 
     let get_result = client

@@ -80,17 +80,26 @@ Receipt lookup is possible only after this order:
 
 1. validate the trusted request context;
 2. verify that its principal matches host authority;
-3. authorize the operation for one exact authoritative scope;
-4. validate the caller command and canonicalize its scope selector;
+3. mint the nonempty operation-specific set of exact authoritative scopes;
+4. validate the caller command; for create, canonicalize its selector and
+   require that exact scope to be in the set;
 5. derive and look up the private receipt identity; and
-6. on a match, recheck that the fresh capability still authorizes the exact
-   scope stored in the receipt before loading the private result.
+6. on a match, require the receipt-bound scope to remain in the set before
+   loading the private result, audit, or full fingerprint. On an update receipt
+   miss, fresh target discovery examines only that authorized set and then
+   narrows to one exact capability.
 
 Mutation capabilities are created by the host and have private fields. Public
 create/update entry points cannot accept a caller-constructed Principal or a
 bare `AuthorizedScope`. The required host grants are
 `memory:write:principal`, `memory:write:project`, `memory:write:session`, or
 `memory:write:instance_global` for the selected exact scope.
+
+The operation-set capability and MCP correlation mapping are runtime
+authorization/adapter seams only. They add no serialized field to the
+historical v1alpha2 manifest, receipt, result, or audit codecs; transaction ID
+remains the strict durable anchor, so checked v1alpha2 fixtures remain byte
+compatible.
 
 The receipt identity is derived from:
 
@@ -232,9 +241,13 @@ revision, ETag, previous revision, and store revision with
 timeout/disconnect, process restart, and recovery. It does not rewrite a file,
 advance either watermark, or append an audit event.
 
-If the same receipt identity exists but the exact scope or request fingerprint
-differs, the operation returns `IDEMPOTENCY_CONFLICT` before CAS, record lookup,
-or any persistent write. Diagnostics contain only the stable error category.
+If the same receipt identity exists, its scope is currently authorized, but
+the exact scope or request fingerprint differs, the operation returns
+`IDEMPOTENCY_CONFLICT` before CAS, record lookup, policy, or any persistent
+write. If the receipt-bound scope is no longer in the current operation set,
+the public operation returns the same `NOT_FOUND` used for an inaccessible or
+absent opaque ID and does not load the private result/audit. Diagnostics
+contain only the stable error category.
 
 Exact replay is guaranteed only while the private result artifact remains and
 the caller still has current authority for its exact scope. `v1alpha3`

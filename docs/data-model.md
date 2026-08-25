@@ -212,9 +212,11 @@ paths part of the public API.
 
 The implemented #4/#17 create/update core follows one state machine:
 
-1. the host authenticates the trusted request context, resolves an
-   operation-specific `AuthorizedMutation` for one exact scope, and validates
-   the public command;
+1. the host authenticates the trusted request context, mints an
+   operation-specific set of exact authorized scopes, and validates the public
+   command; create narrows its selector to one scope, while update/forget
+   require a receipt-bound or fresh target scope to belong to that set before
+   producing the exact `AuthorizedMutation`;
 2. Jiandu fingerprints authoritative scope plus canonical caller input and
    looks up the principal/operation/key-digest receipt before generated values,
    create existence checks, update `NotFound`, or CAS;
@@ -348,3 +350,31 @@ bounded deterministic page. Search queries never become resource identity.
 Resource/tool results preserve canonical record metadata and the authoritative
 store revision in a `v1alpha1` envelope; concise MCP text is not a second data
 projection or prompt-placement policy.
+
+## MCP mutation projection
+
+`jiandu-mcp` publishes the checked core remember/update/forget command schemas
+directly; it does not create identity-bearing adapter DTOs. The trusted
+connection context mints a private, non-serializable operation-specific scope
+set. Receipt metadata may be inspected only after that set exists, and a
+receipt's scope must still belong to the set before its private result/audit or
+full request fingerprint is read. Fresh target discovery scans only the same
+set, preserving the absent/inaccessible boundary for opaque IDs.
+
+The adapter passes a trusted, non-serializable `MutationInvocation` beside the
+core command. Its domain-separated UUID correlation maps reversibly to the
+existing transaction ID repeated in strict WAL/result/receipt/audit bindings;
+it adds no field to record or store codecs and is excluded from the
+idempotency fingerprint. A replay therefore returns the original durable
+operation correlation, while the current retry attempt remains local.
+
+Fresh remember/update admission receives the complete validated canonical
+target after replay/conflict handling and CAS; fresh forget admission receives
+the validated command without the old body. Admission is local, synchronous,
+bounded, non-reentrant, panic-free, and network-free under the writer guard,
+before any WAL byte. MCP handlers dispatch synchronous persistence through a
+blocking worker. Cancellation drops the response path, never the transaction;
+same-key retry after disconnect/restart observes one revision and one audit.
+Fresh commits invalidate only a ready lexical index. Missing/degraded states
+remain closed, exact get/list remain canonical, and search reports explicit
+index degradation until rebuild.

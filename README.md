@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a deterministic disposable Unicode/CJK lexical index, and a transport-independent authenticated read-only MCP handler. The daemon, HTTP transport, and mutation MCP tools remain tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and are delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a deterministic disposable Unicode/CJK lexical index, and a transport-independent authenticated MCP read/mutation handler. The daemon and HTTP transport remain tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and are delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -20,7 +20,7 @@ Jiandu therefore separates three responsibilities:
                             ┌──────────────────────┐
                             │       Jiandu         │
                             │ filesystem + index   │
-                            │ MCP read handler     │
+                            │ MCP tool handler     │
                             │ transport comes next │
                             └──────────┬───────────┘
                                        │
@@ -42,6 +42,7 @@ Jiandu therefore separates three responsibilities:
 - Read and write results are structured data, not pre-rendered prompt instructions.
 - Canonical create/update uses expected-revision CAS plus principal/operation-scoped durable receipts. Identical retries replay the original result without another mutation or audit event.
 - Ordinary forget is exact-scope, revision-aware, independently destructive-authorized, idempotent, and audited; it retains a descriptor-erased zero-length logical witness rather than claiming secure physical erasure. Restore/hard-purge remain separate administrative lifecycles.
+- MCP mutation identity comes only from trusted connection context. Operation-specific write and forget grants are resolved before private receipt access; configurable admission runs only for a fresh canonical target and before the WAL. A strict transport correlation maps to the transaction ID already bound across WAL/result/receipt/audit, while replay returns the original committed correlation.
 - Live owners and coordinated offline inspectors share one bounded, read-only validation engine. Portable export is canonical, deterministic, scope-authorized, complete for public record/provenance fields, and excludes paths and private replay/WAL/audit/witness bytes.
 - Portable import strictly decodes before write, produces a deterministic zero-write authority plan, and commits at most 100 records/tombstones in one metadata-last v4 WAL. Exact retries replay one receipt-bound result and backup metadata without another mutation or audit event.
 - Jiandu remains useful without an LLM provider; extraction and reranking are optional later capabilities.
@@ -93,9 +94,9 @@ crates/jiandu-store/                 exclusive ownership, reads, atomic CAS, and
 crates/jiandu-index/                 deterministic, derived Unicode/CJK lexical retrieval
   fixtures/v1alpha1/                 tokenizer and logical index-format conformance fixtures
   src/                               strict format, SQLite rebuild, HMAC cursor, ranking, diagnostics
-crates/jiandu-mcp/                   transport-independent authenticated read adapter
-  src/                               fixed read tools, resources, safe health, backend seam
-  tests/                             in-process protocol, authorization, schema, degradation fixtures
+crates/jiandu-mcp/                   transport-independent authenticated MCP adapter
+  src/                               fixed read/mutation tools, resources, policy, safe health, backend seams
+  tests/                             in-process protocol, authorization, schema, retry, cancellation, degradation fixtures
 ```
 
 Future daemon and CLI crates are introduced only when their boundary is

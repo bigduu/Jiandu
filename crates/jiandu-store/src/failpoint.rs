@@ -106,6 +106,89 @@ pub enum PersistenceBoundary {
 }
 
 impl PersistenceBoundary {
+    /// Every live persistence boundary shared by one create or update
+    /// transaction, in protocol order. Integration tests use this authority
+    /// rather than maintaining a second partial boundary list.
+    pub const CREATE_UPDATE_TRANSACTION: &'static [Self] = &[
+        Self::ManifestTempWritten,
+        Self::ManifestTempSynced,
+        Self::ManifestTempDirectorySynced,
+        Self::ManifestPublished,
+        Self::ManifestDirectorySynced,
+        Self::RecordNamespacePrepared,
+        Self::RecordTempWritten,
+        Self::RecordTempSynced,
+        Self::RecordTempDirectorySynced,
+        Self::MetadataTempWritten,
+        Self::MetadataTempSynced,
+        Self::MetadataTempDirectorySynced,
+        Self::IdempotencyNamespacePrepared,
+        Self::MutationResultTempWritten,
+        Self::MutationResultTempSynced,
+        Self::MutationResultTempDirectorySynced,
+        Self::MutationReceiptTempWritten,
+        Self::MutationReceiptTempSynced,
+        Self::MutationReceiptTempDirectorySynced,
+        Self::MutationAuditTempWritten,
+        Self::MutationAuditTempSynced,
+        Self::MutationAuditTempDirectorySynced,
+        Self::RecordRenamed,
+        Self::RecordDirectorySynced,
+        Self::MutationResultPublished,
+        Self::MutationResultDirectorySynced,
+        Self::MutationReceiptPublished,
+        Self::MutationReceiptDirectorySynced,
+        Self::MutationAuditPublished,
+        Self::MutationAuditDirectorySynced,
+        Self::MetadataRenamed,
+        Self::MetadataDirectorySynced,
+        Self::ManifestRemoved,
+        Self::ManifestRemovalDirectorySynced,
+    ];
+
+    /// Every live persistence boundary in one forget transaction, in protocol
+    /// order. The list is shared by store recovery and MCP cancellation tests.
+    pub const FORGET_TRANSACTION: &'static [Self] = &[
+        Self::ManifestTempWritten,
+        Self::ManifestTempSynced,
+        Self::ManifestTempDirectorySynced,
+        Self::ManifestPublished,
+        Self::ManifestDirectorySynced,
+        Self::TombstoneNamespacePrepared,
+        Self::TombstoneTempWritten,
+        Self::TombstoneTempSynced,
+        Self::TombstoneTempDirectorySynced,
+        Self::MetadataTempWritten,
+        Self::MetadataTempSynced,
+        Self::MetadataTempDirectorySynced,
+        Self::IdempotencyNamespacePrepared,
+        Self::MutationResultTempWritten,
+        Self::MutationResultTempSynced,
+        Self::MutationResultTempDirectorySynced,
+        Self::MutationReceiptTempWritten,
+        Self::MutationReceiptTempSynced,
+        Self::MutationReceiptTempDirectorySynced,
+        Self::MutationAuditTempWritten,
+        Self::MutationAuditTempSynced,
+        Self::MutationAuditTempDirectorySynced,
+        Self::TombstonePublished,
+        Self::TombstoneDirectorySynced,
+        Self::RecordRenamedForForget,
+        Self::ForgetRecordDirectorySynced,
+        Self::ForgottenBodyErased,
+        Self::ForgottenBodySynced,
+        Self::MutationResultPublished,
+        Self::MutationResultDirectorySynced,
+        Self::MutationReceiptPublished,
+        Self::MutationReceiptDirectorySynced,
+        Self::MutationAuditPublished,
+        Self::MutationAuditDirectorySynced,
+        Self::MetadataRenamed,
+        Self::MetadataDirectorySynced,
+        Self::ManifestRemoved,
+        Self::ManifestRemovalDirectorySynced,
+    ];
+
     /// Exhaustive internal conformance list. Tests compare their exercised
     /// boundary set against this slice so new persistence steps cannot be
     /// introduced silently.

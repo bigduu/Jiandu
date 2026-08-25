@@ -4,7 +4,10 @@ use crate::failpoint::Failpoints;
 use crate::idempotency::IdempotencyTransaction;
 use crate::layout::{self, FileIdentity, StoreDirectory};
 use crate::{PersistenceBoundary, StoreError, StoreId, StoreMetadata};
-use jiandu_core::{Etag, MemoryId, MemoryScope, Revision};
+use jiandu_core::{
+    CorrelationId, Etag, MUTATION_CORRELATION_PREFIX, MemoryId, MemoryScope, MutationInvocation,
+    Revision,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -437,6 +440,37 @@ impl DurableQuarantineReceipt {
 
 pub(crate) fn new_transaction_id() -> String {
     Uuid::new_v4().hyphenated().to_string()
+}
+
+pub(crate) fn transaction_id_from_invocation(
+    invocation: &MutationInvocation,
+) -> Result<String, StoreError> {
+    let simple = invocation
+        .correlation_id()
+        .as_str()
+        .strip_prefix(MUTATION_CORRELATION_PREFIX)
+        .ok_or(StoreError::InvalidTransaction)?;
+    let uuid = Uuid::parse_str(simple).map_err(|_| StoreError::InvalidTransaction)?;
+    let transaction_id = uuid.hyphenated().to_string();
+    if valid_transaction_id(&transaction_id) {
+        Ok(transaction_id)
+    } else {
+        Err(StoreError::InvalidTransaction)
+    }
+}
+
+pub(crate) fn correlation_id_from_transaction_id(
+    transaction_id: &str,
+) -> Result<CorrelationId, StoreError> {
+    if !valid_transaction_id(transaction_id) {
+        return Err(StoreError::InvalidTransaction);
+    }
+    let uuid = Uuid::parse_str(transaction_id).map_err(|_| StoreError::InvalidTransaction)?;
+    let correlation_id =
+        CorrelationId::new(format!("{MUTATION_CORRELATION_PREFIX}{}", uuid.simple()))
+            .map_err(|_| StoreError::InvalidTransaction)?;
+    MutationInvocation::new(correlation_id.clone()).map_err(|_| StoreError::InvalidTransaction)?;
+    Ok(correlation_id)
 }
 
 pub(crate) fn valid_transaction_id(value: &str) -> bool {

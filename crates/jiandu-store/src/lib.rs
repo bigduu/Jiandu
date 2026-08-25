@@ -35,7 +35,7 @@ pub use inspection::{
 };
 pub use lock::{LockOwner, LockOwnerDiagnostics};
 pub use metadata::{AuditSequence, STORE_FORMAT_VERSION, StoreId, StoreMetadata};
-pub use mutation::{ForgetCommit, MutationCommit};
+pub use mutation::{ForgetCommit, FreshRecordMetadata, MutationCommit};
 pub use portable_import::{
     AuthorizedBackupMetadata, BACKUP_METADATA_FORMAT_VERSION, BackupMetadata,
     IMPORT_PLAN_FORMAT_VERSION, IMPORT_RESULT_FORMAT_VERSION, ImportClassification, ImportCommit,
@@ -43,9 +43,9 @@ pub use portable_import::{
     ImportScopeDecision, PortableImportResult, generated_import_schemas,
 };
 pub use store::{
-    AuthorizedAdmin, AuthorizedIndexQuery, AuthorizedMutation, AuthorizedRead, AuthorizedScope,
-    AuthorizedScopes, CanonicalIndexSnapshot, CanonicalStore, QuarantineReceipt, StoreOptions,
-    StoreRead, StoreWatermark,
+    AuthorizedAdmin, AuthorizedIndexQuery, AuthorizedMutation, AuthorizedMutationSet,
+    AuthorizedRead, AuthorizedScope, AuthorizedScopes, CanonicalIndexSnapshot, CanonicalStore,
+    QuarantineReceipt, StoreOptions, StoreRead, StoreWatermark,
 };
 pub use tombstone::{AdminAction, AdminActionPlan, AdminPlanTarget};
 
