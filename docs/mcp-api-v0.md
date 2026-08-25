@@ -6,10 +6,12 @@ This document defines the Jiandu `v1alpha1` public contract. Issue #7 ships the
 transport-independent read slice in `jiandu-mcp`: `memory_search`,
 `memory_get`, `memory_list`, and read-only resources. Issue #8 adds the
 independently authorized `memory_remember`, `memory_update`, and
-`memory_forget` tools over the same handler and production store backend. A
-daemon, HTTP, and two-client conformance remain later issues, so the complete
-document is still an implementation target rather than a stable compatibility
-promise.
+`memory_forget` tools over the same handler and production store backend. Issue
+#28 now serves that adapter from the production `jiandu` process over
+authenticated loopback Streamable HTTP. Broad two-client conformance,
+operational hardening, administrative commands, and stdio proxying remain
+later issues, so the complete document is still an implementation target
+rather than a stable compatibility promise.
 
 The handler supports exactly MCP revision `2025-11-25`. This is
 independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests
@@ -38,6 +40,37 @@ Before a tool is invoked, the MCP session establishes:
 ```
 
 Neither `principalId` nor `clientId` appears as a public tool argument. This prevents a model from impersonating another principal. A host may pass opaque Project and Session IDs only within the scopes authorized for that identity.
+
+### Loopback HTTP authentication
+
+`jiandu serve --config <local-config.json>` opens one already initialized
+canonical store and serves the fixed `/mcp` route. Startup configuration is a
+bounded regular local JSON file. It supplies an explicit loopback bind address,
+the operator-selected data directory, a cursor HMAC key, and one or more local
+client entries. Client entries contain only a fixed
+`sha256:<64 lowercase hex>` bearer digest plus trusted identity, grants,
+authorized scopes, creation actor, and mutation policy. Raw bearer credentials
+are not accepted through CLI arguments, environment variables, config fields,
+or MCP arguments. Operators must generate them with at least 256 bits of
+cryptographic entropy; satisfying the transport's minimum token length alone
+does not provide that entropy.
+
+The HTTP boundary requires exactly one `Authorization` value in the strict
+`Bearer <token>` form. It hashes the request token and compares every
+configured fixed-size digest in constant time. A failure returns HTTP 401 with
+the fixed `{"error":"unauthorized"}` body, `Cache-Control: no-store`, and no
+principal, grant, store, path, memory, lock-owner, or index detail. This occurs
+before constructing or dispatching an MCP handler. On success, the boundary
+removes `Authorization` before forwarding and selects a credential-specific
+session manager, preventing a session ID from being reused under another
+credential. Every selected handler receives trusted Rust context beside the
+unchanged public command schemas and shares one daemon-owned production
+backend.
+
+Only explicit IPv4 or IPv6 loopback binds are accepted. Wildcard, unspecified,
+and non-loopback addresses fail configuration validation before canonical
+store I/O. Remote bind, TLS, OAuth, multi-tenancy, redirects, and service
+discovery are not part of this revision.
 
 ### Connection capability configurations
 
@@ -431,6 +464,34 @@ Store health is the closed set `ready | degraded`; index health is
 from the host. This metadata never includes paths, counts, watermarks, internal
 reasons, credentials, bodies, or queries. It is supplied through the trusted
 host/backend seam and does not invoke operator-only index diagnostics.
+
+## HTTP health routes
+
+The daemon exposes `/live` separately from `/ready`. Both are fixed,
+path-free, count-free JSON probes and neither constructs an MCP handler.
+Liveness reports only `{"status":"alive"}` while the HTTP task is running.
+Readiness is published after exclusive store ownership, deterministic startup
+recovery and ledger validation, durability probing, index classification, and
+singleton backend construction. Its shape is:
+
+```json
+{
+  "status": "ready",
+  "health": {
+    "store": "ready",
+    "index": "missing",
+    "exactRead": true,
+    "list": true,
+    "search": false
+  }
+}
+```
+
+A ready canonical store returns HTTP 200 even when the disposable index is
+missing or degraded; exact get/list remain available and search is false. A
+degraded canonical store returns a closed `not_ready` state with HTTP 503.
+Neither route exposes the store/index reason, path, owner, watermark, record
+count, credential, identity, body, query, or private ledger state.
 
 ## Future event operations
 

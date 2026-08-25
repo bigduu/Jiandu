@@ -1,0 +1,34 @@
+[package]
+name = "jiandu-service"
+description = "Authenticated singleton loopback MCP daemon for Jiandu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "jiandu"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+jiandu-core = { path = "../jiandu-core" }
+jiandu-index = { path = "../jiandu-index" }
+jiandu-mcp = { path = "../jiandu-mcp" }
+jiandu-store = { path = "../jiandu-store" }
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["net", "signal", "sync"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
