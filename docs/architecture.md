@@ -150,28 +150,26 @@ Addressable resources use only opaque IDs or scope selectors, never queries or
 paths. Inaccessible and absent IDs are indistinguishable. Initialization
 metadata contains only closed ready/degraded/missing states and derived
 operation flags; it does not call admin diagnostics or expose reasons, counts,
-watermarks, or paths. Subscriptions, HTTP, daemon ownership, and prompt
-placement remain later boundaries. MCP protocol negotiation remains separate
-from the Jiandu API and store-format versions.
+watermarks, or paths. The `jiandu-service` crate now owns the separate HTTP,
+authentication, and daemon-lifecycle boundary described below; subscriptions
+and prompt placement remain later work. MCP protocol negotiation remains
+separate from the Jiandu API and store-format versions.
 
-### Administrative CLI
+### Service CLI
 
-The `jiandu` binary is both the service entry point and the operator interface. Planned commands include:
+The shipped binary surface is intentionally only:
 
 ```text
-jiandu serve
-jiandu status
-jiandu validate
-jiandu rebuild-index
-jiandu export
-jiandu import
-jiandu doctor
+jiandu serve --config <local-config.json>
 ```
 
-Administrative mutations use the same core commands as the MCP adapter and do
-not bypass validation or revision rules. Store validation/export are currently
-host/operator Rust APIs, not MCP tools; transport and CLI wiring are separate
-milestones.
+The argument is a bounded regular local JSON file, not inline JSON, standard
+input, a raw bearer token, or an environment-variable credential. The current
+command opens one already initialized store; it never falls back to
+`CanonicalStore::initialize`. `status`, validation, rebuild, import/export,
+doctor, and other administrative commands remain Issue #30. Administrative
+mutations will use the same core commands as the MCP adapter and will not
+bypass validation or revision rules.
 
 ### Read-only validation and portable export
 
@@ -263,7 +261,64 @@ Event ingestion is a later milestone. The initial service remains complete and u
 
 ### Local-first service
 
-The first supported topology is one long-running Jiandu daemon bound to loopback and serving MCP over Streamable HTTP. A host launches or discovers the daemon, authenticates, and connects as a client.
+The first supported topology is one long-running Jiandu daemon bound to an
+explicit loopback `SocketAddr` and serving MCP over rmcp Streamable HTTP at the
+fixed `/mcp` route. `jiandu serve` validates the complete trusted configuration
+and rejects wildcard, unspecified, or non-loopback addresses before opening
+the canonical data directory. It then opens and recovers one existing store,
+classifies the disposable index, constructs one shared
+`CanonicalReadBackend`, and only then publishes the listener. Every
+authenticated connection uses that backend and therefore the same exclusive
+store owner and writer lock.
+
+The local configuration contains only a fixed `sha256:<64 lowercase hex>`
+bearer digest, trusted principal/client/grants/scopes, creation actor, mutation
+policy, and a fixed `hmac-sha256:<64 lowercase hex>` cursor key. The raw bearer
+exists only in an HTTP request. Operators must provision bearer values with at
+least 256 bits of cryptographic entropy; the transport's minimum-length check
+is not an entropy estimator. The boundary requires exactly one well-formed
+`Authorization: Bearer` value, hashes it, compares fixed-size digests in
+constant time, removes the header before MCP dispatch, and selects a separate
+session manager for that credential. Missing, multiple, malformed, or invalid
+credentials receive the same cache-disabled fixed-body HTTP 401 before the MCP
+handler factory runs. Authentication state is trusted host context and is
+never merged into tool arguments.
+
+The unauthenticated `/live` and `/ready` probe routes expose fixed closed JSON
+only. Liveness means that the HTTP task is running. Readiness is published only
+after store ownership, recovery/ledger validation, durability probing, index
+classification, and backend construction. A missing or degraded disposable
+index keeps canonical exact-read/list readiness true while search is false; it
+does not terminate the process or expose a path, reason, count, or watermark.
+
+An abbreviated configuration shape is:
+
+```json
+{
+  "bind": "127.0.0.1:9817",
+  "dataDir": "/operator/selected/existing-store",
+  "cursorMacKey": "hmac-sha256:<64-lowercase-hex>",
+  "clients": [{
+    "bearerTokenDigest": "sha256:<64-lowercase-hex>",
+    "principalId": "prn_local_client",
+    "clientId": "cli_local_client",
+    "grants": ["memory:read", "memory:write:principal"],
+    "scopes": { "projectIds": [], "sessionIds": [], "instanceGlobal": false },
+    "creationActor": "host",
+    "mutationPolicy": {
+      "maxBodyBytes": 65536,
+      "allowedTypes": ["preference", "decision", "project", "fact", "feedback", "reference"],
+      "allowedScopes": ["principal"],
+      "secretContentPolicy": "allow_all"
+    }
+  }]
+}
+```
+
+`allow_all` is an explicit deployment choice meaning that the upstream trusted
+admission layer supplies no additional secret detector; core validation and
+the configured size/type/scope limits still apply. Jiandu is not a credential
+vault.
 
 A compatibility `stdio` command may proxy to that daemon. It must not open the canonical store as an independent writer. This preserves MCP client compatibility without creating one writer per agent process.
 
@@ -284,7 +339,7 @@ On startup, Jiandu:
    rejects malformed, missing, foreign, or resurrected identities;
 5. probes required file-sync and same-filesystem atomic-replace behavior and
    fails closed if the filesystem cannot provide it;
-6. validates index compatibility and schedules a rebuild if needed;
+6. validates index compatibility into the closed ready/degraded/missing state;
 7. starts the authenticated MCP transport;
 8. reports readiness only after the store is safe to serve.
 
@@ -323,8 +378,10 @@ capability gate last. The explicit v3-to-v4 migration similarly recovers and
 validates the v3 store before syncing import-ledger layout and publishing v4
 metadata last, so older writers fail closed.
 
-Shutdown stops accepting new mutations, drains bounded in-flight work, and
-releases the store lock. No fallible post-commit receipt callback exists:
+The current service cancellation path stops accepting transport work, cancels
+active MCP sessions, waits for the HTTP task to stop, and then releases the
+store lock. A bounded graceful-drain policy is deliberately deferred to Issue
+#29. No fallible post-commit receipt callback exists:
 receipt/result/audit durability is inside the same transaction that precedes a
 success response. Crash recovery relies on strict write-ahead manifests,
 same-filesystem temporary files, file and directory sync boundaries, atomic
@@ -356,9 +413,9 @@ restart recovery.
 
 ## Observability
 
-Jiandu emits structured, secret-safe logs and metrics for request latency,
-error codes, mutation conflicts, idempotent replays, store revisions, index
-health, rebuild progress, and recovery activity. For a fresh MCP mutation, a
+Issue #28 exposes only the closed liveness/readiness probes and secret-safe
+startup errors. The complete structured logging, metric, and bounded shutdown
+contract is deferred to Issue #29. For a fresh MCP mutation, a
 domain-separated UUIDv4 correlation maps reversibly to the transaction ID
 already bound by the strict WAL/result/receipt/audit codecs. Correlation is
 excluded from the request fingerprint. An exact replay returns that original

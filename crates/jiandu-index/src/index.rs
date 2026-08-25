@@ -56,6 +56,15 @@ pub enum IndexHealth {
     Degraded { reason: IndexDegradedReason },
 }
 
+/// Closed startup readiness for trusted hosts. Unlike [`IndexDiagnostic`],
+/// this never exposes counts, watermarks, paths, or a degradation reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexReadiness {
+    Ready,
+    Degraded,
+    Missing,
+}
+
 /// Path-free administrative diagnostic result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexDiagnostic {
@@ -137,29 +146,44 @@ impl LexicalIndex {
         reader: &R,
         _authorization: &AuthorizedIndexAdmin,
     ) -> Result<IndexDiagnostic, IndexError> {
+        Ok(IndexDiagnostic {
+            health: self.inspect_health(reader),
+            rebuild_supported: true,
+        })
+    }
+
+    /// Inspect only enough state to seed a daemon's closed readiness snapshot.
+    /// Canonical reads remain available when the disposable index is missing
+    /// or degraded.
+    #[must_use]
+    pub fn readiness<R: CanonicalRecordReader>(&self, reader: &R) -> IndexReadiness {
+        match self.inspect_health(reader) {
+            IndexHealth::Ready(_) => IndexReadiness::Ready,
+            IndexHealth::Degraded {
+                reason: IndexDegradedReason::Missing,
+            } => IndexReadiness::Missing,
+            IndexHealth::Degraded { .. } => IndexReadiness::Degraded,
+        }
+    }
+
+    fn inspect_health<R: CanonicalRecordReader>(&self, reader: &R) -> IndexHealth {
         let current = match reader.current_store_watermark() {
             Ok(current) => current,
             Err(_) => {
-                return Ok(IndexDiagnostic {
-                    health: IndexHealth::Degraded {
-                        reason: IndexDegradedReason::SourceUnavailable,
-                    },
-                    rebuild_supported: true,
-                });
+                return IndexHealth::Degraded {
+                    reason: IndexDegradedReason::SourceUnavailable,
+                };
             }
         };
         let directory = match IndexDirectory::open(&self.directory) {
             Ok(directory) => directory,
             Err(error) => {
-                return Ok(IndexDiagnostic {
-                    health: IndexHealth::Degraded {
-                        reason: directory_degraded_reason(error),
-                    },
-                    rebuild_supported: true,
-                });
+                return IndexHealth::Degraded {
+                    reason: directory_degraded_reason(error),
+                };
             }
         };
-        let health = match load_and_validate_all(&directory) {
+        match load_and_validate_all(&directory) {
             Ok((metadata, _))
                 if metadata.source_store_id == current.0
                     && metadata.source_store_revision == current.1 =>
@@ -170,11 +194,7 @@ impl LexicalIndex {
                 reason: IndexDegradedReason::Stale,
             },
             Err(reason) => IndexHealth::Degraded { reason },
-        };
-        Ok(IndexDiagnostic {
-            health,
-            rebuild_supported: true,
-        })
+        }
     }
 
     /// Search only the exact scopes in a fresh unforgeable store capability.

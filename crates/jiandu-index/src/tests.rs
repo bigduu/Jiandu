@@ -441,6 +441,7 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
             reason: IndexDegradedReason::Missing
         }
     );
+    assert_eq!(index.readiness(&reader), crate::IndexReadiness::Missing);
     index.rebuild(&reader, &admin).expect("first rebuild");
     let first = fs::read(&path).expect("first index bytes");
     assert_eq!(
@@ -457,6 +458,7 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
             .health,
         IndexHealth::Ready(_)
     ));
+    assert_eq!(index.readiness(&reader), crate::IndexReadiness::Ready);
     let restarted = LexicalIndex::new(&index_directory);
     assert!(matches!(
         restarted
@@ -480,6 +482,7 @@ fn rebuild_is_byte_deterministic_and_missing_corrupt_incompatible_stale_are_degr
             reason: IndexDegradedReason::Corrupt
         }
     );
+    assert_eq!(index.readiness(&reader), crate::IndexReadiness::Degraded);
     index
         .rebuild(&reader, &admin)
         .expect("rebuild altered schema");

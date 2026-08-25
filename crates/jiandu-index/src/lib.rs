@@ -23,7 +23,9 @@ pub use format::{
     BODY_WEIGHT, SCOPE_WEIGHT, STATUS_WEIGHT, SUMMARY_WEIGHT, TAG_WEIGHT, TITLE_WEIGHT,
     TYPE_WEIGHT, UPDATE_METADATA_WEIGHT,
 };
-pub use index::{IndexDiagnostic, IndexHealth, IndexRebuildReport, IndexWatermark, LexicalIndex};
+pub use index::{
+    IndexDiagnostic, IndexHealth, IndexReadiness, IndexRebuildReport, IndexWatermark, LexicalIndex,
+};
 pub use tokenizer::tokenize;
 
 /// Current derived lexical-index format. It evolves independently from the

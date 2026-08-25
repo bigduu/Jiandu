@@ -37,5 +37,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run store, lexical index, and MCP adapter tests
-        run: cargo test -p jiandu-store -p jiandu-index -p jiandu-mcp --all-features --locked
+      - name: Run store, lexical index, MCP adapter, and service tests
+        run: cargo test -p jiandu-store -p jiandu-index -p jiandu-mcp -p jiandu-service --all-features --locked
