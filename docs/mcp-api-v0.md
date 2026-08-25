@@ -2,9 +2,15 @@
 
 ## Status and versioning
 
-This document defines the proposed Jiandu `v1alpha1` public contract. It is an implementation target, not a compatibility promise. Tool names and schemas become stable only after conformance tests exercise at least two independent clients.
+This document defines the Jiandu `v1alpha1` public contract. Issue #7 ships the
+transport-independent read slice in `jiandu-mcp`: `memory_search`,
+`memory_get`, `memory_list`, and read-only resources. Mutation tools, a daemon,
+HTTP, and two-client conformance remain later issues, so the complete document
+is still an implementation target rather than a stable compatibility promise.
 
-The Jiandu API version is independent from the MCP protocol revision negotiated by the client and server. The service advertises both.
+The read handler supports exactly MCP revision `2025-11-25`. This is
+independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests
+prevent the values from being conflated.
 
 ## Contract principles
 
@@ -106,8 +112,8 @@ Input:
 
 Output contains memory summaries, deterministic pagination metadata, and query diagnostics that disclose no inaccessible record.
 
-Issue #6 implements the retrieval engine and host-facing Rust APIs, not this
-MCP transport adapter. An adapter must first ask `jiandu-store` to mint an
+Issue #6 implements the retrieval engine and host-facing Rust APIs. Issue #7
+adds the read-only MCP adapter. The adapter first asks `jiandu-store` to mint an
 `AuthorizedIndexQuery` for the exact request selectors; passing an arbitrary
 vector of scopes to the index is not supported. Search validates the complete
 private derived image but only authorized scope intersections can become hits.
@@ -136,6 +142,14 @@ Input:
 List memories using structured filters without a free-text relevance query. This is intended for deterministic browsing, synchronization, export selection, and testing.
 
 Input supports one or more authorized scopes, record type, status, tags, update watermark, limit, cursor, and a stable sort order.
+
+For all three read tools, the checked `jiandu-core` request schema is the MCP
+`inputSchema` without an adapter-owned identity wrapper. The handler strictly
+decodes and runs the core validator before calling its backend. Every success
+uses `ResultEnvelope` as authoritative `structuredContent`; every routed
+domain/input failure uses `ErrorEnvelope`. The accompanying text is only a
+short body/query/ID-free summary. Mixed authorized and inaccessible selector
+sets fail as a whole instead of silently returning a narrower page.
 
 ### `memory_remember`
 
@@ -307,11 +321,51 @@ Jiandu may expose addressable, authorized records as resources:
 
 ```text
 jiandu://memory/<memory-id>
+jiandu://scope/principal/memories
 jiandu://scope/project/<project-id>/memories
 jiandu://scope/session/<session-id>/memories
+jiandu://scope/instance_global/memories
 ```
 
-Resource reads follow the same authorization and revision rules as tools. Sensitive free-text searches are not encoded in resource URIs. Resource subscriptions are deferred until their consistency and privacy behavior is specified.
+The exact-ID and project/session shapes are resource templates. The principal
+scope list is also advertised as the one concrete scope resource guaranteed by
+every authenticated read capability; other selectors remain readable only
+when current authority permits them. Scope resources return the first
+deterministic `id_asc` page with limit 100, including an opaque next cursor in
+the normal result envelope when more records exist. Clients continue paging
+through `memory_list`; resource URIs never carry a cursor or free-text query.
+
+Resource reads use the same authority and watermark rules as tools. Malformed,
+absent, and inaccessible exact resources share one generic resource-not-found
+response. The handler implements neither subscriptions nor list-change
+notifications in this revision. Resource results use the `2025-11-25` wire
+shape and therefore do not emit later `resultType`, `cacheScope`, or `ttlMs`
+fields.
+
+## Read-handler initialization metadata
+
+The official `rmcp` `ServerHandler` exposes only tools, resources, and this
+safe authenticated snapshot under `capabilities.experimental.jiandu`:
+
+```json
+{
+  "apiVersion": "jiandu.dev/v1alpha1",
+  "health": {
+    "store": "ready",
+    "index": "ready",
+    "exactRead": true,
+    "list": true,
+    "search": true
+  },
+  "optionalCapabilities": ["resources"]
+}
+```
+
+Store health is the closed set `ready | degraded`; index health is
+`ready | degraded | missing`. Operation flags are derived rather than accepted
+from the host. This metadata never includes paths, counts, watermarks, internal
+reasons, credentials, bodies, or queries. It is supplied through the trusted
+host/backend seam and does not invoke operator-only index diagnostics.
 
 ## Future event operations
 

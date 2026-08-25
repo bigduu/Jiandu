@@ -13,7 +13,7 @@ env:
 
 jobs:
   workspace:
-    name: core, canonical store, and lexical index
+    name: core, store, lexical index, and MCP adapter
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,12 +30,12 @@ jobs:
       - name: Run tests and schema drift checks
         run: cargo test --workspace --all-features --locked
 
-  store-index-windows-runtime:
-    name: canonical store and lexical index Windows runtime
+  store-index-mcp-windows-runtime:
+    name: store, lexical index, and MCP adapter Windows runtime
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run canonical store and lexical index tests
-        run: cargo test -p jiandu-store -p jiandu-index --all-features --locked
+      - name: Run store, lexical index, and MCP adapter tests
+        run: cargo test -p jiandu-store -p jiandu-index -p jiandu-mcp --all-features --locked

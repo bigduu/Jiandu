@@ -333,3 +333,18 @@ query, credential, upload destination, schedule, or retention policy. See
 ## Derived data
 
 Lexical indexes, embeddings, caches, ranking statistics, previews, and materialized lineage views are derived. Every derived format declares the store revision and index version from which it was built. `jiandu rebuild-index` can discard and recreate it without losing canonical records or policy state.
+
+## MCP read projection
+
+`jiandu-mcp` projects these same records and summaries without adding an
+adapter-specific domain model. Tool inputs are the checked core get/list/search
+request schemas. The trusted principal/client context and `memory:read` grant
+are captured beside requests in a non-serializable connection capability;
+neither identity nor canonical/index paths become public fields.
+
+Exact resources use opaque `mem_` identity. Scope-list resources use only the
+closed principal/project/session/instance-global selectors and return the first
+bounded deterministic page. Search queries never become resource identity.
+Resource/tool results preserve canonical record metadata and the authoritative
+store revision in a `v1alpha1` envelope; concise MCP text is not a second data
+projection or prompt-placement policy.

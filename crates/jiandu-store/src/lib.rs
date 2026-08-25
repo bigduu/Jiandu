@@ -43,9 +43,9 @@ pub use portable_import::{
     ImportScopeDecision, PortableImportResult, generated_import_schemas,
 };
 pub use store::{
-    AuthorizedAdmin, AuthorizedIndexQuery, AuthorizedMutation, AuthorizedScope, AuthorizedScopes,
-    CanonicalIndexSnapshot, CanonicalStore, QuarantineReceipt, StoreOptions, StoreRead,
-    StoreWatermark,
+    AuthorizedAdmin, AuthorizedIndexQuery, AuthorizedMutation, AuthorizedRead, AuthorizedScope,
+    AuthorizedScopes, CanonicalIndexSnapshot, CanonicalStore, QuarantineReceipt, StoreOptions,
+    StoreRead, StoreWatermark,
 };
 pub use tombstone::{AdminAction, AdminActionPlan, AdminPlanTarget};
 

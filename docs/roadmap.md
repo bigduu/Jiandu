@@ -62,12 +62,12 @@ Outcome: search is useful and rebuildable without making derived data authoritat
 
 Tracking issues:
 
-- [#7 — structured MCP read operations and resources](https://github.com/bigduu/Jiandu/issues/7)
+- [#7 — structured MCP read operations and resources](https://github.com/bigduu/Jiandu/issues/7) — implemented as a transport-independent handler
 - [#8 — authorized MCP mutation operations](https://github.com/bigduu/Jiandu/issues/8)
 - [#9 — singleton Streamable HTTP daemon and local authentication](https://github.com/bigduu/Jiandu/issues/9)
 - [#10 — two-client conformance and degradation coverage](https://github.com/bigduu/Jiandu/issues/10)
 
-- Expose structured read tools and resources.
+- Expose structured read tools and resources (done).
 - Add mutation tools with independent capability grants.
 - Run a singleton Streamable HTTP daemon with local authentication.
 - Add readiness, diagnostics, graceful shutdown, metrics, and secret-safe logs.
