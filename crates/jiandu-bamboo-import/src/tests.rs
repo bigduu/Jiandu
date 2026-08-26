@@ -102,6 +102,62 @@ fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
     output
 }
 
+fn tree_content_digest(root: &Path) -> String {
+    fn visit(root: &Path, relative: &Path, hasher: &mut Sha256) {
+        use std::io::Read as _;
+        use std::time::UNIX_EPOCH;
+
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).expect("digest tree metadata");
+        let file_type = metadata.file_type();
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(if file_type.is_dir() {
+            b"directory".as_slice()
+        } else if file_type.is_file() {
+            b"file".as_slice()
+        } else if file_type.is_symlink() {
+            b"symlink".as_slice()
+        } else {
+            b"special".as_slice()
+        });
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update([u8::from(metadata.permissions().readonly())]);
+        hasher.update(link_count(&metadata).to_le_bytes());
+        let modified = metadata
+            .modified()
+            .expect("digest tree modified time")
+            .duration_since(UNIX_EPOCH)
+            .expect("post-epoch modified time");
+        hasher.update(modified.as_secs().to_le_bytes());
+        hasher.update(modified.subsec_nanos().to_le_bytes());
+        if file_type.is_file() {
+            let mut file = fs::File::open(&path).expect("digest tree file");
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).expect("digest tree bytes");
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else if file_type.is_dir() {
+            let mut names = fs::read_dir(&path)
+                .expect("digest tree directory")
+                .map(|entry| entry.expect("digest tree entry").file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                visit(root, &relative.join(name), hasher);
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    visit(root, Path::new(""), &mut hasher);
+    hex_digest(&hasher.finalize())
+}
+
 #[cfg(unix)]
 fn link_count(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
@@ -697,6 +753,45 @@ fn source_inventory_binds_directories_and_bounds_total_entries_and_depth_without
     assert!(!diagnostic.contains("private-depth"));
     assert!(!diagnostic.contains(deep_snapshot.path().to_string_lossy().as_ref()));
     assert_eq!(tree_snapshot(deep_snapshot.path()), deep_before);
+    assert_eq!(tree_snapshot(target.path()), target_before);
+    assert_eq!(store.watermark().expect("pristine watermark").0, 0);
+}
+
+#[test]
+fn cumulative_source_byte_budget_preflights_each_file_without_overreading_or_writes() {
+    let snapshot = copied_fixture();
+    let source = snapshot.path().join("source");
+    let large_file_bytes = MAX_SOURCE_BYTES / 2 + 1024 * 1024;
+    for name in [
+        "000_PRIVATE_CUMULATIVE_BUDGET_A",
+        "001_PRIVATE_CUMULATIVE_BUDGET_B",
+    ] {
+        fs::File::create(source.join(name))
+            .expect("create sparse cumulative-budget witness")
+            .set_len(u64::try_from(large_file_bytes).expect("large fixture length"))
+            .expect("size sparse cumulative-budget witness");
+    }
+    let source_before = tree_content_digest(snapshot.path());
+    let (target, store) = initialize_store();
+    let target_before = tree_snapshot(target.path());
+    let (authority, context) = operator();
+    let observed_before = test_observed_content_bytes_read();
+
+    let error = plan_bamboo_snapshot(snapshot.path(), &store, &authority, &context)
+        .expect_err("two individually bounded files exceed the cumulative source budget");
+    assert_eq!(error, BambooImportError::InvalidSnapshot);
+    let observed = test_observed_content_bytes_read()
+        .checked_sub(observed_before)
+        .expect("monotonic per-thread read observation");
+    assert!(observed >= large_file_bytes, "the first file was scanned");
+    assert!(
+        observed <= MAX_SOURCE_BYTES && observed < large_file_bytes.saturating_mul(2),
+        "the second file must be rejected from metadata before content read: {observed}"
+    );
+    let diagnostic = format!("{error:?} {error}");
+    assert!(!diagnostic.contains("PRIVATE_CUMULATIVE_BUDGET"));
+    assert!(!diagnostic.contains(snapshot.path().to_string_lossy().as_ref()));
+    assert_eq!(tree_content_digest(snapshot.path()), source_before);
     assert_eq!(tree_snapshot(target.path()), target_before);
     assert_eq!(store.watermark().expect("pristine watermark").0, 0);
 }

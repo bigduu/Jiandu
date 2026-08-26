@@ -11,6 +11,16 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(test)]
+std::thread_local! {
+    static OBSERVED_CONTENT_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_observed_content_bytes_read() -> usize {
+    OBSERVED_CONTENT_BYTES_READ.get()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScannedEntry {
     pub(crate) relative_path: String,
@@ -228,7 +238,18 @@ fn scan_directory(
                 budget,
             )?;
         } else if metadata.is_file() {
-            let bytes = read_regular_in(directory, name, MAX_SOURCE_BYTES)?;
+            if IdentityMetadataExt::nlink(&metadata) != 1 {
+                return Err(BambooImportError::UnsafeSnapshot);
+            }
+            let remaining_bytes = MAX_SOURCE_BYTES
+                .checked_sub(budget.total_bytes)
+                .ok_or(BambooImportError::InvalidSnapshot)?;
+            if metadata.len()
+                > u64::try_from(remaining_bytes).map_err(|_| BambooImportError::InvalidSnapshot)?
+            {
+                return Err(BambooImportError::InvalidSnapshot);
+            }
+            let bytes = read_regular_in(directory, name, remaining_bytes)?;
             budget.total_bytes = budget
                 .total_bytes
                 .checked_add(bytes.len())
@@ -298,12 +319,11 @@ fn read_regular_in(
     let before = directory
         .symlink_metadata(name)
         .map_err(|_| BambooImportError::UnsafeSnapshot)?;
-    if before.is_symlink()
-        || !before.is_file()
-        || IdentityMetadataExt::nlink(&before) != 1
-        || before.len() > maximum as u64
-    {
+    if before.is_symlink() || !before.is_file() || IdentityMetadataExt::nlink(&before) != 1 {
         return Err(BambooImportError::UnsafeSnapshot);
+    }
+    if before.len() > u64::try_from(maximum).map_err(|_| BambooImportError::InvalidSnapshot)? {
+        return Err(BambooImportError::InvalidSnapshot);
     }
     let before_identity = FileIdentity::from_metadata(&before);
     let mut options = OpenOptions::new();
@@ -326,6 +346,10 @@ fn read_regular_in(
         .take((maximum as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| BambooImportError::UnsafeSnapshot)?;
+    #[cfg(test)]
+    OBSERVED_CONTENT_BYTES_READ.with(|observed| {
+        observed.set(observed.get().saturating_add(bytes.len()));
+    });
     if bytes.len() > maximum {
         return Err(BambooImportError::InvalidSnapshot);
     }

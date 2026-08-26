@@ -61,6 +61,9 @@ or quarantined. It:
 - accepts only single-link regular files and ordinary directories;
 - bounds traversal to 1,000 total directory entries (files and directories),
   at most 1,000 regular source artifacts, 16 directory levels, and 64 MiB;
+- derives the remaining cumulative byte budget before each file safety
+  recheck, open, and bounded read, so multiple individually valid files cannot
+  be retained beyond the 64 MiB aggregate;
 - requires the scanned directory set to equal the parent directories implied by
   the frozen file manifest, so an extra empty directory is source drift;
 - captures and rechecks root, directory, filename, and opened-file identity;
@@ -239,10 +242,10 @@ Behavior tests cover byte-identical repeated 48-artifact planning, exact four
 record mapping, source and destination zero-write planning, ignored ambient
 `BAMBOO_DATA_DIR` tripwires, source byte/symlink/hardlink drift, exact directory
 inventory, global entry and recursion-depth bounds, changed mapping bytes,
-unrelated nonempty and incompatible targets, target conflict and tombstone
-overlays, strict plan tampering, authoritative validation/export, safe
-diagnostics, explicit post-commit evidence failure, and exact-key receipt
-recovery.
+cumulative multi-file byte preflight, unrelated nonempty and incompatible
+targets, target conflict and tombstone overlays, strict plan tampering,
+authoritative validation/export, safe diagnostics, explicit post-commit
+evidence failure, and exact-key receipt recovery.
 
 The acceptance slice ends at the deterministic offline import boundary. Shadow
 reads, Bamboo runtime adapters, proactive prompt injection, dual-write,
