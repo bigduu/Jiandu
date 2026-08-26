@@ -1,0 +1,28 @@
+[package]
+name = "jiandu-bamboo-import"
+description = "Read-only deterministic Bamboo filesystem-memory migration adapter for Jiandu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
+jiandu-core = { path = "../jiandu-core" }
+jiandu-store = { path = "../jiandu-store" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+time.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

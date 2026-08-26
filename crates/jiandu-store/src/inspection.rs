@@ -2477,6 +2477,47 @@ struct UnsignedPortableExport<'a> {
 }
 
 impl PortableExportBundle {
+    /// Build a strict, deterministic portable projection from records that
+    /// have already passed canonical document round-trip validation.
+    ///
+    /// This is a zero-I/O seam for trusted migration adapters. The supplied
+    /// `source_store_id` identifies the canonical projection, not the adapter's
+    /// physical source. Adapters must bind their independent source evidence
+    /// outside this bundle and must not represent a foreign filesystem as a
+    /// Jiandu store.
+    pub fn from_canonical_records(
+        source_store_id: StoreId,
+        snapshot: SnapshotWatermark,
+        records: Vec<jiandu_core::MemoryRecord>,
+    ) -> Result<Self, StoreError> {
+        let mut records = records
+            .into_iter()
+            .map(PortableMemoryRecord::from)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| scope_key(&left.scope).cmp(&scope_key(&right.scope)))
+        });
+        let mut scopes = BTreeMap::<String, MemoryScope>::new();
+        for record in &records {
+            scopes.insert(scope_key(&record.scope), record.scope.clone());
+        }
+        let mut bundle = Self {
+            format_version: PORTABLE_EXPORT_FORMAT_VERSION.to_owned(),
+            source_store_format: crate::STORE_FORMAT_VERSION.to_owned(),
+            source_store_id,
+            snapshot,
+            scopes: scopes.into_values().collect(),
+            records,
+            tombstones: Vec::new(),
+            digest: ExportDigest(String::new()),
+        };
+        bundle.digest = bundle.expected_digest()?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
     fn expected_digest(&self) -> Result<ExportDigest, StoreError> {
         let payload = serde_json::to_vec(&UnsignedPortableExport {
             format_version: &self.format_version,

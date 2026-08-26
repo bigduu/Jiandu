@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a deterministic disposable Unicode/CJK lexical index, an authenticated MCP read/mutation handler, and a singleton loopback Streamable HTTP daemon with bounded response drain. Remaining service work is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a reviewed offline Bamboo snapshot adapter, a deterministic disposable Unicode/CJK lexical index, an authenticated MCP read/mutation handler, and a singleton loopback Streamable HTTP daemon with bounded response drain. Remaining service work is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -71,6 +71,7 @@ MCP does not force a client to inject context. Jiandu returns memory records; th
 - [Historical forget/tombstone store format v1alpha3](docs/store-format-v1alpha3.md)
 - [Historical create/update store format v1alpha2](docs/store-format-v1alpha2.md)
 - [Bamboo integration and migration](docs/integrations/bamboo.md)
+- [Reviewed Bamboo snapshot import v1alpha1](docs/bamboo-snapshot-import-v1alpha1.md)
 - [Delivery roadmap](docs/roadmap.md)
 
 ## Rust layout
@@ -92,6 +93,8 @@ crates/jiandu-store/                 exclusive ownership, reads, atomic CAS, and
   schemas/inspection/v1alpha1/       generated strict report/export JSON Schemas
   schemas/import/v1alpha1/           generated strict import/backup JSON Schemas
   src/                               private paths, strict codecs, lock, inspection, import, tombstones, logical-erasure witnesses, transactions, and recovery
+crates/jiandu-bamboo-import/         read-only Bamboo snapshot planning and reviewed portable import
+  src/                               strict report/plan/evidence contracts, capability scan, mapping, commit, and recovery acknowledgement
 crates/jiandu-index/                 deterministic, derived Unicode/CJK lexical retrieval
   fixtures/v1alpha1/                 tokenizer and logical index-format conformance fixtures
   src/                               strict format, SQLite rebuild, HMAC cursor, ranking, diagnostics
@@ -109,7 +112,9 @@ depends on the three existing domain/store/index crates
 but owns no transport listener or canonical data. `jiandu-index` depends narrowly on `jiandu-store` and
 `jiandu-core`; canonical storage never depends on the index. `jiandu-core` has
 no storage, transport, Bamboo, prompt, LLM, or filesystem-path identity
-dependency. The current canonical on-disk compatibility rules are documented in
+dependency. `jiandu-bamboo-import` is a leaf adapter over core/store canonical
+APIs; neither crate depends on Bamboo contracts or the adapter. The current
+canonical on-disk compatibility rules are documented in
 [Canonical store format v1alpha4](docs/store-format-v1alpha4.md); the
 [v1alpha3 document](docs/store-format-v1alpha3.md) preserves the historical
 forget/tombstone contract, the [v1alpha2 document](docs/store-format-v1alpha2.md)

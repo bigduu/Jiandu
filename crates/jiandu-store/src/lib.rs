@@ -22,6 +22,7 @@ mod store;
 mod tombstone;
 mod transaction;
 
+pub use document::canonical_record_from_document_parts;
 pub use durability::{DirectoryDurability, StoreDoctorReport};
 pub use error::{InvalidRecordReason, StoreError, StoreErrorCode};
 pub use failpoint::{PersistenceBoundary, PersistenceFailpointInjector};
