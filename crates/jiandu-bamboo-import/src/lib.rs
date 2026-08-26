@@ -469,6 +469,7 @@ fn map_candidates(
             .or_default() += 1;
     }
     let mut mapped = Vec::new();
+    let mut mapping_failures = BTreeMap::<String, BambooMappingDisposition>::new();
     let mut rows = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let result = if id_counts.get(candidate.frontmatter.id.as_str()).copied() != Some(1) {
@@ -478,13 +479,67 @@ fn map_candidates(
         };
         match result {
             Ok(value) => mapped.push(value),
-            Err(disposition) => rows.push(MappingRow {
-                case_id: candidate.case_id.clone(),
+            Err(disposition) => {
+                mapping_failures.insert(candidate.frontmatter.id.clone(), disposition);
+                rows.push(MappingRow {
+                    case_id: candidate.case_id.clone(),
+                    disposition,
+                    memory_id: None,
+                    scope: None,
+                    actor_evidence: Some(actor_evidence(&candidate.frontmatter)),
+                });
+            }
+        }
+    }
+
+    // `contradicted_by` reverses onto the contradicting record. If either end
+    // cannot be projected, importing the other end without that documented
+    // relation would be lossy. Propagate the dependency disposition until the
+    // remaining relation graph is closed instead of aborting the full 48-row
+    // report. An invalid/missing target dominates an unresolved identity.
+    loop {
+        let mapped_ids = mapped
+            .iter()
+            .map(|candidate| candidate.record.id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut dependent_failures = Vec::new();
+        for (index, candidate) in mapped.iter().enumerate() {
+            let mut disposition = None;
+            for target in &candidate.source.relations.contradicted_by {
+                if mapped_ids.contains(target) {
+                    continue;
+                }
+                let target_disposition = mapping_failures
+                    .get(target)
+                    .copied()
+                    .unwrap_or(BambooMappingDisposition::InvalidMapping);
+                disposition = Some(
+                    if disposition == Some(BambooMappingDisposition::InvalidMapping)
+                        || target_disposition == BambooMappingDisposition::InvalidMapping
+                    {
+                        BambooMappingDisposition::InvalidMapping
+                    } else {
+                        BambooMappingDisposition::UnresolvedIdentity
+                    },
+                );
+            }
+            if let Some(disposition) = disposition {
+                dependent_failures.push((index, disposition));
+            }
+        }
+        if dependent_failures.is_empty() {
+            break;
+        }
+        for (index, disposition) in dependent_failures.into_iter().rev() {
+            let candidate = mapped.remove(index);
+            mapping_failures.insert(candidate.record.id.as_str().to_owned(), disposition);
+            rows.push(MappingRow {
+                case_id: candidate.case_id,
                 disposition,
                 memory_id: None,
                 scope: None,
-                actor_evidence: Some(actor_evidence(&candidate.frontmatter)),
-            }),
+                actor_evidence: Some(candidate.actor_evidence),
+            });
         }
     }
 

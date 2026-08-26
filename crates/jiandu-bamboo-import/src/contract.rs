@@ -121,8 +121,10 @@ pub struct BambooSnapshotEvidence {
     pub projection_snapshot: SnapshotWatermark,
 }
 
-/// Full authorized migration report. Relative logical source names and actor
-/// evidence occur only here, never in errors or rollback evidence.
+/// Full authorized migration report. Raw standalone relative-path fields and
+/// actor evidence occur only here; imported records and authorized exports may
+/// retain the documented logical source URI. Neither form appears in normal
+/// errors or rollback evidence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BambooMigrationReport {

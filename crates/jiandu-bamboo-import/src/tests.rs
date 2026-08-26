@@ -216,12 +216,12 @@ fn forget_principal_record(
         .expect("forget target record");
 }
 
-fn rewrite_identity_without_projects(snapshot: &Path) {
+fn rewrite_identity(snapshot: &Path, edit: impl FnOnce(&mut HostIdentityMap)) {
     let identity_path = snapshot.join("expected/host-identity-map.json");
     let identity_bytes = fs::read(&identity_path).expect("identity map bytes");
     let mut identity: HostIdentityMap =
         serde_json::from_slice(&identity_bytes).expect("identity map");
-    identity.projects.clear();
+    edit(&mut identity);
     let mut identity_bytes = serde_json::to_vec_pretty(&identity).expect("canonical identity map");
     identity_bytes.push(b'\n');
     fs::write(&identity_path, &identity_bytes).expect("write test identity map");
@@ -708,7 +708,7 @@ fn mapping_bytes_are_bound_and_only_unresolved_eligible_records_block_commit() {
     let (authority, context) = operator();
     let complete = plan_bamboo_snapshot(snapshot.path(), &store, &authority, &context)
         .expect("complete baseline plan");
-    rewrite_identity_without_projects(snapshot.path());
+    rewrite_identity(snapshot.path(), |identity| identity.projects.clear());
     let target_before_drift = tree_snapshot(target.path());
     assert_eq!(
         commit_bamboo_snapshot(
@@ -764,6 +764,63 @@ fn mapping_bytes_are_bound_and_only_unresolved_eligible_records_block_commit() {
         )
         .expect_err("unresolved eligible identity is noncommittable"),
         BambooImportError::UnresolvedEligibleIdentity
+    );
+    assert_eq!(tree_snapshot(target.path()), target_before);
+    assert_eq!(store.watermark().expect("watermark").0, 0);
+
+    let relation_snapshot = copied_fixture();
+    rewrite_identity(relation_snapshot.path(), |identity| {
+        identity.principal_slots.clear();
+    });
+    let relation_source_before = tree_snapshot(relation_snapshot.path());
+    let target_before = tree_snapshot(target.path());
+    let relation_incomplete =
+        plan_bamboo_snapshot(relation_snapshot.path(), &store, &authority, &context)
+            .expect("unresolved relation dependency still produces a full report");
+    assert_eq!(relation_incomplete.report.cases.len(), 48);
+    assert_eq!(relation_incomplete.plan.eligible_record_count, 4);
+    assert_eq!(relation_incomplete.plan.mapped_record_count, 1);
+    assert_eq!(relation_incomplete.report.destination_counts.accepted, 1);
+    assert_eq!(
+        relation_incomplete
+            .report
+            .cases
+            .iter()
+            .filter(|case| {
+                case.mapping_disposition == BambooMappingDisposition::UnresolvedIdentity
+            })
+            .count(),
+        3
+    );
+    assert_eq!(
+        relation_incomplete
+            .report
+            .cases
+            .iter()
+            .find(|case| case.case_id == "durable-project-current")
+            .expect("relation-dependent report row")
+            .mapping_disposition,
+        BambooMappingDisposition::UnresolvedIdentity
+    );
+    assert!(!relation_incomplete.plan.eligible_mappings_complete);
+    assert!(!relation_incomplete.plan.committable);
+    assert_eq!(
+        commit_bamboo_snapshot(
+            relation_snapshot.path(),
+            &mut store,
+            &authority,
+            &context,
+            &relation_incomplete
+                .plan_bytes()
+                .expect("relation-incomplete plan bytes"),
+            &IdempotencyKey::new("unresolved-relation-dependency").expect("key"),
+        )
+        .expect_err("unresolved relation dependency cannot commit"),
+        BambooImportError::UnresolvedEligibleIdentity
+    );
+    assert_eq!(
+        tree_snapshot(relation_snapshot.path()),
+        relation_source_before
     );
     assert_eq!(tree_snapshot(target.path()), target_before);
     assert_eq!(store.watermark().expect("watermark").0, 0);

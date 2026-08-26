@@ -23,10 +23,13 @@ The adapter has two host-facing functions:
   an idempotency key, regenerates all source-derived artifacts, and delegates
   the only durable mutation to `CanonicalStore::import_portable`.
 
-Planning and commit require fresh authority for every projected Principal and
-Project scope, the corresponding `memory:import:*` grants, and the independent
-`memory:admin:validate_store` and `memory:admin:export_all` grants. The adapter
-does not infer Principal, Project, or Session identity from a path.
+Planning requires the independent `memory:admin:validate_store` and
+`memory:admin:export_all` grants. It evaluates fresh import authority for every
+projected Principal and Project scope; a missing corresponding
+`memory:import:*` grant becomes an `unauthorized`, noncommittable destination
+classification rather than preventing the report. Commit requires all of
+those projected scopes to remain freshly authorized. The adapter does not
+infer Principal, Project, or Session identity from a path.
 
 The API accepts only the explicit snapshot root supplied by the operator. It
 does not read `BAMBOO_DATA_DIR`, discover a Bamboo installation, acquire a
@@ -140,7 +143,9 @@ timestamps, provenance, confidence, and relations. In particular:
   `sources[]` values remain authorized report evidence;
 - the logical `bamboo-memory://snapshot-v1/...` source URI and exact source
   digest retain source-file provenance without making a path authoritative;
-- `contradicted_by` is reversed onto the contradicting Jiandu record; and
+- `contradicted_by` is reversed onto the contradicting Jiandu record; if that
+  endpoint cannot be mapped, the dependent mapping also becomes
+  noncommittable instead of silently dropping the relation; and
 - revision `1` and the exact canonical ETag are produced by Jiandu's ordinary
   canonical document round trip, not copied from Bamboo.
 
