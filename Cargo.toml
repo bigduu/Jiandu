@@ -19,6 +19,7 @@ repository = "https://github.com/bigduu/Jiandu"
 axum = { version = "0.8.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.23.1"
 hmac = "0.13.0"
+http-body = "1.0.1"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "serialize"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["macros", "server"] }
 schemars = { version = "1.2.2", features = ["preserve_order"] }

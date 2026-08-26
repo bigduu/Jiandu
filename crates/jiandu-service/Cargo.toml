@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+http-body.workspace = true
 jiandu-core = { path = "../jiandu-core" }
 jiandu-index = { path = "../jiandu-index" }
 jiandu-mcp = { path = "../jiandu-mcp" }

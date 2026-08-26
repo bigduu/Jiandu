@@ -6,9 +6,10 @@
 mod auth;
 mod config;
 mod daemon;
+mod lifecycle;
 
 pub use config::{ConfigError, ServeConfig};
-pub use daemon::{DaemonError, RunningDaemon};
+pub use daemon::{DaemonError, RunningDaemon, ShutdownOutcome};
 
 pub const MCP_ROUTE: &str = "/mcp";
 pub const LIVENESS_ROUTE: &str = "/live";

@@ -2,7 +2,7 @@
 
 use crate::{
     IndexReadHealth, MutationPolicy, MutationPolicyContext, MutationPolicyError,
-    MutationPolicyRequest, ReadServiceHealth, StoreReadHealth,
+    MutationPolicyRequest, ReadHealthSnapshot, ReadServiceHealth, StoreReadHealth,
 };
 use jiandu_core::{
     CreationActor, ForgetMemoryCommand, ForgetMemoryResult, MemoryGetRequest, MemoryId,
@@ -193,7 +193,7 @@ pub struct CanonicalReadBackend {
     store: Arc<RwLock<CanonicalStore>>,
     index: LexicalIndex,
     cursor_key: CursorMacKey,
-    health: RwLock<ReadServiceHealth>,
+    health: ReadHealthSnapshot,
 }
 
 impl fmt::Debug for CanonicalReadBackend {
@@ -219,18 +219,23 @@ impl CanonicalReadBackend {
             store,
             index,
             cursor_key,
-            health: RwLock::new(health),
+            health: ReadHealthSnapshot::new(health),
         }
+    }
+
+    /// Return an observer that shares only the closed health value and cannot
+    /// retain the canonical store owner.
+    #[must_use]
+    pub fn health_snapshot(&self) -> ReadHealthSnapshot {
+        self.health.clone()
     }
 
     /// Replace only the pre-sanitized readiness snapshot exposed during MCP
     /// initialization. This does not inspect or mutate canonical/index data.
     pub fn update_health(&self, health: ReadServiceHealth) -> Result<(), ReadBackendError> {
-        *self
-            .health
-            .write()
-            .map_err(|_| ReadBackendError::HostUnavailable)? = health;
-        Ok(())
+        self.health
+            .replace(health)
+            .map_err(|()| ReadBackendError::HostUnavailable)
     }
 
     fn read_store(
@@ -346,10 +351,7 @@ impl McpReadBackend for CanonicalReadBackend {
     }
 
     fn health(&self) -> ReadServiceHealth {
-        self.health.read().map_or_else(
-            |_| ReadServiceHealth::new(StoreReadHealth::Degraded, IndexReadHealth::Degraded),
-            |health| health.clone(),
-        )
+        self.health.current()
     }
 }
 
@@ -543,6 +545,7 @@ const fn policy_store_error(error: MutationPolicyError) -> StoreError {
     match error {
         MutationPolicyError::InvalidRequest => StoreError::InvalidRequest,
         MutationPolicyError::Forbidden => StoreError::Forbidden,
+        MutationPolicyError::Unavailable => StoreError::InvalidTransaction,
     }
 }
 

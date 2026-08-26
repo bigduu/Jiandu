@@ -43,6 +43,30 @@ The same isolated harness now also runs a separate black-box resilience slice:
 
 Every destructive fixture action is guarded by an exact fixed-file assertion
 beneath a nested `TempDir` store, and every daemon binds `127.0.0.1:0`. The
-matrix closes sessions explicitly before lifecycle transitions. Arbitrary
-active-session admission/drain bounds remain #29; Bamboo behavior, remote
-transport, load testing, and semantic-quality evaluation remain out of scope.
+resilience matrix closes sessions explicitly before lifecycle transitions.
+Bamboo behavior, remote transport, load testing, and semantic-quality
+evaluation remain out of scope.
+
+## Bounded shutdown contract (#29)
+
+The service library adds a deterministic in-process lifecycle matrix around
+the same real rmcp transport and canonical store:
+
+| Boundary | Evidence |
+| --- | --- |
+| Admission linearization | A paused authenticated initialize owns the atomic HTTP permit; synchronous drain closes the gate, preserves invalid-token 401 precedence, and returns one fixed redacted 503 to a later valid request. |
+| Concurrent normal drain | Independent rmcp sessions enter a canonical mutation and exact list; shutdown waits for both finite response bodies, returns `Drained`, and releases the store at the committed watermark. |
+| Normal final-frame flush | A deterministic pause occurs after `PermitBody` produces its terminal frame but before Hyper can finish the response. Shutdown does not cancel connection I/O or report `Drained` until release lets the client receive the complete body. |
+| Whole-grace deadline | A deterministic post-idle cleanup delay exceeds the configured response grace; outcome is `ForcedAfterTimeout`, sessions close, and the delay cannot be misreported as `Drained`. |
+| Incomplete authenticated upload | A raw HTTP/1.1 peer sends valid authorization and headers but only part of its declared JSON body. Forced timeout cancels the accepted socket, releases its HTTP permit, writes nothing, and reopens the singleton store while the peer object is still alive. |
+| Readiness ownership | A cloned sanitized health observer remains live after shutdown while the singleton store is reopened immediately, proving readiness cannot retain the canonical backend or writer lock. |
+| Runtime-worker saturation | With one Tokio worker, a mutation holds the canonical writer while an exact read waits behind it on the blocking pool. The async deadline still reaches forced state before an independent OS-thread fail-safe releases the writer. |
+| Forced before WAL | Policy pauses after normal admission but before the final lifecycle check. Timeout removes HTTP/session work, the final check writes no WAL/artifact/watermark, and restart sees revision zero. |
+| Forced after WAL | A mutation pauses at the metadata-rename durability boundary. Timeout removes transport acknowledgement while a competing owner still sees `StoreLocked`; after release, the detached supervisor quiesces the worker and immediate restart recovers one exact replay. |
+| Cancelled shutdown waiter | Dropping the caller's shutdown future cannot drop the already-spawned supervisor; the singleton lock is eventually released. |
+
+All blocking pause fixtures have bounded waits plus idempotent release-on-drop
+guards, so an assertion failure cannot strand CI. These tests do not claim that
+Tokio can kill a synchronous fsync/rename worker. The configured deadline
+bounds response/session grace; explicit shutdown returns only after any entered
+canonical lease has ended and the store owner has been dropped.

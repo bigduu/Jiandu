@@ -1078,6 +1078,7 @@ name = "jiandu-service"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "http-body",
  "jiandu-core",
  "jiandu-index",
  "jiandu-mcp",

@@ -152,9 +152,10 @@ successful mutation response body before restarting and replaying its durable
 key; deletes and corrupts only an isolated disposable index before rebuilding
 byte-identical index bytes and identical public results; and proves a
 contending daemon cannot alter the owned store. Complete service absence
-produces a transport failure rather than a fabricated memory envelope. This
-matrix does not define the bounded active-session drain policy reserved for
-Issue #29.
+produces a transport failure rather than a fabricated memory envelope. The
+bounded shutdown matrix additionally linearizes HTTP/session and backend-worker
+admission, exercises concurrent read/mutation drain, and proves pre-WAL and
+post-WAL forced outcomes against immediate restart.
 
 Addressable resources use only opaque IDs or scope selectors, never queries or
 paths. Inaccessible and absent IDs are indistinguishable. Initialization
@@ -302,14 +303,19 @@ classification, and backend construction. A missing or degraded disposable
 index keeps canonical exact-read/list readiness true while search is false; it
 does not terminate the process or expose a path, reason, count, or watermark.
 
-An abbreviated configuration shape is:
+The strict `jiandu.service.config/v0.2` document adds one required
+`shutdown.drainTimeoutMs` response-grace value in the inclusive range
+`10..=60000`. The still-supported strict v0.1 shape rejects that field and uses
+the documented 5,000 ms default; it is not silently decoded as v0.2. An
+abbreviated current configuration shape is:
 
 ```json
 {
-  "configVersion": "jiandu.service.config/v0.1",
+  "configVersion": "jiandu.service.config/v0.2",
   "bind": "127.0.0.1:9817",
   "dataDir": "/operator/selected/existing-store",
   "cursorMacKey": "hmac-sha256:<64-lowercase-hex>",
+  "shutdown": { "drainTimeoutMs": 5000 },
   "clients": [{
     "bearerTokenDigest": "sha256:<64-lowercase-hex>",
     "principalId": "prn_local_client",
@@ -330,7 +336,7 @@ service derives `memory:read`, the exact `memory:write:*` and
 profile. Write and forget therefore remain independent without a second
 operator-visible grant or policy source.
 
-The v0.1 service defaults admit all six current memory types up to the core
+Both configuration versions admit all six current memory types up to the core
 65,536-byte body bound. Its closed secret-content policy is the existing
 `AllowAllSecretContent`, meaning that the upstream trusted admission layer
 supplies no additional secret detector; it is not a configurable daemon knob.
@@ -396,16 +402,75 @@ capability gate last. The explicit v3-to-v4 migration similarly recovers and
 validates the v3 store before syncing import-ledger layout and publishing v4
 metadata last, so older writers fail closed.
 
-The current service cancellation path stops accepting transport work, cancels
-active MCP sessions, waits for the HTTP task to stop, and then releases the
-store lock. A bounded graceful-drain policy is deliberately deferred to Issue
-#29. No fallible post-commit receipt callback exists:
-receipt/result/audit durability is inside the same transaction that precedes a
-success response. Crash recovery relies on strict write-ahead manifests,
-same-filesystem temporary files, file and directory sync boundaries, atomic
-replacement, and startup reconciliation. Any failure after write-ahead begins
-poisons the current handle so stale in-memory metadata cannot be served before
-restart recovery.
+Shutdown first closes one mutex-linearized admission gate shared by
+authenticated `/mcp` requests and backend workers. Authentication retains its
+precedence: invalid credentials still receive the fixed 401, while an
+authenticated request that loses the admission race receives only the fixed,
+cache-disabled `{"error":"service_unavailable"}` HTTP 503. Existing readiness
+reports the real closed store/index health from a separately allocated,
+sanitized shared snapshot and expresses lifecycle drain through HTTP 503 plus
+`status: "not_ready"`; it never fabricates store degradation. The snapshot
+contains no backend/store/index owner, so an accepted readiness connection
+cannot prolong the writer lock.
+
+One absolute deadline, captured synchronously with that admission transition,
+covers finite MCP response delivery, backend/HTTP idle, tracked-session close,
+and the Axum graceful join. Long-lived GET/SSE receive streams are protected
+through session resolution and are then closed by the tracked session manager;
+finite POST/DELETE responses retain their HTTP permit through body delivery.
+If every admitted operation and transport completes by the deadline,
+`shutdown` returns `Drained`. Otherwise the gate becomes forced, remaining
+response/session/listener work is cancelled, Axum is aborted, and the result is
+`ForcedAfterTimeout`. Because Axum owns accepted Hyper connection tasks, each
+accepted TCP stream is wrapped in cancellation-aware `AsyncRead`/`AsyncWrite`;
+the forced token therefore interrupts an authenticated peer that has sent only
+part of a declared request body instead of waiting for that peer forever.
+The accepted-socket token is distinct from rmcp session/response cancellation:
+normal drain never cancels connection I/O. Axum graceful join therefore flushes
+any final body frame already pulled from `PermitBody` before the host can report
+`Drained`; only timeout activates the hard socket cutoff.
+
+`drainTimeoutMs` is therefore a transport/session **response grace**, not a
+promise that Rust can safely kill a filesystem worker. A `spawn_blocking`
+mutation that already entered canonical code owns its lifecycle permit itself;
+dropping the MCP future cannot release it. Forced shutdown waits without a
+second deadline for those canonical leases to quiesce, takes a second exact
+session-manager snapshot, and only then drops the singleton backend/store lock.
+A late commit is never acknowledged on the cancelled transport and is observed
+only by retrying the identical idempotency key after restart. Before WAL, the
+local bounded admission closure rechecks the forced phase after configured
+policy and fails with the closed unavailable result without writing.
+
+HTTP and canonical-backend lease counts are distinct. Normal drain requires
+both to reach zero. After the forced socket cutoff, the supervisor first waits
+for canonical-backend leases, so queued or running store work cannot lose its
+owner early, and then proves every cancelled HTTP lease ended without waiting
+for peer cooperation. Router/connection state retains only the owner-free
+health snapshot; session handlers retain the weak backend facade.
+On normal drain, zero
+admitted HTTP/backend permits proves no session-create/insert critical section
+can race the close snapshot. On forced drain, Axum is stopped before the first
+snapshot and the post-worker second snapshot catches any already-spawned Hyper
+connection that inserted late; the closed gate makes such state externally
+unreachable in either case. Explicit `shutdown` and a supervisor already
+spawned on a live Tokio runtime retain this cleanup even if the caller drops its
+wait future. Plain `Drop` outside a runtime is best-effort only and is not the
+operator shutdown contract.
+
+Every canonical get/list/search/resource/revision call is dispatched through
+Tokio's blocking pool before it can wait on the synchronous store `RwLock`.
+This preserves the synchronous canonical transaction/read implementation while
+keeping runtime workers available to poll the absolute shutdown deadline,
+session cancellation, and supervisor notifications even on a one-worker
+runtime under writer/read contention.
+
+No fallible post-commit receipt callback exists: receipt/result/audit
+durability is inside the same transaction that precedes a success response.
+Crash recovery relies on strict write-ahead manifests, same-filesystem
+temporary files, file and directory sync boundaries, atomic replacement, and
+startup reconciliation. Any failure after write-ahead begins poisons the
+current handle so stale in-memory metadata cannot be served before restart
+recovery.
 
 ## Security model
 
@@ -432,8 +497,9 @@ restart recovery.
 ## Observability
 
 Issue #28 exposes only the closed liveness/readiness probes and secret-safe
-startup errors. The complete structured logging, metric, and bounded shutdown
-contract is deferred to Issue #29. For a fresh MCP mutation, a
+startup errors, while Issue #29 adds the lifecycle result and bounded response
+drain above. Structured logging, metrics, and richer diagnostics remain Issue
+#35 rather than being implied by shutdown. For a fresh MCP mutation, a
 domain-separated UUIDv4 correlation maps reversibly to the transaction ID
 already bound by the strict WAL/result/receipt/audit codecs. Correlation is
 excluded from the request fingerprint. An exact replay returns that original
