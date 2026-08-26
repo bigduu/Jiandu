@@ -149,16 +149,22 @@ impl JianduReadServer {
         let correlation_id = next_correlation_id();
         let request = match decode_validated_request::<MemorySearchRequest>(parameters.0) {
             Ok(request) => request,
-            Err(()) => return self.invalid_request(correlation_id),
+            Err(()) => return self.invalid_request(correlation_id).await,
         };
-        match self.backend.search(&self.authorization, &request) {
+        let backend = Arc::clone(&self.backend);
+        let authorization = self.authorization.clone();
+        match blocking_backend_call(backend, move |backend| {
+            backend.search(&authorization, &request)
+        })
+        .await
+        {
             Ok((store_revision, result)) => success_result(
                 correlation_id,
                 store_revision,
                 result,
                 "Returned authorized memory search results.",
             ),
-            Err(error) => self.backend_error(correlation_id, error),
+            Err(error) => self.backend_error(correlation_id, error).await,
         }
     }
 
@@ -179,16 +185,22 @@ impl JianduReadServer {
         let correlation_id = next_correlation_id();
         let request = match decode_request::<MemoryGetRequest>(parameters.0) {
             Ok(request) => request,
-            Err(()) => return self.invalid_request(correlation_id),
+            Err(()) => return self.invalid_request(correlation_id).await,
         };
-        match self.backend.get(&self.authorization, &request) {
+        let backend = Arc::clone(&self.backend);
+        let authorization = self.authorization.clone();
+        match blocking_backend_call(backend, move |backend| {
+            backend.get(&authorization, &request)
+        })
+        .await
+        {
             Ok(read) => success_result(
                 correlation_id,
                 read.store_revision,
                 read.result,
                 "Returned one authorized memory.",
             ),
-            Err(error) => self.backend_error(correlation_id, error),
+            Err(error) => self.backend_error(correlation_id, error).await,
         }
     }
 
@@ -209,16 +221,22 @@ impl JianduReadServer {
         let correlation_id = next_correlation_id();
         let request = match decode_validated_request::<MemoryListRequest>(parameters.0) {
             Ok(request) => request,
-            Err(()) => return self.invalid_request(correlation_id),
+            Err(()) => return self.invalid_request(correlation_id).await,
         };
-        match self.backend.list(&self.authorization, &request) {
+        let backend = Arc::clone(&self.backend);
+        let authorization = self.authorization.clone();
+        match blocking_backend_call(backend, move |backend| {
+            backend.list(&authorization, &request)
+        })
+        .await
+        {
             Ok(read) => success_result(
                 correlation_id,
                 read.store_revision,
                 read.result,
                 "Returned authorized memory list results.",
             ),
-            Err(error) => self.backend_error(correlation_id, error),
+            Err(error) => self.backend_error(correlation_id, error).await,
         }
     }
 
@@ -406,8 +424,8 @@ impl JianduReadServer {
         }
     }
 
-    fn invalid_request(&self, correlation_id: CorrelationId) -> CallToolResult {
-        let revision = self.backend.store_revision().unwrap_or(StoreRevision(0));
+    async fn invalid_request(&self, correlation_id: CorrelationId) -> CallToolResult {
+        let revision = self.current_store_revision().await;
         error_result(
             correlation_id,
             revision,
@@ -429,13 +447,21 @@ impl JianduReadServer {
         )
     }
 
-    fn backend_error(
+    async fn backend_error(
         &self,
         correlation_id: CorrelationId,
         error: ReadBackendError,
     ) -> CallToolResult {
-        let revision = self.backend.store_revision().unwrap_or(StoreRevision(0));
+        let revision = self.current_store_revision().await;
         error_result(correlation_id, revision, public_error(&error))
+    }
+
+    async fn current_store_revision(&self) -> StoreRevision {
+        blocking_backend_call(Arc::clone(&self.backend), |backend| {
+            backend.store_revision()
+        })
+        .await
+        .unwrap_or(StoreRevision(0))
     }
 
     fn mutation_error(
@@ -528,21 +554,39 @@ impl ServerHandler for JianduReadServer {
         let parsed = resource::parse(&uri).map_err(|()| resource_not_found())?;
         match parsed {
             ResourceRequest::Get(request) => {
-                let read = self
-                    .backend
-                    .get(&self.authorization, &request)
-                    .map_err(resource_backend_error)?;
+                let backend = Arc::clone(&self.backend);
+                let authorization = self.authorization.clone();
+                let read = blocking_backend_call(backend, move |backend| {
+                    backend.get(&authorization, &request)
+                })
+                .await
+                .map_err(resource_backend_error)?;
                 resource_result(uri, correlation_id, read.store_revision, read.result)
             }
             ResourceRequest::List(request) => {
-                let read = self
-                    .backend
-                    .list(&self.authorization, &request)
-                    .map_err(resource_backend_error)?;
+                let backend = Arc::clone(&self.backend);
+                let authorization = self.authorization.clone();
+                let read = blocking_backend_call(backend, move |backend| {
+                    backend.list(&authorization, &request)
+                })
+                .await
+                .map_err(resource_backend_error)?;
                 resource_result(uri, correlation_id, read.store_revision, read.result)
             }
         }
     }
+}
+
+async fn blocking_backend_call<T>(
+    backend: Arc<dyn McpReadBackend>,
+    operation: impl FnOnce(&dyn McpReadBackend) -> Result<T, ReadBackendError> + Send + 'static,
+) -> Result<T, ReadBackendError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(backend.as_ref()))
+        .await
+        .unwrap_or(Err(ReadBackendError::HostUnavailable))
 }
 
 fn decode_request<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, ()> {
@@ -690,6 +734,10 @@ fn public_error(error: &ReadBackendError) -> DomainError {
         ReadBackendError::Policy(MutationPolicyError::Forbidden) => DomainError::new(
             DomainErrorCode::Forbidden,
             "The memory operation is not authorized.",
+        ),
+        ReadBackendError::Policy(MutationPolicyError::Unavailable) => DomainError::new(
+            DomainErrorCode::StoreUnavailable,
+            "Canonical memory storage is unavailable.",
         ),
         ReadBackendError::UnstableSearchSnapshot => DomainError::new(
             DomainErrorCode::IndexDegraded,

@@ -16,9 +16,13 @@ use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_CLIENTS: usize = 64;
+const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 5_000;
+const MIN_DRAIN_TIMEOUT_MS: u64 = 10;
+const MAX_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const TOKEN_DIGEST_PREFIX: &str = "sha256:";
 const CURSOR_KEY_PREFIX: &str = "hmac-sha256:";
 const SERVICE_MEMORY_TYPES: [MemoryType; 6] = [
@@ -87,12 +91,6 @@ impl<'de> Deserialize<'de> for CursorKeyMaterial {
             .map(Self)
             .ok_or_else(|| D::Error::custom("invalid cursor key"))
     }
-}
-
-#[derive(Clone, Copy, Deserialize)]
-enum ConfigVersion {
-    #[serde(rename = "jiandu.service.config/v0.1")]
-    V0_1,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -172,13 +170,41 @@ struct ClientDocument {
 }
 
 #[derive(Deserialize)]
+#[serde(tag = "configVersion", deny_unknown_fields)]
+enum ServeConfigDocument {
+    #[serde(rename = "jiandu.service.config/v0.1")]
+    V0_1 {
+        bind: SocketAddr,
+        #[serde(rename = "dataDir")]
+        data_dir: PathBuf,
+        #[serde(rename = "cursorMacKey")]
+        cursor_mac_key: CursorKeyMaterial,
+        clients: Vec<ClientDocument>,
+    },
+    #[serde(rename = "jiandu.service.config/v0.2")]
+    V0_2 {
+        bind: SocketAddr,
+        #[serde(rename = "dataDir")]
+        data_dir: PathBuf,
+        #[serde(rename = "cursorMacKey")]
+        cursor_mac_key: CursorKeyMaterial,
+        shutdown: ShutdownDocument,
+        clients: Vec<ClientDocument>,
+    },
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ServeConfigDocument {
-    config_version: ConfigVersion,
+struct ShutdownDocument {
+    drain_timeout_ms: u64,
+}
+
+struct CommonConfigDocument {
     bind: SocketAddr,
     data_dir: PathBuf,
     cursor_mac_key: CursorKeyMaterial,
     clients: Vec<ClientDocument>,
+    drain_timeout: Duration,
 }
 
 pub(crate) struct ValidatedClient {
@@ -208,6 +234,7 @@ pub struct ServeConfig {
     pub(crate) data_dir: PathBuf,
     pub(crate) cursor_mac_key: CursorMacKey,
     pub(crate) clients: Vec<ValidatedClient>,
+    pub(crate) drain_timeout: Duration,
 }
 
 impl fmt::Debug for ServeConfig {
@@ -218,6 +245,7 @@ impl fmt::Debug for ServeConfig {
             .field("data_dir", &"[REDACTED]")
             .field("cursor_mac_key", &"[REDACTED]")
             .field("client_count", &self.clients.len())
+            .field("drain_timeout", &self.drain_timeout)
             .finish()
     }
 }
@@ -251,14 +279,47 @@ impl ServeConfig {
     }
 
     fn validate(document: ServeConfigDocument) -> Result<Self, ConfigError> {
-        let ServeConfigDocument {
-            config_version,
+        let common = match document {
+            ServeConfigDocument::V0_1 {
+                bind,
+                data_dir,
+                cursor_mac_key,
+                clients,
+            } => CommonConfigDocument {
+                bind,
+                data_dir,
+                cursor_mac_key,
+                clients,
+                drain_timeout: Duration::from_millis(DEFAULT_DRAIN_TIMEOUT_MS),
+            },
+            ServeConfigDocument::V0_2 {
+                bind,
+                data_dir,
+                cursor_mac_key,
+                shutdown,
+                clients,
+            } => {
+                if !(MIN_DRAIN_TIMEOUT_MS..=MAX_DRAIN_TIMEOUT_MS)
+                    .contains(&shutdown.drain_timeout_ms)
+                {
+                    return Err(ConfigError::invalid());
+                }
+                CommonConfigDocument {
+                    bind,
+                    data_dir,
+                    cursor_mac_key,
+                    clients,
+                    drain_timeout: Duration::from_millis(shutdown.drain_timeout_ms),
+                }
+            }
+        };
+        let CommonConfigDocument {
             bind,
             data_dir,
             cursor_mac_key,
             clients: client_documents,
-        } = document;
-        let ConfigVersion::V0_1 = config_version;
+            drain_timeout,
+        } = common;
         if !bind.ip().is_loopback()
             || data_dir.as_os_str().is_empty()
             || client_documents.is_empty()
@@ -349,6 +410,7 @@ impl ServeConfig {
             data_dir,
             cursor_mac_key: cursor_mac_key.into_key(),
             clients,
+            drain_timeout,
         })
     }
 }

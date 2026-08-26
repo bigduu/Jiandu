@@ -1,6 +1,8 @@
 //! Secret-safe adapter health exposed during MCP initialization.
 
 use serde::Serialize;
+use std::fmt;
+use std::sync::{Arc, RwLock};
 
 /// Closed canonical-store readiness reported to an authenticated connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -78,5 +80,46 @@ impl ReadServiceHealth {
     #[must_use]
     pub const fn search_available(&self) -> bool {
         self.search
+    }
+}
+
+/// Cloneable observer for the sanitized readiness state. It owns only the
+/// closed health value, never the canonical backend, store, index, path, or
+/// credentials, so a long-lived host readiness handler cannot prolong the
+/// singleton writer lock.
+#[derive(Clone)]
+pub struct ReadHealthSnapshot {
+    inner: Arc<RwLock<ReadServiceHealth>>,
+}
+
+impl ReadHealthSnapshot {
+    pub(crate) fn new(health: ReadServiceHealth) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(health)),
+        }
+    }
+
+    /// Return the latest closed health value. Poisoning is reported only as the
+    /// same path-free degraded state already used by the MCP health boundary.
+    #[must_use]
+    pub fn current(&self) -> ReadServiceHealth {
+        self.inner.read().map_or_else(
+            |_| ReadServiceHealth::new(StoreReadHealth::Degraded, IndexReadHealth::Degraded),
+            |health| health.clone(),
+        )
+    }
+
+    pub(crate) fn replace(&self, health: ReadServiceHealth) -> Result<(), ()> {
+        *self.inner.write().map_err(|_| ())? = health;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ReadHealthSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadHealthSnapshot")
+            .field("health", &"[REDACTED]")
+            .finish()
     }
 }

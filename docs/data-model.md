@@ -252,6 +252,42 @@ specified in [the `v1alpha4` document](store-format-v1alpha4.md).
 Derived index maintenance remains asynchronous and non-authoritative in its own
 milestone.
 
+## Daemon shutdown and canonical ownership
+
+Bounded shutdown changes no canonical record, receipt, transaction, audit, or
+store-format codec. It adds a process-local lifecycle lease around the existing
+store API. Authenticated HTTP/session dispatch and each backend operation acquire
+that lease from one mutex-linearized gate; shutdown closes the gate before it
+waits. A blocking mutation owns its worker lease inside `spawn_blocking`, so an
+MCP future or response body cannot release the lease while canonical code still
+holds the writer guard.
+
+The gate accounts for HTTP and canonical-backend leases separately. Normal
+drain waits for both. Forced transport cancellation interrupts every accepted
+socket, including an incomplete request upload, then quiesces backend leases
+before confirming that every cancelled HTTP lease ended. Router, connection,
+and session objects hold the weak facade, so an uncooperative transport cannot
+retain the store owner; shutdown still cannot drop that owner until every
+blocking read or mutation worker has returned. Canonical reads are dispatched
+to the blocking pool so a contended synchronous store lock cannot starve the
+async shutdown timer.
+
+The public readiness route shares only a sanitized health-value cell with the
+backend. That cell is updated with the same closed health states but owns no
+canonical store/index object. Normal session cancellation is also separate
+from the force-only accepted-socket token: producing the last body frame ends
+its HTTP lease, while Axum graceful join remains responsible for flushing that
+frame before `Drained` can be observed.
+
+The configured absolute deadline is response/session grace only. Before WAL,
+the existing fresh-mutation admission closure performs the final forced-state
+check after configured policy and can return unavailable without writing. Once
+WAL has begun, the transaction retains the same old-or-complete recovery and
+receipt semantics described above. Forced transport cleanup may discard that
+attempt's response, but daemon shutdown waits for the canonical lease before
+dropping store ownership; retrying the same principal/operation/key/input after
+restart is the sole authority for discovering a late commit.
+
 ## External edits
 
 Human readability is not a promise that arbitrary editor writes are safe. The supported paths are MCP and the administrative CLI.

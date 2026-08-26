@@ -14,7 +14,9 @@ pub use backend::{
     CanonicalReadBackend, McpMutationBackend, McpReadBackend, MutationBackendCommit,
     MutationBackendError, ReadBackendError,
 };
-pub use health::{IndexReadHealth, OptionalCapability, ReadServiceHealth, StoreReadHealth};
+pub use health::{
+    IndexReadHealth, OptionalCapability, ReadHealthSnapshot, ReadServiceHealth, StoreReadHealth,
+};
 pub use policy::{
     AllowAllSecretContent, ConfiguredMutationPolicy, MutationPolicy, MutationPolicyContext,
     MutationPolicyError, MutationPolicyRequest, MutationScopeKind, SecretContentPolicy,

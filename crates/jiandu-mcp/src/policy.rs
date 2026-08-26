@@ -42,6 +42,9 @@ impl MutationScopeKind {
 pub enum MutationPolicyError {
     InvalidRequest,
     Forbidden,
+    /// The host lifecycle closed fresh persistence admission. This remains a
+    /// generic store-unavailable outcome on the public MCP wire.
+    Unavailable,
 }
 
 /// Trusted identity and durable-attempt correlation passed to policy without

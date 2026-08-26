@@ -14,9 +14,10 @@ below. Issue #10 now proves the ordinary public contract with official rmcp and
 an independent raw HTTP driver. Issue #34 extends that matrix across concurrent
 conflicts, acknowledgement loss, restart replay, index loss/corruption and
 rebuild, writer contention, and complete service absence; see the
-[compatibility matrix](mcp-conformance-matrix-v0.md). Bounded shutdown,
-administrative commands, and stdio proxying remain later issues, so this is not
-yet a stable compatibility promise.
+[compatibility matrix](mcp-conformance-matrix-v0.md). Issue #29 adds bounded
+session/response shutdown without changing any MCP tool, resource, envelope, or
+store-format contract. Administrative commands and stdio proxying remain later
+issues, so this is not yet a stable compatibility promise.
 
 The handler supports exactly MCP revision `2025-11-25`. This is
 independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests
@@ -71,6 +72,12 @@ raw credentials, and the unreleased #28 `grants`/`mutationPolicy` fields fail
 the whole document with generic redacted diagnostics. The pre-v0.1 shape is
 not retained as a second schema.
 
+The strict `jiandu.service.config/v0.2` document retains those exact fields and
+requires `"shutdown":{"drainTimeoutMs":N}`, where `N` is an integer from 10
+through 60,000 milliseconds. Strict v0.1 remains accepted with a documented
+5,000 ms response grace and rejects the v0.2 field; v0.2 never defaults or
+silently accepts v0.1 omissions.
+
 The HTTP boundary requires exactly one `Authorization` value in the strict
 `Bearer <token>` form. It hashes the request token and compares every
 configured fixed-size digest in constant time. A failure returns HTTP 401 with
@@ -82,6 +89,50 @@ session manager, preventing a session ID from being reused under another
 credential. Every selected handler receives trusted Rust context beside the
 unchanged public command schemas and shares one daemon-owned production
 backend.
+
+### Bounded shutdown and authentication precedence
+
+Shutdown closes new admission synchronously. The bearer boundary still runs
+first: malformed, missing, or invalid credentials always receive the same fixed
+401 even during drain. A correctly authenticated request that did not acquire
+the atomic HTTP permit receives HTTP 503, `Cache-Control: no-store`, and exactly
+`{"error":"service_unavailable"}`. No JSON-RPC error, identity, scope, memory,
+path, credential, store/index reason, count, or watermark is synthesized.
+
+The configured duration is one absolute response-grace deadline for already
+admitted finite MCP responses, backend/HTTP idle, tracked session closure, and
+listener shutdown. The daemon returns `Drained` only if that whole sequence
+finishes in time. On expiry it stops response delivery, closes tracked sessions,
+force-cancels the I/O wrapper around every accepted socket, aborts remaining
+listener work, and classifies the result as `ForcedAfterTimeout`. Socket-level
+cancellation covers a valid authenticated request that is still uploading or
+decoding its body and does not depend on the peer closing first. Readiness
+changes to HTTP 503/`not_ready` but preserves the backend's actual closed
+store/index health fields through a separately allocated sanitized snapshot
+that cannot retain the canonical backend or writer lock.
+
+Normal session cleanup and forced connection cutoff use distinct tokens. Once
+the last finite body frame is produced, the normal path closes tracked sessions
+and asks Axum to stop accepting while leaving connection I/O writable; the
+Axum graceful join must flush the produced frame before `Drained` is returned.
+Only expiry cancels the per-socket I/O token, so normal response delivery cannot
+be truncated and misclassified as a successful drain.
+
+The bound does not kill a synchronous filesystem transaction. A blocking
+mutation owns its lifecycle lease independently of the dropped MCP future. If
+it already crossed WAL, the shutdown supervisor waits for durable quiescence
+before releasing the singleton lock; the cancelled transport never
+acknowledges that late result, and the client observes it by retrying the same
+idempotency key after restart. If timeout wins while fresh admission is still
+inside configured policy, a final pre-WAL forced check returns unavailable and
+writes nothing. Thus `ForcedAfterTimeout` may be returned later than the
+configured grace, but when it returns no entered canonical worker or store lock
+remains. Forced cleanup separately accounts for HTTP and backend leases: it
+first quiesces every queued or running canonical worker, then confirms that
+socket cancellation released every transport permit without depending on the
+peer. Router and connection state retain no canonical pointer; session clones
+retain only the weak lifecycle facade. Neither can become another long-lived
+strong store owner.
 
 Only explicit IPv4 or IPv6 loopback binds are accepted. Wildcard, unspecified,
 and non-loopback addresses fail configuration validation before canonical
@@ -98,10 +149,11 @@ store backend, the trusted connection context, a trusted `CreationActor`, and
 a configured admission policy. Missing write or forget grants reject only the
 corresponding tool call and do not make initialization or read tools fail.
 
-For `jiandu serve`, those lower-level objects are derived from the v0.1
-permission profile. They remain the transport-independent Rust seam and the
-MCP public authentication-context contract is unchanged; raw grant strings and
-mutation-policy internals are simply no longer daemon configuration inputs.
+For `jiandu serve`, those lower-level objects are derived from the identical
+permission profile shared by service config v0.1 and v0.2. They remain the
+transport-independent Rust seam and the MCP public authentication-context
+contract is unchanged; raw grant strings and mutation-policy internals are
+simply no longer daemon configuration inputs.
 
 All handlers require `memory:read` for the shipped read surface. Within a
 mutation-enabled handler, remember/update require the exact scope-kind
@@ -258,7 +310,9 @@ retry attempt correlation remains local to policy/backend diagnostics.
 Mutation failures carry the revision captured under the same store writer
 guard, avoiding a later mixed-watermark read.
 
-Canonical fsync/rename work runs on a blocking worker. MCP
+Canonical reads, search, resource reads, revision lookup, and fsync/rename work
+run on blocking workers rather than parking Tokio runtime workers behind the
+canonical `std::sync::RwLock`. MCP
 `notifications/cancelled`, an adapter future drop, or transport timeout marks
 the response unused but does not abort the worker after WAL work begins. The
 caller retries the identical command and key after timeout/disconnect. Tests
@@ -271,9 +325,13 @@ The separate service-level resilience suite discards a successful raw HTTP
 response without reading its result, observes the durable record through the
 other public client, terminates that MCP session, restarts the daemon, and
 proves exact replay retains the record, revision, store watermark, and durable
-correlation while changed input under the same key is rejected. Session
-termination is explicit in this slice; bounded draining of arbitrary active
-sessions remains Issue #29.
+correlation while changed input under the same key is rejected. The bounded
+shutdown suite separately races new session admission with drain, drains
+concurrent read/mutation responses, forces both pre-WAL and post-WAL cases,
+holds a raw authenticated upload open across forced timeout, saturates a
+single-worker runtime with read/write lock contention, checks that no
+unpersisted result is acknowledged, and immediately reopens or recovers the
+same store.
 
 ### `memory_remember`
 
