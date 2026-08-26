@@ -1,0 +1,36 @@
+{
+  "mappingSchema": "jiandu.dev/compatibility/bamboo-memory-mapping/v1alpha1",
+  "sourceCase": "durable-project-legacy-pre-granularity",
+  "generatedFields": [
+    "revision",
+    "etag"
+  ],
+  "record": {
+    "schema": "jiandu.dev/memory/v1alpha1",
+    "id": "mem_fixture_legacy_reference",
+    "scope": {
+      "kind": "project",
+      "projectId": "prj_fixture_alpha"
+    },
+    "type": "reference",
+    "status": "archived",
+    "title": "Legacy reference without temporal granularity",
+    "summary": null,
+    "body": "This pre-granularity frontmatter remains readable by the pinned Bamboo codec.",
+    "tags": [
+      "compatibility"
+    ],
+    "createdAt": "2026-06-01T08:00:00Z",
+    "updatedAt": "2026-06-02T08:00:00Z",
+    "provenance": {
+      "createdBy": "import",
+      "sourceUri": "bamboo-memory://snapshot-v1/memory/v1/scopes/projects/fixture-workspace-deadbeef/topics/mem_fixture_legacy_reference.md",
+      "contentDigest": "sha256:ea750333ecef8f79ee4124e91198ce70d16458755e706d489eab2d00b69a59a3",
+      "extraction": {
+        "method": "import",
+        "extractorVersion": "bamboo-f362cc1"
+      }
+    },
+    "relations": []
+  }
+}

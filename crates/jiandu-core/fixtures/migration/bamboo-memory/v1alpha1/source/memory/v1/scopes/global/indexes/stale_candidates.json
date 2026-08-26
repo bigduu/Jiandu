@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-08-22T00:00:00Z",
+  "items": [
+    {
+      "id": "mem_fixture_global_user",
+      "title": "Preferred review style",
+      "status": "stale",
+      "updated_at": "2026-08-01T09:00:00+00:00",
+      "reason": "status=stale"
+    }
+  ]
+}
