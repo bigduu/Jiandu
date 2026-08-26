@@ -125,6 +125,51 @@ impl RawHttpDriver {
         .await
     }
 
+    /// Submit one tool call, wait until the server has accepted the response,
+    /// then drop its unread body. The resilience suite independently observes
+    /// the durable mutation before stopping the daemon, so this models a lost
+    /// application acknowledgement without relying on timing or test hooks.
+    pub(crate) async fn call_tool_and_drop_response(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<(), String> {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| "raw request ID exhausted".to_owned())?;
+        let response = self
+            .authenticated(self.client.post(&self.endpoint))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .send()
+            .await
+            .map_err(|_| "raw MCP request failed before response headers".to_owned())?;
+        if response.status() != StatusCode::OK {
+            return Err(format!(
+                "raw MCP request returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "raw MCP response omitted content type".to_owned())?;
+        if !content_type.starts_with("application/json")
+            && !content_type.starts_with("text/event-stream")
+        {
+            return Err("raw MCP response used an unsupported content type".to_owned());
+        }
+        drop(response);
+        Ok(())
+    }
+
     pub(crate) async fn close(self) -> Result<(), String> {
         let response = self
             .authenticated(self.client.delete(&self.endpoint))

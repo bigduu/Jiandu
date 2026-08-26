@@ -70,7 +70,7 @@ Tracking issues:
 - [#10 — ordinary two-client public conformance](https://github.com/bigduu/Jiandu/issues/10) — implemented with shared official-rmcp/raw-HTTP fixtures
 - Non-blocking service follow-ups:
   - [#29 — bounded shutdown admission and durable drain](https://github.com/bigduu/Jiandu/issues/29)
-  - [#34 — restart, retry, and degraded-index conformance](https://github.com/bigduu/Jiandu/issues/34)
+  - [#34 — restart, retry, and degraded-index conformance](https://github.com/bigduu/Jiandu/issues/34) — implemented black-box resilience matrix
   - [#35 — secret-safe diagnostics after integration demand](https://github.com/bigduu/Jiandu/issues/35)
   - [#30 — administrative maintenance commands on demand](https://github.com/bigduu/Jiandu/issues/30)
   - [#31 — stdio proxy only for clients without HTTP](https://github.com/bigduu/Jiandu/issues/31)
@@ -87,9 +87,10 @@ Tracking issues:
   #33, done).
 - Prove the ordinary public contract with two independent clients (Issue #10,
   done; exact matrix in `mcp-conformance-matrix-v0.md`).
-- Add restart/retry/degraded-index conformance (#34), bounded shutdown (#29),
-  diagnostics (#35), administrative commands (#30), and a `stdio` proxy (#31)
-  only as separately scheduled follow-ups; none blocks the thin #9 service.
+- Add restart/retry/degraded-index conformance (#34, done; same exact matrix).
+- Add bounded shutdown (#29), diagnostics (#35), administrative commands (#30),
+  and a `stdio` proxy (#31) only as separately scheduled follow-ups; none
+  blocks the thin #9 service.
 
 Outcome: at least two independent MCP clients can use the same Jiandu service safely.
 
