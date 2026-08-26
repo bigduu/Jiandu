@@ -1,6 +1,9 @@
 # Bamboo Memory Compatibility Corpus v1alpha1
 
-This document freezes the evidence and mapping decisions for a future Bamboo-to-Jiandu migration. It does **not** implement an importer, open a Bamboo data directory, mutate either store, or import Bamboo's Session database.
+This document freezes the evidence and mapping decisions consumed by the
+separate [Bamboo Snapshot Import `v1alpha1`](bamboo-snapshot-import-v1alpha1.md).
+The corpus itself does **not** open a Bamboo data directory, mutate either
+store, or import Bamboo's Session database.
 
 ## Reproducible source evidence
 
@@ -82,4 +85,15 @@ Expected mappings are intentionally partial plans. Tests inject synthetic revisi
 
 Fixtures contain invented principals, Projects, Sessions, messages, content, and URIs. Validation rejects common credential markers, home-directory paths, real absolute workspace paths, unlisted files, symlinks, and digest drift. No test reads `BAMBOO_DATA_DIR` or depends on a Bamboo crate.
 
-A future importer must consume an operator-provided isolated snapshot and identity map, produce the same five-way report, validate all IDs before selecting candidates, and leave Bamboo read-only. Store mutation, adapter behavior, Session database migration, live cutover, and dual-write are explicitly outside this corpus.
+The implemented offline adapter consumes an operator-provided isolated
+snapshot and exact identity map, produces this same five-way source report,
+consumes the reviewed manifest classifications, and validates every
+import-eligible ID for syntax and uniqueness before portable projection. It
+leaves Bamboo read-only; this focused four-record slice does not re-parse
+quarantined or intentionally unsupported durable artifacts to derive a second
+classification.
+Its independent destination classifications and reviewed portable-import
+contract are documented in
+[Bamboo Snapshot Import `v1alpha1`](bamboo-snapshot-import-v1alpha1.md).
+Session database migration, live cutover, and dual-write remain outside both
+this corpus and the importer slice.

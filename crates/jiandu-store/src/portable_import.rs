@@ -2347,6 +2347,43 @@ impl CanonicalStore {
         Ok(plan)
     }
 
+    /// Return an exact committed portable-import receipt when one already
+    /// exists, without performing fresh target planning or entering the WAL.
+    ///
+    /// This narrow acknowledgement-recovery seam retains the same ordering as
+    /// [`Self::import_portable`]: ownership, trusted identity, exact-scope
+    /// authority, strict bundle decode, and request fingerprint validation all
+    /// precede private receipt access. `None` means no receipt exists for the
+    /// authenticated principal/key; a reused key with different canonical
+    /// input remains an idempotency conflict.
+    pub fn replay_portable_import(
+        &self,
+        authority: &crate::AuthorizedScopes,
+        context: &TrustedRequestContext,
+        bundle_bytes: &[u8],
+        expected_plan_digest: &ImportDigest,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<Option<ImportCommit>, StoreError> {
+        self.validate_ownership()?;
+        context
+            .validate()
+            .map_err(|_| StoreError::Unauthenticated)?;
+        expected_plan_digest.validate()?;
+        if context.principal_id != authority.principal_id {
+            return Err(StoreError::Forbidden);
+        }
+        let bundle = PortableExportBundle::decode_canonical(bundle_bytes)?;
+        require_import_authority(authority, context, &bundle.scopes)?;
+        let identity = ImportReceiptIdentity::derive(&context.principal_id, idempotency_key);
+        let request_fingerprint = import_request_fingerprint(&bundle, expected_plan_digest)?;
+        self.lookup_import_replay(
+            &identity,
+            &request_fingerprint,
+            &bundle,
+            expected_plan_digest,
+        )
+    }
+
     /// Commit one strict portable bundle as a single metadata-last batch.
     /// Fresh exact-scope authority and receipt replay are resolved before any
     /// target-state/CAS inspection or write.

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/jiandu-core",
+    "crates/jiandu-bamboo-import",
     "crates/jiandu-store",
     "crates/jiandu-index",
     "crates/jiandu-mcp",

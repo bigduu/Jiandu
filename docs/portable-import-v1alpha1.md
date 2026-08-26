@@ -39,6 +39,15 @@ scope to remain authorized; authorization is checked before private receipt
 lookup. Import never accepts a destination scope separately, widens authority,
 moves a record, derives Project identity from a path, or changes an opaque ID.
 
+`CanonicalStore::replay_portable_import` is the narrower read-only
+acknowledgement-recovery seam. With the same trusted principal, complete scope
+authority, canonical bundle, expected plan digest, and idempotency key, it
+returns an existing verified `ImportCommit` or `None` without fresh target
+planning or WAL entry. Conflicting key reuse remains an idempotency conflict;
+absence never authorizes a new commit. Host adapters use this only to
+distinguish a lost committed acknowledgement from unrelated later target
+state before deciding whether a fresh import is still admissible.
+
 ## Deterministic zero-write dry run
 
 The dry run returns source and target identities/watermarks, sorted unique

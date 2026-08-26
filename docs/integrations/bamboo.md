@@ -69,9 +69,12 @@ This keeps existing prompts and UI stable while allowing new hosts to grant read
 ### Phase A: contract and importer
 
 - Use the [versioned Bamboo compatibility corpus](../bamboo-memory-compatibility-v1alpha1.md) as the pinned format, identity, duplicate, sanitization, and classification contract.
+- Use the [reviewed offline snapshot importer](../bamboo-snapshot-import-v1alpha1.md) for deterministic planning and the one canonical portable-import commit.
 - Inventory Bamboo's current filesystem memory schema, IDs, scope assumptions, and error behavior against an isolated, quiesced copy.
 - Implement a read-only importer and validator in Jiandu.
-- Generate a deterministic migration report: accepted, transformed, skipped, conflicted, and quarantined records.
+- Keep the corpus source outcomes (`accepted`, `transformed`, `unresolved`,
+  `skipped`, `quarantined`) separate from the Jiandu destination overlay
+  (`accepted`, `conflicting`, `unauthorized`, `tombstone_protected`, `invalid`).
 - Run dry-run imports against fixtures and a sanitized copy, never the live store.
 - Preserve original source paths and hashes in import provenance without treating paths as identity.
 

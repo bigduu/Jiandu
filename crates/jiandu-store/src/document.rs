@@ -14,6 +14,21 @@ pub(crate) struct CanonicalDocument {
     pub record: MemoryRecord,
 }
 
+/// Canonicalize one trusted host-adapter record projection without opening a
+/// store.
+///
+/// Migration adapters use this seam to generate the exact revision-bound ETag
+/// that the canonical store would validate. The operation is pure: it encodes
+/// and decodes the committed Markdown representation in memory and performs no
+/// filesystem I/O.
+pub fn canonical_record_from_document_parts(
+    frontmatter: &MemoryFrontmatterV1Alpha1,
+    body: &str,
+) -> Result<MemoryRecord, StoreError> {
+    let bytes = encode_canonical_document(frontmatter, body)?;
+    Ok(decode_canonical_document(&bytes, Some(&frontmatter.id))?.record)
+}
+
 /// Encode strict frontmatter and an exact API body into canonical bytes.
 ///
 /// The final LF is a file terminator and is not part of `body`. If the API

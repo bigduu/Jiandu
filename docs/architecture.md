@@ -240,6 +240,16 @@ revalidation. Exact public codecs, bounds, privacy, and compatibility are in
 layout, recovery, and migration are in
 [Canonical Store Format `v1alpha4`](store-format-v1alpha4.md).
 
+The Bamboo-specific offline adapter is a separate leaf crate. It consumes only
+an explicit isolated snapshot, retains the frozen source five-way report as a
+separate axis from canonical target import classifications, and creates an
+in-memory portable projection through the same store codecs. Exact reviewed
+plan bytes bind source/mapping evidence, pristine-target validation/export,
+report, bundle, and portable plan before `import_portable` is allowed to write.
+Post-commit evidence failure is an explicit committed state whose exact-key
+retry reaches the canonical receipt before fresh conflicts. The full boundary
+is specified in [Bamboo Snapshot Import `v1alpha1`](bamboo-snapshot-import-v1alpha1.md).
+
 ## Integration flows
 
 ### 1. Explicit model tools
