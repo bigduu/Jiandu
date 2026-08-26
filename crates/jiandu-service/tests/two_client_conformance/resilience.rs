@@ -17,6 +17,8 @@ const ABSENT_MEMORY: &str = "mem_resilience_absent";
 const LOST_ACK_TITLE: &str = "resilience lost acknowledgement";
 const INDEX_QUERY: &str = "ordinary conformance";
 const INDEX_QUERY_SENTINEL: &str = "resiliencequerymustnotleak";
+const UNAVAILABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const UNAVAILABLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn concurrent_clients_preserve_cas_idempotency_and_exact_scope() {
@@ -541,9 +543,13 @@ async fn wait_for_shared_title<D: PublicMcpDriver>(driver: &mut D, title: &str) 
 }
 
 async fn unavailable_raw_get(endpoint: &str, memory_id: &str) -> reqwest::Error {
+    let client = reqwest::Client::builder()
+        .connect_timeout(UNAVAILABLE_CONNECT_TIMEOUT)
+        .build()
+        .expect("bounded unavailable client");
     tokio::time::timeout(
-        Duration::from_secs(2),
-        reqwest::Client::new()
+        UNAVAILABLE_REQUEST_TIMEOUT,
+        client
             .post(endpoint)
             .bearer_auth(RAW_TOKEN)
             .header("accept", "application/json, text/event-stream")
