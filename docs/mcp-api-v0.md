@@ -10,9 +10,10 @@ independently authorized `memory_remember`, `memory_update`, and
 #28 now serves that adapter from the production `jiandu` process over
 authenticated loopback Streamable HTTP. Issue #33 replaces that daemon's
 unreleased startup shape with the closed thin v0.1 permission profile described
-below. Broad two-client conformance, operational hardening, administrative
-commands, and stdio proxying remain later issues, so the complete document is
-still an implementation target rather than a stable compatibility promise.
+below. Issue #10 now proves the ordinary public contract with official rmcp and
+an independent raw HTTP driver; see the [compatibility matrix](mcp-conformance-matrix-v0.md).
+Operational hardening, administrative commands, and stdio proxying remain later
+issues, so this is not yet a stable compatibility promise.
 
 The handler supports exactly MCP revision `2025-11-25`. This is
 independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests

@@ -67,7 +67,7 @@ Tracking issues:
 - [#9 — standalone MCP service](https://github.com/bigduu/Jiandu/issues/9) (thin v0.1 tracker), delivered by:
   - [#28 — authenticated singleton loopback MCP daemon](https://github.com/bigduu/Jiandu/issues/28) — implemented foundation
   - [#33 — thin v0.1 daemon authority configuration](https://github.com/bigduu/Jiandu/issues/33) — implemented compact typed permission profile
-- [#10 — ordinary two-client public conformance](https://github.com/bigduu/Jiandu/issues/10)
+- [#10 — ordinary two-client public conformance](https://github.com/bigduu/Jiandu/issues/10) — implemented with shared official-rmcp/raw-HTTP fixtures
 - Non-blocking service follow-ups:
   - [#29 — bounded shutdown admission and durable drain](https://github.com/bigduu/Jiandu/issues/29)
   - [#34 — restart, retry, and degraded-index conformance](https://github.com/bigduu/Jiandu/issues/34)
@@ -85,7 +85,8 @@ Tracking issues:
 - Replace the unreleased raw grant/policy daemon inputs with one versioned,
   typed read/write/forget permission profile and closed service defaults (Issue
   #33, done).
-- Prove the ordinary public contract with two independent clients (Issue #10).
+- Prove the ordinary public contract with two independent clients (Issue #10,
+  done; exact matrix in `mcp-conformance-matrix-v0.md`).
 - Add restart/retry/degraded-index conformance (#34), bounded shutdown (#29),
   diagnostics (#35), administrative commands (#30), and a `stdio` proxy (#31)
   only as separately scheduled follow-ups; none blocks the thin #9 service.
