@@ -1,5 +1,7 @@
 #[path = "two_client_conformance/raw_http.rs"]
 mod raw_http;
+#[path = "two_client_conformance/resilience.rs"]
+mod resilience;
 #[path = "two_client_conformance/suite.rs"]
 mod suite;
 
@@ -604,6 +606,7 @@ impl Harness {
         fs::create_dir(&store_path).expect("create isolated store directory");
         seed_store(&store_path);
         let config_path = sandbox.path().join("daemon.json");
+        assert!(config_path.starts_with(sandbox.path()));
         fs::write(&config_path, config_bytes(&store_path)).expect("write local config");
         Self {
             _sandbox: sandbox,
@@ -613,9 +616,17 @@ impl Harness {
     }
 
     async fn start(&self) -> RunningDaemon {
-        RunningDaemon::start(ServeConfig::load(&self.config_path).expect("load config"))
-            .await
-            .expect("start daemon")
+        let daemon =
+            RunningDaemon::start(ServeConfig::load(&self.config_path).expect("load config"))
+                .await
+                .expect("start daemon");
+        assert!(daemon.local_addr().ip().is_loopback());
+        assert_ne!(
+            daemon.local_addr().port(),
+            0,
+            "fixture must use an ephemeral port"
+        );
+        daemon
     }
 
     fn assert_lock_released(&self) {

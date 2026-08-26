@@ -146,6 +146,16 @@ release, close the owner, reopen, and retry the same key. Together they prove
 transport cancellation never becomes a second commit and crash recovery never
 fabricates an acknowledgement.
 
+The public black-box service matrix adds two independent clients around those
+lower layers. It races CAS, idempotency, and exact-scope checks; discards one
+successful mutation response body before restarting and replaying its durable
+key; deletes and corrupts only an isolated disposable index before rebuilding
+byte-identical index bytes and identical public results; and proves a
+contending daemon cannot alter the owned store. Complete service absence
+produces a transport failure rather than a fabricated memory envelope. This
+matrix does not define the bounded active-session drain policy reserved for
+Issue #29.
+
 Addressable resources use only opaque IDs or scope selectors, never queries or
 paths. Inaccessible and absent IDs are indistinguishable. Initialization
 metadata contains only closed ready/degraded/missing states and derived

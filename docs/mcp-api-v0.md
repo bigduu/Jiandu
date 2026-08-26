@@ -11,9 +11,12 @@ independently authorized `memory_remember`, `memory_update`, and
 authenticated loopback Streamable HTTP. Issue #33 replaces that daemon's
 unreleased startup shape with the closed thin v0.1 permission profile described
 below. Issue #10 now proves the ordinary public contract with official rmcp and
-an independent raw HTTP driver; see the [compatibility matrix](mcp-conformance-matrix-v0.md).
-Operational hardening, administrative commands, and stdio proxying remain later
-issues, so this is not yet a stable compatibility promise.
+an independent raw HTTP driver. Issue #34 extends that matrix across concurrent
+conflicts, acknowledgement loss, restart replay, index loss/corruption and
+rebuild, writer contention, and complete service absence; see the
+[compatibility matrix](mcp-conformance-matrix-v0.md). Bounded shutdown,
+administrative commands, and stdio proxying remain later issues, so this is not
+yet a stable compatibility promise.
 
 The handler supports exactly MCP revision `2025-11-25`. This is
 independent from `jiandu.dev/v1alpha1`; initialization advertises both and tests
@@ -263,6 +266,14 @@ pause at every authoritative create/update/forget live persistence boundary,
 send a real cancellation, release the worker, close/reopen the store, and
 verify one audit/revision plus exact replay. Separate exhaustive store
 failpoint/recovery matrices cover old-or-complete crash states.
+
+The separate service-level resilience suite discards a successful raw HTTP
+response without reading its result, observes the durable record through the
+other public client, terminates that MCP session, restarts the daemon, and
+proves exact replay retains the record, revision, store watermark, and durable
+correlation while changed input under the same key is rejected. Session
+termination is explicit in this slice; bounded draining of arbitrary active
+sessions remains Issue #29.
 
 ### `memory_remember`
 
