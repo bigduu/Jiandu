@@ -16,6 +16,7 @@ time.workspace = true
 [dev-dependencies]
 jsonschema = { version = "0.50.1", default-features = false }
 serde_yaml_ng = "0.10.0"
+sha2.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,44 @@
+{
+  "mappingSchema": "jiandu.dev/compatibility/bamboo-host-identity-map/v1alpha1",
+  "principalSlots": [
+    {
+      "source": "bamboo-single-user-global",
+      "targetPrincipalId": "prn_fixture_owner"
+    }
+  ],
+  "projects": [
+    {
+      "bambooProjectId": "01JFIXTUREPROJECT0000000001",
+      "declaredLegacyProjectKeys": [
+        "fixture-workspace-deadbeef"
+      ],
+      "targetProjectId": "prj_fixture_alpha"
+    }
+  ],
+  "sessions": [
+    {
+      "bambooSessionId": "sesfixture1",
+      "targetSessionId": "ses_fixture_1"
+    }
+  ],
+  "recordTypeOverrides": [
+    {
+      "sourceMemoryId": "mem_fixture_global_user",
+      "targetType": "preference",
+      "reason": "operator-classified fixture preference"
+    }
+  ],
+  "createdByMappings": [
+    {
+      "bambooKind": "user",
+      "targetActor": "import",
+      "preserveAsMigrationEvidence": true
+    },
+    {
+      "bambooKind": "session",
+      "targetActor": "import",
+      "requiresSessionBinding": true,
+      "preserveAsMigrationEvidence": true
+    }
+  ]
+}

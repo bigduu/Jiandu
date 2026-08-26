@@ -1,0 +1,1 @@
+{"timestamp":"2026-08-21T07:00:00Z","action":"contradiction","scope":"global","memory_id":"mem_fixture_global_feedback","session_id":null,"topic":null,"summary":"Recorded a synthetic contradiction.","metadata":{"contradicted_ids":["mem_fixture_global_user"]}}

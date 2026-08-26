@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "session_id": "sesfixture1",
+  "updated_at": "2026-08-22T10:00:00Z",
+  "cursor_type": "task",
+  "current_task_id": "task_fixture_mapping",
+  "current_task_ordinal": 2,
+  "current_step_id": "step_fixture_validate",
+  "current_section_id": "validate-mappings",
+  "next_task_id": null,
+  "next_task_ordinal": null,
+  "next_section_id": null,
+  "last_completed_task_id": "task_fixture_inventory",
+  "last_completed_section_id": "inspect-formats",
+  "last_completed_checkpoint": "formats-inventoried",
+  "round_hint": 2,
+  "round_id_hint": "round-fixture-2",
+  "suspension_hook_point": null,
+  "tool_call_boundary": null,
+  "resume_note": "Continue deterministic fixture validation."
+}

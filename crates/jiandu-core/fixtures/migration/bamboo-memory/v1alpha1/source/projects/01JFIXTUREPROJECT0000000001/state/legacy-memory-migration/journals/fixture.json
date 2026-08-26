@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "report": {
+    "project_id": "01JFIXTUREPROJECT0000000001",
+    "legacy_project_key": "fixture-workspace-deadbeef",
+    "transaction_id": "00000000-0000-4000-8000-000000000036",
+    "phase": "committed",
+    "files": [
+      {
+        "relative_path": "topics/mem_fixture_legacy_reference.md",
+        "size": 486,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "disposition": "copied"
+      }
+    ],
+    "started_at": "2026-08-20T00:00:00Z",
+    "updated_at": "2026-08-20T00:01:00Z",
+    "committed_at": "2026-08-20T00:01:00Z"
+  },
+  "resource_revision_bumped": true
+}
