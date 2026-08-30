@@ -1,28 +1,21 @@
-//! Transport-independent authenticated MCP adapter for Jiandu.
+//! Thin MCP adapter for Jiandu's unified `memory` tool.
 //!
-//! Authentication and scope resolution happen at the trusted host boundary.
-//! This crate never accepts a principal, client identity, filesystem path, or
-//! prompt-placement policy from an MCP request.
+//! The wire contract is the current Bamboo `MemoryArgs` action enum. This crate
+//! maps it directly onto [`jiandu_memory::memory_store::MemoryStore`] and exposes
+//! only a local stdio transport.
 
-mod backend;
-mod health;
-mod policy;
-mod resource;
+mod args;
+mod context;
+mod handler;
 mod server;
 
-pub use backend::{
-    CanonicalReadBackend, McpMutationBackend, McpReadBackend, MutationBackendCommit,
-    MutationBackendError, ReadBackendError,
+pub use args::{
+    MEMORY_ACTIONS, MemoryActionOptions, MemoryArgs, MemoryToolClass, QueryFilters, SplitPiece,
+    WriteOptions,
 };
-pub use health::{
-    IndexReadHealth, OptionalCapability, ReadHealthSnapshot, ReadServiceHealth, StoreReadHealth,
+pub use context::{MemoryError, MemoryExecutionContext};
+pub use jiandu_memory::ProjectId;
+pub use server::{
+    MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME, MemoryServer,
+    memory_tool, serve_stdio,
 };
-pub use policy::{
-    AllowAllSecretContent, ConfiguredMutationPolicy, MutationPolicy, MutationPolicyContext,
-    MutationPolicyError, MutationPolicyRequest, MutationScopeKind, SecretContentPolicy,
-};
-pub use resource::{
-    INSTANCE_GLOBAL_LIST_RESOURCE_URI, MEMORY_RESOURCE_TEMPLATE, PRINCIPAL_LIST_RESOURCE_URI,
-    PROJECT_LIST_RESOURCE_TEMPLATE, SESSION_LIST_RESOURCE_TEMPLATE,
-};
-pub use server::{JIANDU_MCP_PROTOCOL_REVISION, JianduReadServer};

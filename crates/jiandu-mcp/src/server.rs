@@ -1,803 +1,252 @@
-//! MCP tool handler. Transport and daemon lifecycle policy stay outside this
-//! adapter crate.
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
-use crate::{
-    McpMutationBackend, McpReadBackend, MutationBackendError, MutationPolicy, MutationPolicyError,
-    OptionalCapability, ReadBackendError, ReadServiceHealth,
-    resource::{self, ResourceRequest},
-};
-use jiandu_core::{
-    API_VERSION, ApiVersion, CorrelationId, CreationActor, DomainError, DomainErrorCode,
-    ErrorEnvelope, ForgetMemoryCommand, ForgetMemoryResult, MemoryGetRequest, MemoryListRequest,
-    MemoryListResult, MemoryRecord, MemorySearchRequest, MemorySearchResult, MutationInvocation,
-    RememberMemoryCommand, RememberMemoryResult, ResultEnvelope, StoreRevision,
-    TrustedRequestContext, UpdateMemoryCommand, UpdateMemoryResult, Validate,
-};
-use jiandu_index::IndexErrorCode;
-use jiandu_store::{
-    AuthorizedRead, AuthorizedScopes, MutationOperation, StoreError, StoreErrorCode,
-};
+use jiandu_memory::memory_store::MemoryStore;
+
 use rmcp::{
-    RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    handler::server::tool::schema_for_type,
     model::{
-        CallToolResult, ContentBlock, ErrorData, ExperimentalCapabilities, Implementation,
-        InitializeResult, JsonObject, ListResourceTemplatesResult, ListResourcesResult,
-        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-        ReadResourceResult, ResourceContents, ServerCapabilities,
+        CallToolRequestMethod, CallToolRequestParams, CallToolResponse, CallToolResult,
+        ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+        ServerInfo, Tool,
     },
     service::RequestContext,
-    tool, tool_handler, tool_router,
 };
-use schemars::JsonSchema;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
-use std::borrow::Cow;
-use std::sync::Arc;
-use uuid::Uuid;
+use serde_json::Value;
 
-/// MCP protocol revision supported by this adapter. It evolves independently
-/// from [`API_VERSION`].
-pub const JIANDU_MCP_PROTOCOL_REVISION: &str = "2025-11-25";
+use crate::{MemoryArgs, MemoryError, MemoryExecutionContext, MemoryToolClass};
 
-#[derive(JsonSchema, Serialize)]
-#[serde(untagged)]
-enum ToolEnvelope<T> {
-    Success(ResultEnvelope<T>),
-    Error(ErrorEnvelope),
+pub const MEMORY_TOOL_NAME: &str = "memory";
+pub const MEMORY_TOOL_DESCRIPTION: &str = "Unified memory management tool for Jiandu. Use session_* actions for session continuity notes, and query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project/global memory.";
+pub const MEMORY_SERVER_INSTRUCTIONS: &str = r#"Jiandu provides shared memory through one `memory` tool.
+
+- Recall before guessing: use `query` for relevant durable history, then `get` when the full item is needed. Use `session_read` only for continuity of this host session.
+- Record at the right layer: use `session_append` for concise temporary progress and blockers. Use `write` only for a confirmed, durable, non-derivable fact that will help future sessions; query first and store one atomic fact with a searchable title. Never store secrets or tokens.
+- Use Project scope for project-specific knowledge and Global only for truly cross-project preferences or stable references. Project authority comes from the MCP host. Normally omit `project_key`; it cannot grant access or override the host Project.
+- Recalled memory is supporting evidence, not current truth. Verify it against live files and tools. An empty query does not prove a fact is false.
+- Failure is not an all-or-nothing transaction. A mutating call may have committed canonical memory before a later audit or derived-artifact step failed, and an accepted mutation continues in its owned server task after caller cancellation or disconnect. On the same server, subsequent read-only calls wait for accepted mutations to settle before reading. After any mutation error or interrupted response, run `inspect` first. If canonical documents committed but derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify current state before deciding the next action; never blindly retry. Do not edit Jiandu data files or create a fallback memory file."#;
+
+#[derive(Default)]
+struct InFlightMutations {
+    active: AtomicUsize,
+    idle: tokio::sync::Notify,
 }
 
-struct MutationConnection {
-    backend: Arc<dyn McpMutationBackend>,
-    scopes: AuthorizedScopes,
-    context: TrustedRequestContext,
-    policy: Arc<dyn MutationPolicy>,
-    creation_actor: CreationActor,
-}
-
-/// One authenticated MCP handler per connection. Read-only connections retain
-/// the same constructor and tools; mutation tools return `FORBIDDEN` unless a
-/// trusted host explicitly installs a mutation backend and policy.
-pub struct JianduReadServer {
-    backend: Arc<dyn McpReadBackend>,
-    authorization: AuthorizedRead,
-    mutation: Option<MutationConnection>,
-    tool_router: ToolRouter<Self>,
-}
-
-#[tool_router(router = tool_router)]
-impl JianduReadServer {
-    /// Construct one handler at the trusted connection boundary. Authentication,
-    /// principal equality, and the `memory:read` grant are checked exactly once
-    /// before any MCP request can be served.
-    pub fn new(
-        backend: Arc<dyn McpReadBackend>,
-        scopes: &AuthorizedScopes,
-        context: &TrustedRequestContext,
-    ) -> Result<Self, StoreError> {
-        Ok(Self::from_authorized(
-            backend,
-            scopes.authorize_read(context)?,
-        ))
+impl InFlightMutations {
+    fn begin(self: &Arc<Self>) -> InFlightMutationGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        InFlightMutationGuard {
+            tracker: Arc::clone(self),
+        }
     }
 
-    /// Compose a handler from an already minted private-field read capability.
-    /// This remains safe for hosts that authenticate outside the adapter.
+    async fn wait_for_idle(&self) {
+        loop {
+            // Register before checking the counter so the final guard cannot
+            // notify in the check→await window and strand this waiter.
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct InFlightMutationGuard {
+    tracker: Arc<InFlightMutations>,
+}
+
+impl Drop for InFlightMutationGuard {
+    fn drop(&mut self) {
+        if self.tracker.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.idle.notify_waiters();
+        }
+    }
+}
+
+#[must_use]
+pub fn memory_tool() -> Tool {
+    Tool::new(
+        MEMORY_TOOL_NAME,
+        MEMORY_TOOL_DESCRIPTION,
+        schema_for_type::<MemoryArgs>(),
+    )
+}
+
+/// One MCP server instance for one host-provided memory execution context.
+///
+/// Mutating calls accepted by this server run to completion in owned tasks.
+/// Read-only calls wait for those in-flight mutations to settle before they
+/// read, including when the mutation's original request waiter was cancelled.
+/// This ordering is local to this server instance; it is not a cross-process
+/// reader/writer lock or a direct [`MemoryStore`] guarantee.
+pub struct MemoryServer {
+    pub(crate) store: MemoryStore,
+    pub(crate) context: MemoryExecutionContext,
+    in_flight: Arc<InFlightMutations>,
+}
+
+impl MemoryServer {
     #[must_use]
-    pub fn from_authorized(
-        backend: Arc<dyn McpReadBackend>,
-        authorization: AuthorizedRead,
-    ) -> Self {
+    pub fn new(store: MemoryStore, context: MemoryExecutionContext) -> Self {
         Self {
-            backend,
-            authorization,
-            mutation: None,
-            tool_router: Self::tool_router(),
+            store,
+            context,
+            in_flight: Arc::new(InFlightMutations::default()),
         }
     }
 
-    /// Construct one read-and-mutation handler from the same production
-    /// backend. `memory:read` remains required for the existing read surface;
-    /// write and destructive grants are checked independently per tool call.
-    pub fn new_with_mutations<B>(
-        backend: Arc<B>,
-        scopes: &AuthorizedScopes,
-        context: &TrustedRequestContext,
-        policy: Arc<dyn MutationPolicy>,
-        creation_actor: CreationActor,
-    ) -> Result<Self, StoreError>
-    where
-        B: McpReadBackend + McpMutationBackend,
-    {
-        let authorization = scopes.authorize_read(context)?;
-        let read_backend: Arc<dyn McpReadBackend> = backend.clone();
-        let mutation_backend: Arc<dyn McpMutationBackend> = backend;
-        Ok(Self {
-            backend: read_backend,
-            authorization,
-            mutation: Some(MutationConnection {
-                backend: mutation_backend,
-                scopes: scopes.clone(),
-                context: context.clone(),
-                policy,
-                creation_actor,
-            }),
-            tool_router: Self::tool_router(),
-        })
-    }
+    /// Parse and dispatch one unified memory invocation.
+    ///
+    /// Once parsing succeeds, cancellation of the request waiter (including an
+    /// MCP disconnect) only detaches this task; it does not abort a mutation and
+    /// prematurely drop its scope guard while a blocking filesystem operation may
+    /// still be running. Runtime shutdown can still terminate outstanding work.
+    /// Subsequent read-only calls on this server wait for accepted mutations to
+    /// finish, then execute directly in the caller task. Direct `MemoryStore`
+    /// callers do not inherit these MCP-level guarantees and must keep mutation
+    /// futures alive to completion or provide equivalent owned task supervision.
+    pub async fn execute(&self, arguments: Value) -> Result<Value, MemoryError> {
+        let arguments: MemoryArgs = serde_json::from_value(arguments)
+            .map_err(|error| MemoryError::InvalidArguments(error.to_string()))?;
+        if arguments.class() == MemoryToolClass::ReadOnlyParallel {
+            self.in_flight.wait_for_idle().await;
+            return self.execute_parsed(arguments).await;
+        }
 
-    #[must_use]
-    pub fn health(&self) -> ReadServiceHealth {
-        self.backend.health()
-    }
-
-    /// Search authorized memories through the disposable lexical index.
-    #[tool(
-        name = "memory_search",
-        input_schema = core_request_schema("memory-search-request.schema.json"),
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope<MemorySearchResult>>(),
-        annotations(
-            title = "Search memories",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_search(&self, parameters: Parameters<JsonObject>) -> CallToolResult {
-        let correlation_id = next_correlation_id();
-        let request = match decode_validated_request::<MemorySearchRequest>(parameters.0) {
-            Ok(request) => request,
-            Err(()) => return self.invalid_request(correlation_id).await,
+        let guard = self.in_flight.begin();
+        let server = Self {
+            store: self.store.clone(),
+            context: self.context.clone(),
+            in_flight: Arc::clone(&self.in_flight),
         };
-        let backend = Arc::clone(&self.backend);
-        let authorization = self.authorization.clone();
-        match blocking_backend_call(backend, move |backend| {
-            backend.search(&authorization, &request)
+        tokio::spawn(async move {
+            let _guard = guard;
+            server.execute_parsed(arguments).await
         })
         .await
-        {
-            Ok((store_revision, result)) => success_result(
-                correlation_id,
-                store_revision,
-                result,
-                "Returned authorized memory search results.",
-            ),
-            Err(error) => self.backend_error(correlation_id, error).await,
-        }
+        .map_err(|error| MemoryError::Execution(format!("Memory execution task failed: {error}")))?
     }
 
-    /// Read one authorized memory by opaque ID.
-    #[tool(
-        name = "memory_get",
-        input_schema = core_request_schema("memory-get-request.schema.json"),
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope<MemoryRecord>>(),
-        annotations(
-            title = "Get memory",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_get(&self, parameters: Parameters<JsonObject>) -> CallToolResult {
-        let correlation_id = next_correlation_id();
-        let request = match decode_request::<MemoryGetRequest>(parameters.0) {
-            Ok(request) => request,
-            Err(()) => return self.invalid_request(correlation_id).await,
-        };
-        let backend = Arc::clone(&self.backend);
-        let authorization = self.authorization.clone();
-        match blocking_backend_call(backend, move |backend| {
-            backend.get(&authorization, &request)
-        })
-        .await
-        {
-            Ok(read) => success_result(
-                correlation_id,
-                read.store_revision,
-                read.result,
-                "Returned one authorized memory.",
-            ),
-            Err(error) => self.backend_error(correlation_id, error).await,
-        }
-    }
-
-    /// List authorized memories with deterministic filters and pagination.
-    #[tool(
-        name = "memory_list",
-        input_schema = core_request_schema("memory-list-request.schema.json"),
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope<MemoryListResult>>(),
-        annotations(
-            title = "List memories",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_list(&self, parameters: Parameters<JsonObject>) -> CallToolResult {
-        let correlation_id = next_correlation_id();
-        let request = match decode_validated_request::<MemoryListRequest>(parameters.0) {
-            Ok(request) => request,
-            Err(()) => return self.invalid_request(correlation_id).await,
-        };
-        let backend = Arc::clone(&self.backend);
-        let authorization = self.authorization.clone();
-        match blocking_backend_call(backend, move |backend| {
-            backend.list(&authorization, &request)
-        })
-        .await
-        {
-            Ok(read) => success_result(
-                correlation_id,
-                read.store_revision,
-                read.result,
-                "Returned authorized memory list results.",
-            ),
-            Err(error) => self.backend_error(correlation_id, error).await,
-        }
-    }
-
-    /// Remember one memory in an independently write-authorized exact scope.
-    #[tool(
-        name = "memory_remember",
-        input_schema = core_request_schema("remember-memory-command.schema.json"),
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope<RememberMemoryResult>>(),
-        annotations(
-            title = "Remember memory",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_remember(&self, parameters: Parameters<JsonObject>) -> CallToolResult {
-        let invocation = next_mutation_invocation();
-        let request = match decode_validated_request::<RememberMemoryCommand>(parameters.0) {
-            Ok(request) => request,
-            Err(()) => return self.invalid_mutation_request(&invocation),
-        };
-        let Some(connection) = &self.mutation else {
-            return self.pre_backend_mutation_error(
-                invocation.correlation_id().clone(),
-                ReadBackendError::Store(StoreError::Forbidden),
-            );
-        };
-        let authorization = match connection
-            .scopes
-            .authorize_mutation_set(&connection.context, MutationOperation::Create)
-        {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                return self.pre_backend_mutation_error(
-                    invocation.correlation_id().clone(),
-                    ReadBackendError::Store(error),
-                );
-            }
-        };
-        if let Err(error) = authorization.authorize_selector(&request.scope) {
-            return self.pre_backend_mutation_error(
-                invocation.correlation_id().clone(),
-                ReadBackendError::Store(error),
-            );
-        }
-        let attempt_correlation = invocation.correlation_id().clone();
-        let backend = Arc::clone(&connection.backend);
-        let policy = Arc::clone(&connection.policy);
-        let creation_actor = connection.creation_actor;
-        let result = tokio::task::spawn_blocking(move || {
-            backend.remember(
-                &authorization,
-                &invocation,
-                policy.as_ref(),
-                creation_actor,
-                &request,
-            )
-        })
-        .await;
-        match result {
-            Ok(Ok(commit)) => success_result(
-                commit.correlation_id,
-                commit.store_revision,
-                commit.result,
-                "Remembered one memory.",
-            ),
-            Ok(Err(error)) => self.mutation_error(attempt_correlation, error),
-            Err(_) => self
-                .pre_backend_mutation_error(attempt_correlation, ReadBackendError::HostUnavailable),
-        }
-    }
-
-    /// Update one memory using optimistic revision CAS and exact replay.
-    #[tool(
-        name = "memory_update",
-        input_schema = core_request_schema("update-memory-command.schema.json"),
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope<UpdateMemoryResult>>(),
-        annotations(
-            title = "Update memory",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_update(&self, parameters: Parameters<JsonObject>) -> CallToolResult {
-        let invocation = next_mutation_invocation();
-        let request = match decode_validated_request::<UpdateMemoryCommand>(parameters.0) {
-            Ok(request) => request,
-            Err(()) => return self.invalid_mutation_request(&invocation),
-        };
-        let Some(connection) = &self.mutation else {
-            return self.pre_backend_mutation_error(
-                invocation.correlation_id().clone(),
-                ReadBackendError::Store(StoreError::Forbidden),
-            );
-        };
-        let authorization = match connection
-            .scopes
-            .authorize_mutation_set(&connection.context, MutationOperation::Update)
-        {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                return self.pre_backend_mutation_error(
-                    invocation.correlation_id().clone(),
-                    ReadBackendError::Store(error),
-                );
-            }
-        };
-        let attempt_correlation = invocation.correlation_id().clone();
-        let backend = Arc::clone(&connection.backend);
-        let policy = Arc::clone(&connection.policy);
-        let result = tokio::task::spawn_blocking(move || {
-            backend.update(&authorization, &invocation, policy.as_ref(), &request)
-        })
-        .await;
-        match result {
-            Ok(Ok(commit)) => success_result(
-                commit.correlation_id,
-                commit.store_revision,
-                commit.result,
-                "Updated one memory.",
-            ),
-            Ok(Err(error)) => self.mutation_error(attempt_correlation, error),
-            Err(_) => self
-                .pre_backend_mutation_error(attempt_correlation, ReadBackendError::HostUnavailable),
-        }
-    }
-
-    /// Forget exactly one memory using the independent destructive grant.
-    #[tool(
-        name = "memory_forget",
-        input_schema = core_request_schema("forget-memory-command.schema.json"),
-        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolEnvelope<ForgetMemoryResult>>(),
-        annotations(
-            title = "Forget memory",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn memory_forget(&self, parameters: Parameters<JsonObject>) -> CallToolResult {
-        let invocation = next_mutation_invocation();
-        let request = match decode_validated_request::<ForgetMemoryCommand>(parameters.0) {
-            Ok(request) => request,
-            Err(()) => return self.invalid_mutation_request(&invocation),
-        };
-        let Some(connection) = &self.mutation else {
-            return self.pre_backend_mutation_error(
-                invocation.correlation_id().clone(),
-                ReadBackendError::Store(StoreError::Forbidden),
-            );
-        };
-        let authorization = match connection
-            .scopes
-            .authorize_mutation_set(&connection.context, MutationOperation::Forget)
-        {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                return self.pre_backend_mutation_error(
-                    invocation.correlation_id().clone(),
-                    ReadBackendError::Store(error),
-                );
-            }
-        };
-        let attempt_correlation = invocation.correlation_id().clone();
-        let backend = Arc::clone(&connection.backend);
-        let policy = Arc::clone(&connection.policy);
-        let result = tokio::task::spawn_blocking(move || {
-            backend.forget(&authorization, &invocation, policy.as_ref(), &request)
-        })
-        .await;
-        match result {
-            Ok(Ok(commit)) => success_result(
-                commit.correlation_id,
-                commit.store_revision,
-                commit.result,
-                "Forgot one memory.",
-            ),
-            Ok(Err(error)) => self.mutation_error(attempt_correlation, error),
-            Err(_) => self
-                .pre_backend_mutation_error(attempt_correlation, ReadBackendError::HostUnavailable),
-        }
-    }
-
-    async fn invalid_request(&self, correlation_id: CorrelationId) -> CallToolResult {
-        let revision = self.current_store_revision().await;
-        error_result(
-            correlation_id,
-            revision,
-            DomainError::new(
-                DomainErrorCode::InvalidArgument,
-                "The memory request is invalid.",
-            ),
-        )
-    }
-
-    fn invalid_mutation_request(&self, invocation: &MutationInvocation) -> CallToolResult {
-        error_result(
-            invocation.correlation_id().clone(),
-            StoreRevision(0),
-            DomainError::new(
-                DomainErrorCode::InvalidArgument,
-                "The memory request is invalid.",
-            ),
-        )
-    }
-
-    async fn backend_error(
-        &self,
-        correlation_id: CorrelationId,
-        error: ReadBackendError,
-    ) -> CallToolResult {
-        let revision = self.current_store_revision().await;
-        error_result(correlation_id, revision, public_error(&error))
-    }
-
-    async fn current_store_revision(&self) -> StoreRevision {
-        blocking_backend_call(Arc::clone(&self.backend), |backend| {
-            backend.store_revision()
-        })
-        .await
-        .unwrap_or(StoreRevision(0))
-    }
-
-    fn mutation_error(
-        &self,
-        correlation_id: CorrelationId,
-        error: MutationBackendError,
-    ) -> CallToolResult {
-        let (error, store_revision) = error.into_parts();
-        error_result(correlation_id, store_revision, public_error(&error))
-    }
-
-    fn pre_backend_mutation_error(
-        &self,
-        correlation_id: CorrelationId,
-        error: ReadBackendError,
-    ) -> CallToolResult {
-        error_result(correlation_id, StoreRevision(0), public_error(&error))
+    /// Wait until every mutating call accepted by this server has finished.
+    /// Read-only calls wait on this same barrier but are never detached or counted.
+    pub async fn wait_for_in_flight_mutations(&self) {
+        self.in_flight.wait_for_idle().await;
     }
 }
 
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for JianduReadServer {
-    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[ProtocolVersion::V_2025_11_25])
-    }
-
-    fn get_info(&self) -> InitializeResult {
-        let health = self.backend.health();
-        let health_value = serde_json::to_value(&health).unwrap_or_else(|_| {
-            json!({
-                "store": "degraded",
-                "index": "degraded",
-                "exactRead": false,
-                "list": false,
-                "search": false
-            })
-        });
-        let mut jiandu = JsonObject::new();
-        jiandu.insert(
-            "apiVersion".to_owned(),
-            Value::String(API_VERSION.to_owned()),
-        );
-        jiandu.insert("health".to_owned(), health_value);
-        jiandu.insert(
-            "optionalCapabilities".to_owned(),
-            serde_json::to_value([OptionalCapability::Resources])
-                .expect("closed optional capabilities are JSON serializable"),
-        );
-        let mut experimental = ExperimentalCapabilities::new();
-        experimental.insert("jiandu".to_owned(), jiandu);
-        let capabilities = ServerCapabilities::builder()
-            .enable_experimental_with(experimental)
-            .enable_resources()
-            .enable_tools()
-            .build();
-        InitializeResult::new(capabilities)
-            .with_protocol_version(ProtocolVersion::V_2025_11_25)
-            .with_server_info(Implementation::new("jiandu", env!("CARGO_PKG_VERSION")))
-    }
-
-    async fn list_resources(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        reject_protocol_cursor(request)?;
-        Ok(ListResourcesResult::with_all_items(
-            resource::concrete_resources(),
-        ))
-    }
-
-    async fn list_resource_templates(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        reject_protocol_cursor(request)?;
-        Ok(ListResourceTemplatesResult::with_all_items(
-            resource::templates(),
-        ))
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResponse, ErrorData> {
-        let uri = request.uri;
-        let correlation_id = next_correlation_id();
-        let parsed = resource::parse(&uri).map_err(|()| resource_not_found())?;
-        match parsed {
-            ResourceRequest::Get(request) => {
-                let backend = Arc::clone(&self.backend);
-                let authorization = self.authorization.clone();
-                let read = blocking_backend_call(backend, move |backend| {
-                    backend.get(&authorization, &request)
-                })
-                .await
-                .map_err(resource_backend_error)?;
-                resource_result(uri, correlation_id, read.store_revision, read.result)
-            }
-            ResourceRequest::List(request) => {
-                let backend = Arc::clone(&self.backend);
-                let authorization = self.authorization.clone();
-                let read = blocking_backend_call(backend, move |backend| {
-                    backend.list(&authorization, &request)
-                })
-                .await
-                .map_err(resource_backend_error)?;
-                resource_result(uri, correlation_id, read.store_revision, read.result)
-            }
-        }
-    }
-}
-
-async fn blocking_backend_call<T>(
-    backend: Arc<dyn McpReadBackend>,
-    operation: impl FnOnce(&dyn McpReadBackend) -> Result<T, ReadBackendError> + Send + 'static,
-) -> Result<T, ReadBackendError>
-where
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || operation(backend.as_ref()))
-        .await
-        .unwrap_or(Err(ReadBackendError::HostUnavailable))
-}
-
-fn decode_request<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, ()> {
-    serde_json::from_value(Value::Object(arguments)).map_err(|_| ())
-}
-
-fn core_request_schema(name: &'static str) -> Arc<JsonObject> {
-    let schema = jiandu_core::generated_contract_schemas()
-        .remove(name)
-        .unwrap_or_else(|| panic!("missing checked core schema {name}"));
-    let Value::Object(schema) = schema else {
-        panic!("checked core request schema {name} must be an object")
-    };
-    Arc::new(schema)
-}
-
-fn decode_validated_request<T>(arguments: JsonObject) -> Result<T, ()>
-where
-    T: DeserializeOwned + Validate,
-{
-    let request: T = decode_request(arguments)?;
-    request.validate().map_err(|_| ())?;
-    Ok(request)
-}
-
-fn next_correlation_id() -> CorrelationId {
-    CorrelationId::new(format!("req_mcp_{}", Uuid::new_v4().simple()))
-        .expect("UUID-derived correlation IDs satisfy the core grammar")
-}
-
-fn next_mutation_invocation() -> MutationInvocation {
-    let correlation_id = CorrelationId::new(format!("req_txn_{}", Uuid::new_v4().simple()))
-        .expect("UUID-derived mutation correlations satisfy the core ID grammar");
-    MutationInvocation::new(correlation_id)
-        .expect("UUIDv4-derived correlations satisfy the mutation invocation contract")
-}
-
-fn success_result<T: Serialize>(
-    correlation_id: CorrelationId,
-    store_revision: StoreRevision,
-    result: T,
-    summary: &'static str,
-) -> CallToolResult {
-    let envelope = ResultEnvelope {
-        api_version: ApiVersion::default(),
-        correlation_id,
-        store_revision,
-        result,
-    };
-    let structured = serde_json::to_value(ToolEnvelope::Success(envelope))
-        .expect("public result envelopes are JSON serializable");
-    let mut output = CallToolResult::structured(structured);
-    output.content = vec![ContentBlock::text(summary)];
-    output
-}
-
-fn error_result(
-    correlation_id: CorrelationId,
-    store_revision: StoreRevision,
-    error: DomainError,
-) -> CallToolResult {
-    let code = serde_json::to_value(error.code)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "INTERNAL".to_owned());
-    let envelope = ErrorEnvelope {
-        api_version: ApiVersion::default(),
-        correlation_id,
-        store_revision,
-        error,
-    };
-    let structured = serde_json::to_value(ToolEnvelope::<Value>::Error(envelope))
-        .expect("public error envelopes are JSON serializable");
-    let mut output = CallToolResult::structured_error(structured);
-    output.content = vec![ContentBlock::text(format!(
-        "Memory operation failed: {code}."
-    ))];
-    output
-}
-
-fn public_error(error: &ReadBackendError) -> DomainError {
-    match error {
-        ReadBackendError::Store(error) => match error.code() {
-            StoreErrorCode::Unauthenticated => DomainError::new(
-                DomainErrorCode::Unauthenticated,
-                "The connection is not authenticated.",
-            ),
-            StoreErrorCode::Forbidden => DomainError::new(
-                DomainErrorCode::Forbidden,
-                "The memory operation is not authorized.",
-            ),
-            StoreErrorCode::InvalidRequest
-            | StoreErrorCode::InvalidCursor
-            | StoreErrorCode::StaleCursor => DomainError::new(
-                DomainErrorCode::InvalidArgument,
-                "The memory request is invalid.",
-            ),
-            StoreErrorCode::NotFound => {
-                DomainError::new(DomainErrorCode::NotFound, "The memory is not available.")
-            }
-            StoreErrorCode::RevisionConflict => {
-                let domain = DomainError::new(
-                    DomainErrorCode::RevisionConflict,
-                    "The memory revision changed.",
-                );
-                if let StoreError::RevisionConflict { current_revision } = error {
-                    domain.with_detail("currentRevision", current_revision.get())
-                } else {
-                    domain
-                }
-            }
-            StoreErrorCode::IdempotencyConflict => DomainError::new(
-                DomainErrorCode::IdempotencyConflict,
-                "The idempotency key was already used for different input.",
-            ),
-            _ => DomainError::new(
-                DomainErrorCode::StoreUnavailable,
-                "Canonical memory storage is unavailable.",
-            ),
-        },
-        ReadBackendError::Index(error) => match error.code() {
-            IndexErrorCode::InvalidRequest
-            | IndexErrorCode::InvalidCursor
-            | IndexErrorCode::StaleCursor => DomainError::new(
-                DomainErrorCode::InvalidArgument,
-                "The memory request is invalid.",
-            ),
-            IndexErrorCode::Unauthenticated => DomainError::new(
-                DomainErrorCode::Unauthenticated,
-                "The connection is not authenticated.",
-            ),
-            IndexErrorCode::Forbidden => DomainError::new(
-                DomainErrorCode::Forbidden,
-                "The memory operation is not authorized.",
-            ),
-            _ => DomainError::new(
-                DomainErrorCode::IndexDegraded,
-                "Lexical memory search is temporarily unavailable.",
-            ),
-        },
-        ReadBackendError::Policy(MutationPolicyError::InvalidRequest) => DomainError::new(
-            DomainErrorCode::InvalidArgument,
-            "The memory request violates configured policy.",
-        ),
-        ReadBackendError::Policy(MutationPolicyError::Forbidden) => DomainError::new(
-            DomainErrorCode::Forbidden,
-            "The memory operation is not authorized.",
-        ),
-        ReadBackendError::Policy(MutationPolicyError::Unavailable) => DomainError::new(
-            DomainErrorCode::StoreUnavailable,
-            "Canonical memory storage is unavailable.",
-        ),
-        ReadBackendError::UnstableSearchSnapshot => DomainError::new(
-            DomainErrorCode::IndexDegraded,
-            "Lexical memory search is temporarily unavailable.",
-        ),
-        ReadBackendError::HostUnavailable => DomainError::new(
-            DomainErrorCode::StoreUnavailable,
-            "Canonical memory storage is unavailable.",
-        ),
-    }
-}
-
-fn reject_protocol_cursor(request: Option<PaginatedRequestParams>) -> Result<(), ErrorData> {
-    if request.is_some_and(|request| request.cursor.is_some()) {
-        return Err(ErrorData::invalid_params(
-            "Resource pagination is not supported.",
-            None,
-        ));
-    }
+/// Run one configured memory server over stdin/stdout.
+///
+/// The binary crate only needs to construct its concrete memory backend and
+/// execution context, then pass them to [`MemoryServer::new`] and this function.
+pub async fn serve_stdio(
+    server: MemoryServer,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let in_flight = Arc::clone(&server.in_flight);
+    let service = server.serve(rmcp::transport::stdio()).await?;
+    let transport_result = service.waiting().await;
+    // EOF/disconnect ends the transport waiter, but accepted owned mutations
+    // still need this runtime. Drain them before returning to the binary, whose
+    // Tokio runtime may then shut down.
+    in_flight.wait_for_idle().await;
+    transport_result?;
     Ok(())
 }
 
-fn resource_result<T: Serialize>(
-    uri: String,
-    correlation_id: CorrelationId,
-    store_revision: StoreRevision,
-    result: T,
-) -> Result<ReadResourceResponse, ErrorData> {
-    let envelope = ResultEnvelope {
-        api_version: ApiVersion::default(),
-        correlation_id,
-        store_revision,
-        result,
-    };
-    let text = serde_json::to_string(&envelope)
-        .map_err(|_| ErrorData::internal_error("Memory resource is unavailable.", None))?;
-    Ok(ReadResourceResult::new(vec![
-        ResourceContents::text(text, uri).with_mime_type("application/json"),
-    ])
-    .into())
-}
+impl ServerHandler for MemoryServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("jiandu", env!("CARGO_PKG_VERSION")))
+            .with_instructions(MEMORY_SERVER_INSTRUCTIONS)
+    }
 
-fn resource_not_found() -> ErrorData {
-    ErrorData::resource_not_found("Memory resource not found.", None)
-}
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(vec![memory_tool()]))
+    }
 
-fn resource_backend_error(error: ReadBackendError) -> ErrorData {
-    match &error {
-        ReadBackendError::Store(store_error)
-            if matches!(
-                store_error.code(),
-                StoreErrorCode::NotFound
-                    | StoreErrorCode::Forbidden
-                    | StoreErrorCode::InvalidRequest
-                    | StoreErrorCode::InvalidCursor
-                    | StoreErrorCode::StaleCursor
-            ) =>
-        {
-            resource_not_found()
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        (name == MEMORY_TOOL_NAME).then(memory_tool)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        if request.name != MEMORY_TOOL_NAME {
+            return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
-        _ => ErrorData::internal_error("Memory resource is unavailable.", None),
+        let arguments = Value::Object(request.arguments.unwrap_or_default());
+        let result = match self.execute(arguments).await {
+            Ok(value) => success_result(value),
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+        };
+        Ok(result.into())
+    }
+}
+
+fn success_result(value: Value) -> CallToolResult {
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| "{\"success\":false}".to_string());
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(value);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, task::Poll};
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn read_only_execute_waits_for_the_internal_mutation_barrier() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let server = MemoryServer::new(
+            MemoryStore::new(directory.path()),
+            MemoryExecutionContext::new("session_read_barrier").expect("context"),
+        );
+
+        // Missing-memory lookup performs no asynchronous filesystem operation.
+        // Prove that premise so Pending below can only come from the barrier.
+        let mut unblocked =
+            Box::pin(server.execute(json!({"action": "get", "id": "missing-unblocked"})));
+        let unblocked_first_poll =
+            std::future::poll_fn(|context| Poll::Ready(unblocked.as_mut().poll(context))).await;
+        assert!(
+            matches!(
+                &unblocked_first_poll,
+                Poll::Ready(Err(MemoryError::Execution(message)))
+                    if message == "memory not found: missing-unblocked"
+            ),
+            "missing get should synchronously reach its handler: {unblocked_first_poll:?}"
+        );
+
+        let guard = server.in_flight.begin();
+        let mut blocked =
+            Box::pin(server.execute(json!({"action": "get", "id": "missing-blocked"})));
+        let blocked_first_poll =
+            std::future::poll_fn(|context| Poll::Ready(blocked.as_mut().poll(context))).await;
+        assert!(
+            matches!(&blocked_first_poll, Poll::Pending),
+            "read-only execute bypassed the in-flight mutation barrier: {blocked_first_poll:?}"
+        );
+
+        drop(guard);
+        assert_eq!(
+            blocked.await.expect_err("missing memory remains an error"),
+            MemoryError::Execution("memory not found: missing-blocked".to_string())
+        );
     }
 }

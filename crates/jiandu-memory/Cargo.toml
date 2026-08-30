@@ -1,6 +1,6 @@
 [package]
-name = "jiandu-mcp"
-description = "Stdio MCP server for the Jiandu shared memory system"
+name = "jiandu-memory"
+description = "Deterministic filesystem memory store with BM25/CJK recall"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono.workspace = true
 dashmap.workspace = true
-jiandu-memory = { version = "0.1.0", path = "../jiandu-memory" }
-rmcp = { workspace = true, features = ["transport-io"] }
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-rmcp = { workspace = true, features = ["client"] }
 tempfile.workspace = true
 
 [lints]
