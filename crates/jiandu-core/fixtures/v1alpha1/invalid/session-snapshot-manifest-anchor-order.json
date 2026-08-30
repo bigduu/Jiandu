@@ -1,0 +1,27 @@
+{
+  "schema": "jiandu.dev/session-snapshot-manifest/v1alpha1",
+  "event": {
+    "schema": "jiandu.dev/branch-snapshot-event/v1alpha1",
+    "eventId": "evt_01K4SNAPSHOT",
+    "sourceSessionId": "ses_01K4SOURCE",
+    "sourceBranchId": "br_01K4SOURCE",
+    "throughMessageId": "msg_000042",
+    "targetSessionId": "ses_01K4TARGET",
+    "targetBranchId": "br_01K4TARGET",
+    "mode": "snapshot",
+    "occurredAt": "2026-08-30T04:17:10Z"
+  },
+  "sourceStoreRevision": 42,
+  "visibleRecords": [
+    {
+      "memoryId": "mem_01K4OMEGA",
+      "revision": 7,
+      "etag": "sha256:9999999999999999"
+    },
+    {
+      "memoryId": "mem_01K4ALPHA",
+      "revision": 3,
+      "etag": "sha256:1111111111111111"
+    }
+  ]
+}

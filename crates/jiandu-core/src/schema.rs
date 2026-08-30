@@ -3,6 +3,7 @@
 use crate::auth::TrustedRequestContext;
 use crate::error::{ErrorEnvelope, ResultEnvelope};
 use crate::frontmatter::MemoryFrontmatterV1Alpha1;
+use crate::lineage::{BranchSnapshotEvent, SessionSnapshotManifest};
 use crate::memory::MemoryRecord;
 use crate::mutation::{
     ForgetMemoryCommand, ForgetMemoryResult, RememberMemoryCommand, RememberMemoryResult,
@@ -22,6 +23,10 @@ use std::collections::BTreeMap;
 #[must_use]
 pub fn generated_contract_schemas() -> BTreeMap<&'static str, Value> {
     BTreeMap::from([
+        (
+            "branch-snapshot-event.schema.json",
+            schema_value::<BranchSnapshotEvent>(),
+        ),
         (
             "error-envelope.schema.json",
             schema_value::<ErrorEnvelope>(),
@@ -70,6 +75,10 @@ pub fn generated_contract_schemas() -> BTreeMap<&'static str, Value> {
         (
             "remember-memory-result-envelope.schema.json",
             schema_value::<ResultEnvelope<RememberMemoryResult>>(),
+        ),
+        (
+            "session-snapshot-manifest.schema.json",
+            schema_value::<SessionSnapshotManifest>(),
         ),
         (
             "trusted-request-context.schema.json",

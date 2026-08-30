@@ -4,7 +4,7 @@
 
 The name refers to the bamboo and wooden slips used for durable written records. Jiandu applies the same idea to agents: memory is stored as inspectable records, owned by one standalone service, and shared through a stable protocol instead of being embedded in one agent runtime.
 
-> Status: architecture, agent-neutral `v1alpha1` Rust contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a reviewed offline Bamboo snapshot adapter, a deterministic disposable Unicode/CJK lexical index, an authenticated MCP read/mutation handler, and a singleton loopback Streamable HTTP daemon with bounded response drain. Remaining service work is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
+> Status: architecture, agent-neutral `v1alpha1` Rust memory and immutable Session-snapshot contracts, a canonical-store core with exclusive ownership, validated reads, atomic/idempotent mutations, validation/export/import/recovery support, a reviewed offline Bamboo snapshot adapter, a deterministic disposable Unicode/CJK lexical index, an authenticated MCP read/mutation handler, and a singleton loopback Streamable HTTP daemon with bounded response drain. Snapshot persistence and copy-on-write remain separate work. Remaining service work is tracked in [the standalone-service epic](https://github.com/bigduu/Jiandu/issues/1) and delivered through small, independently testable issues.
 
 ## Why Jiandu exists
 
@@ -64,6 +64,7 @@ MCP does not force a client to inject context. Jiandu returns memory records; th
 - [Architecture](docs/architecture.md)
 - [MCP API v0](docs/mcp-api-v0.md)
 - [Data model, filesystem, scopes, and lineage](docs/data-model.md)
+- [Session snapshot contracts v1alpha1](docs/session-snapshot-contract-v1alpha1.md)
 - [Canonical store format v1alpha4](docs/store-format-v1alpha4.md)
 - [Validation report and portable export v1alpha1](docs/portable-export-v1alpha1.md)
 - [Portable import and backup metadata v1alpha1](docs/portable-import-v1alpha1.md)

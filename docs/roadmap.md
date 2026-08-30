@@ -99,9 +99,12 @@ Outcome: at least two independent MCP clients can use the same Jiandu service sa
 Tracking issues:
 
 - [#11 — Session snapshots and copy-on-write branch semantics](https://github.com/bigduu/Jiandu/issues/11)
+  - [#44 — immutable Session snapshot event and visibility contracts](https://github.com/bigduu/Jiandu/issues/44)
+    — agent-neutral contract foundation
 - [#12 — committed turn and branch lifecycle event ingestion](https://github.com/bigduu/Jiandu/issues/12)
 
-- Define idempotent committed-turn and branch event contracts.
+- Define the strict branch-event intent and immutable exact-record visibility
+  contracts (#44), then add independently idempotent committed-event ingestion.
 - Implement Session snapshot, copy-through-message watermarks, and copy-on-write memory semantics.
 - Add a two-client conformance harness and transport failure tests.
 - Document remote deployment requirements without enabling an insecure default.
