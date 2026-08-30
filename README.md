@@ -56,6 +56,17 @@ use Jiandu's API. Direct edits to canonical files are unsupported and can bypass
 the concurrency contract. Session notes are intentionally isolated by
 `session-id`; do not share one Session identity across independent processes.
 
+After MCP argument validation, Jiandu executes the complete call in an owned
+server task. Cancelling the request waiter or disconnecting the client detaches
+that task instead of aborting it halfway through a blocking filesystem operation;
+the same-scope guard remains held until the operation returns. The stdio server
+tracks only mutating calls and drains them after transport EOF/disconnect before
+returning, so its normal runtime shutdown does not cut them off. A forced process
+or runtime termination can still end outstanding work. This is an MCP-surface
+guarantee, not a cancellation guarantee on direct `MemoryStore` mutation
+futures: native callers must keep those futures alive to completion or provide
+equivalent owned-task supervision.
+
 Recall access logging remains a best-effort soft signal outside the durable
 scope lock. Under cross-process recall load, a sample can be lost (especially
 during rare log compaction); this can only make later capacity ranking slightly
@@ -64,10 +75,11 @@ fail the recall that produced the sample.
 
 A mutation is not a filesystem-wide transaction. A call can return an error
 after its canonical memory document was committed but before an audit or
-rebuildable artifact completed. After any mutation failure, run `inspect` first.
-If canonical documents committed but derived artifacts are stale, run `rebuild`,
-then use `query` or `get` to verify current state before choosing the next
-action; never blindly retry.
+rebuildable artifact completed; cancellation or disconnect can also leave an
+accepted owned mutation running. After any failure or interrupted response, run
+`inspect` first. If canonical documents committed but derived artifacts are
+stale, run `rebuild`, then use `query` or `get` to verify current state before
+choosing the next action; never blindly retry.
 
 During MCP initialization Jiandu returns concise usage instructions, so hosts
 that surface server instructions can teach the connected agent when to recall,

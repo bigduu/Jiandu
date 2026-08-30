@@ -24,8 +24,8 @@ use super::{
     build_memory_markdown_view, build_recent_markdown_view, build_stale_markdown_view,
     derive_summary, detect_entities, extract_keywords, make_query_cursor, match_memory_query,
     normalize_tags, now_rfc3339, parse_markdown_document, parse_query_cursor, parse_rfc3339,
-    render_markdown_document, short_stable_hash, sort_memories_desc, validate_memory_id,
-    validate_memory_title, validate_session_id, validate_session_topic,
+    render_markdown_document, sort_memories_desc, validate_memory_id, validate_memory_title,
+    validate_session_id, validate_session_topic,
 };
 use super::{
     BlobScanItem, BlobScanReport, DuplicateCluster, DuplicateClusterMember, DuplicateScanReport,
@@ -135,6 +135,28 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
         + content.chars().count()
 }
 
+/// Deterministic candidate id for one allocation attempt. Scope and opaque
+/// Project identity are part of the hash domain, so same-second same-title writes
+/// in Global and different Projects do not manufacture the same id. The complete
+/// 64-bit `DefaultHasher` output is retained (16 hex characters).
+fn memory_id_candidate(
+    scope: MemoryScope,
+    project_key: Option<&str>,
+    title: &str,
+    timestamp: &str,
+    counter: usize,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.hash(&mut hasher);
+    project_key.hash(&mut hasher);
+    title.hash(&mut hasher);
+    timestamp.hash(&mut hasher);
+    counter.hash(&mut hasher);
+    format!("mem_{timestamp}_{:016x}", hasher.finish())
+}
+
 /// Process-global registry of local per-scope write locks.
 ///
 /// `MemoryStore` is cheap to construct or clone and may exist at many call sites,
@@ -155,11 +177,39 @@ fn scope_locks() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
     SCOPE_LOCKS.get_or_init(DashMap::new)
 }
 
+#[cfg(test)]
+struct ResolveThenLockTestHook {
+    resolved: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn resolve_then_lock_test_hooks() -> &'static DashMap<String, Arc<ResolveThenLockTestHook>> {
+    static HOOKS: OnceLock<DashMap<String, Arc<ResolveThenLockTestHook>>> = OnceLock::new();
+    HOOKS.get_or_init(DashMap::new)
+}
+
+#[cfg(test)]
+async fn pause_after_initial_resolution_for_test(id: &str) {
+    let Some(hook) = resolve_then_lock_test_hooks()
+        .get(id)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return;
+    };
+    hook.resolved.notify_one();
+    hook.resume.notified().await;
+    resolve_then_lock_test_hooks().remove(id);
+}
+
 /// Owning guard for the OS advisory lock of one durable scope.
 ///
 /// `std::fs::File::lock` is blocking, so acquisition happens on Tokio's blocking
-/// pool. Dropping this owner releases the lock even on early return, panic unwind,
-/// or task cancellation after acquisition.
+/// pool. Dropping this owner releases the lock on normal return, error, or panic.
+/// Cancelling a direct `MemoryStore` future can drop it too early while an
+/// underlying Tokio filesystem blocking operation is still running; direct
+/// callers must therefore drive durable mutator futures to completion. Jiandu's
+/// MCP surface enforces that rule with owned mutation tasks.
 struct AdvisoryScopeLock {
     file: std::fs::File,
 }
@@ -178,6 +228,15 @@ struct ScopeWriteGuard {
     _local: OwnedMutexGuard<()>,
 }
 
+/// Filesystem-backed Session and durable Project/Global memory operations.
+///
+/// Cancellation contract: direct mutator futures are not cancellation
+/// safe and must be driven to completion (or supervised in an equivalent owned
+/// task). Cancelling one after it acquires a scope guard can release that guard
+/// while a Tokio filesystem blocking operation is still finishing. The
+/// `jiandu-mcp` server provides owned-task supervision and shutdown draining for
+/// its public MCP mutation surface; native consumers must provide the same
+/// lifecycle discipline themselves.
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     resolver: MemoryPathResolver,
@@ -701,17 +760,17 @@ impl MemoryStore {
 
         if let Some(project_key) = preferred_project_key {
             if let Some(doc) = self
-                .get_memory_in_scope(MemoryScope::Project, Some(project_key), id)
+                .get_memory_at_locator(MemoryScope::Project, Some(project_key), id)
                 .await?
             {
                 return Ok(Some(doc));
             }
             return self
-                .get_memory_in_scope(MemoryScope::Global, None, id)
+                .get_memory_at_locator(MemoryScope::Global, None, id)
                 .await;
         }
 
-        self.get_memory_in_scope(MemoryScope::Global, None, id)
+        self.get_memory_at_locator(MemoryScope::Global, None, id)
             .await
     }
 
@@ -917,6 +976,8 @@ impl MemoryStore {
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        pause_after_initial_resolution_for_test(id).await;
         let _guard = self
             .acquire_scope_write_guard(
                 doc.frontmatter.scope,
@@ -926,7 +987,14 @@ impl MemoryStore {
         // Re-read under the lock so the mutation is applied to the latest
         // committed state, not a pre-lock snapshot another writer may have
         // superseded in the meantime (#235).
-        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+        let Some(fresh) = self
+            .get_memory_at_locator(
+                doc.frontmatter.scope,
+                doc.frontmatter.project_key.as_deref(),
+                id,
+            )
+            .await?
+        else {
             return Ok(None);
         };
         doc = fresh;
@@ -1007,7 +1075,7 @@ impl MemoryStore {
         let project_key = project_key_owned.as_deref();
         let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
         // Re-read under the lock to avoid splitting a stale pre-lock snapshot (#235).
-        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+        let Some(fresh) = self.get_memory_at_locator(scope, project_key, id).await? else {
             return Ok(None);
         };
         source = fresh;
@@ -1427,7 +1495,7 @@ impl MemoryStore {
         let mut fresh_sources = Vec::with_capacity(sources.len());
         for source in &sources {
             let Some(doc) = self
-                .get_memory(&source.frontmatter.id, preferred_project_key)
+                .get_memory_at_locator(scope, project_key, &source.frontmatter.id)
                 .await?
             else {
                 return Ok(None);
@@ -1642,7 +1710,14 @@ impl MemoryStore {
             )
             .await?;
         // Re-read under the lock so a concurrent mutation isn't clobbered (#235).
-        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+        let Some(fresh) = self
+            .get_memory_at_locator(
+                target.frontmatter.scope,
+                target.frontmatter.project_key.as_deref(),
+                id,
+            )
+            .await?
+        else {
             return Ok(None);
         };
         target = fresh;
@@ -1654,7 +1729,7 @@ impl MemoryStore {
 
         for source_id in requested_ids {
             if self
-                .get_memory_in_scope(
+                .get_memory_at_locator(
                     target.frontmatter.scope,
                     target.frontmatter.project_key.as_deref(),
                     &source_id,
@@ -1769,7 +1844,14 @@ impl MemoryStore {
             )
             .await?;
         // Re-read under the lock so the merge isn't applied to a stale snapshot (#235).
-        let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
+        let Some(fresh) = self
+            .get_memory_at_locator(
+                doc.frontmatter.scope,
+                doc.frontmatter.project_key.as_deref(),
+                id,
+            )
+            .await?
+        else {
             return Ok(None);
         };
         doc = fresh;
@@ -1843,7 +1925,7 @@ impl MemoryStore {
         let mut superseded_ids = Vec::new();
         for source_id in &source_ids {
             if let Some(mut source_doc) = self
-                .get_memory_in_scope(
+                .get_memory_at_locator(
                     doc.frontmatter.scope,
                     doc.frontmatter.project_key.as_deref(),
                     source_id,
@@ -2358,7 +2440,7 @@ impl MemoryStore {
         Ok(true)
     }
 
-    async fn get_memory_in_scope(
+    async fn get_memory_at_locator(
         &self,
         scope: MemoryScope,
         project_key: Option<&str>,
@@ -2366,17 +2448,28 @@ impl MemoryStore {
     ) -> io::Result<Option<DurableMemoryDocument>> {
         let id = validate_memory_id(id)?;
         let project_key = self.require_project_key(scope, project_key)?;
+        let expected_project_key = match scope {
+            MemoryScope::Project => project_key,
+            MemoryScope::Global | MemoryScope::Session => None,
+        };
         for root in self.resolver.scope_read_roots(scope, project_key) {
             let path = root.join(super::TOPICS_DIR).join(format!("{id}.md"));
             if !path.exists() {
                 continue;
             }
             let raw = fs::read_to_string(&path).await?;
-            let (mut frontmatter, body) = parse_markdown_document(&raw)?;
-            if scope == MemoryScope::Project
-                && let Some(project_id) = self.resolver.project_id()
+            let (frontmatter, body) = parse_markdown_document(&raw)?;
+            if frontmatter.id != id
+                || frontmatter.scope != scope
+                || frontmatter.project_key.as_deref() != expected_project_key
             {
-                frontmatter.project_key = Some(project_id.to_string());
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "memory '{}' frontmatter id/scope/project does not match its canonical locator",
+                        frontmatter.id
+                    ),
+                ));
             }
             return Ok(Some(DurableMemoryDocument {
                 frontmatter,
@@ -2406,9 +2499,7 @@ impl MemoryStore {
     ) -> io::Result<String> {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
         for counter in 0..1000 {
-            let seed = format!("{}:{}:{}", title, timestamp, counter);
-            let suffix = short_stable_hash(&seed).unwrap_or_else(|| "00000000".to_string());
-            let id = format!("mem_{}_{}", timestamp, &suffix[..6.min(suffix.len())]);
+            let id = memory_id_candidate(scope, project_key, title, &timestamp, counter);
             let path = self.resolver.topic_path(scope, project_key, &id)?;
             if !path.exists() {
                 return Ok(id);
@@ -4382,6 +4473,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn same_second_same_title_ids_differ_across_global_and_projects() {
+        let timestamp = "20260830_123456";
+        let title = "Same title in three canonical scopes";
+        let global = memory_id_candidate(MemoryScope::Global, None, title, timestamp, 0);
+        let project_a =
+            memory_id_candidate(MemoryScope::Project, Some("project_a"), title, timestamp, 0);
+        let project_b =
+            memory_id_candidate(MemoryScope::Project, Some("project_b"), title, timestamp, 0);
+
+        assert_ne!(global, project_a);
+        assert_ne!(global, project_b);
+        assert_ne!(project_a, project_b);
+        for id in [global, project_a, project_b] {
+            assert_eq!(id.rsplit('_').next().unwrap().len(), 16);
+            validate_memory_id(&id).unwrap();
+        }
+    }
+
     /// A mutation may commit its canonical Markdown document before a later
     /// audit/index/view step fails. Keep this observable so callers do not assume
     /// an error makes a blind retry safe.
@@ -4998,6 +5108,129 @@ mod tests {
             contradicted.contains(&source_b),
             "source B append lost (contradicted_by = {contradicted:?})"
         );
+    }
+
+    /// Project-first lookup is only the initial resolver. Once that lookup chose
+    /// Global and the method acquired the Global lock, a same-id Project record
+    /// appearing in the meantime must not redirect the locked re-read.
+    #[tokio::test]
+    async fn cross_scope_same_id_race_keeps_locked_mutation_in_resolved_scope() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let project_key = "proj-scope-race";
+        let global = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Global record selected before lock",
+                "The initial Project-first lookup falls back to this Global record.",
+                &[],
+                Some("scope-race-session"),
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let id = global.frontmatter.id.clone();
+
+        let hook = Arc::new(ResolveThenLockTestHook {
+            resolved: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        resolve_then_lock_test_hooks().insert(id.clone(), Arc::clone(&hook));
+
+        let archive_store = store.clone();
+        let archive_id = id.clone();
+        let archive = tokio::spawn(async move {
+            archive_store
+                .archive_memory(
+                    &archive_id,
+                    Some(project_key),
+                    DurableMemoryStatus::Archived,
+                    Some("controlled cross-scope race"),
+                )
+                .await
+        });
+
+        hook.resolved.notified().await;
+        let mut project = global.clone();
+        project.frontmatter.scope = MemoryScope::Project;
+        project.frontmatter.project_key = Some(project_key.to_string());
+        project.frontmatter.title = "Project record created during lock race".to_string();
+        project.path = store
+            .resolver()
+            .topic_path(MemoryScope::Project, Some(project_key), &id)
+            .unwrap();
+        store.write_document(&project).await.unwrap();
+        hook.resume.notify_one();
+
+        let archived = archive
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("originally resolved Global record still exists");
+        assert_eq!(archived.frontmatter.scope, MemoryScope::Global);
+
+        let global_after = store
+            .get_memory_at_locator(MemoryScope::Global, None, &id)
+            .await
+            .unwrap()
+            .expect("Global record");
+        let project_after = store
+            .get_memory_at_locator(MemoryScope::Project, Some(project_key), &id)
+            .await
+            .unwrap()
+            .expect("Project record");
+        assert_eq!(
+            global_after.frontmatter.status,
+            DurableMemoryStatus::Archived
+        );
+        assert_eq!(
+            project_after.frontmatter.status,
+            DurableMemoryStatus::Active
+        );
+        assert_eq!(
+            project_after.frontmatter.title,
+            "Project record created during lock race"
+        );
+    }
+
+    #[tokio::test]
+    async fn locator_frontmatter_scope_mismatch_fails_closed() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let mut doc = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Corrupted locator fixture",
+                "The file stays in Global while its frontmatter is forged as Project.",
+                &[],
+                Some("scope-validation-session"),
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        doc.frontmatter.scope = MemoryScope::Project;
+        doc.frontmatter.project_key = Some("forged_project".to_string());
+        store.write_document(&doc).await.unwrap();
+
+        let error = store
+            .archive_memory(
+                &doc.frontmatter.id,
+                None,
+                DurableMemoryStatus::Archived,
+                Some("must not follow forged frontmatter"),
+            )
+            .await
+            .expect_err("locator/frontmatter mismatch must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("canonical locator"));
     }
 
     #[tokio::test]

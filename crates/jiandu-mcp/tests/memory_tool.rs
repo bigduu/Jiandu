@@ -5,6 +5,8 @@ use jiandu_mcp::{
     MemoryExecutionContext, MemoryServer, MemoryToolClass, memory_tool,
 };
 use jiandu_memory::memory_store::{MAX_MEMORY_ID_LEN, MemoryStore};
+#[cfg(unix)]
+use jiandu_memory::memory_store::{MemoryScope, WRITE_AUDIT_LOG};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, JsonObject, ProtocolVersion},
@@ -46,6 +48,140 @@ async fn write_global(server: &MemoryServer, title: &str, content: &str) -> Stri
         .as_str()
         .expect("memory id")
         .to_string()
+}
+
+/// A cancelled MCP request must detach, not abort, a mutation whose Tokio
+/// filesystem open is still blocked while holding the durable scope guard.
+/// Otherwise a second writer could enter while that abandoned blocking open is
+/// still live.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = MemoryStore::new(directory.path());
+    let audit_path = store
+        .resolver()
+        .logs_dir(MemoryScope::Global, None)
+        .join(WRITE_AUDIT_LOG);
+    std::fs::create_dir_all(audit_path.parent().expect("audit parent")).expect("logs dir");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&audit_path)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "create a controllably blocking audit sink"
+    );
+
+    let server = std::sync::Arc::new(MemoryServer::new(
+        store.clone(),
+        MemoryExecutionContext::new("session_cancel").expect("context"),
+    ));
+    let first_server = std::sync::Arc::clone(&server);
+    let first_waiter = tokio::spawn(async move {
+        first_server
+            .execute(json!({
+                "action": "write",
+                "scope": "global",
+                "type": "reference",
+                "title": "Owned mutation survives waiter cancellation",
+                "content": "The canonical document commits before the audit FIFO is released.",
+                "options": {"allow_merge_if_similar": false}
+            }))
+            .await
+    });
+
+    let mut canonical_committed = false;
+    for _ in 0..500 {
+        if store
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list canonical docs")
+            .len()
+            == 1
+        {
+            canonical_committed = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        canonical_committed,
+        "first mutation reached its canonical write"
+    );
+    // Let the owned mutation advance from the canonical rename to the FIFO open,
+    // where it remains blocked while still owning the scope guard.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !first_waiter.is_finished(),
+        "audit FIFO still blocks the call"
+    );
+
+    first_waiter.abort();
+    assert!(
+        first_waiter
+            .await
+            .expect_err("waiter was cancelled")
+            .is_cancelled(),
+        "outer MCP waiter cancellation is observed"
+    );
+
+    let drain_server = std::sync::Arc::clone(&server);
+    let drain_waiter = tokio::spawn(async move {
+        drain_server.wait_for_in_flight_mutations().await;
+    });
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let drain_finished_before_first_io = drain_waiter.is_finished();
+
+    let second_server = std::sync::Arc::clone(&server);
+    let second_waiter = tokio::spawn(async move {
+        second_server
+            .execute(json!({"action": "rebuild", "scope": "global"}))
+            .await
+    });
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let second_finished_before_first_io = second_waiter.is_finished();
+
+    // Always release the blocking syscall before asserting, so even a broken
+    // implementation cannot strand Tokio's blocking pool during test teardown.
+    let reader_path = audit_path.clone();
+    let audit_reader = std::thread::spawn(move || {
+        use std::io::Read;
+
+        let mut raw = String::new();
+        std::fs::File::open(reader_path)
+            .expect("open audit FIFO reader")
+            .read_to_string(&mut raw)
+            .expect("read audit FIFO");
+        raw
+    });
+    let rebuild = second_waiter
+        .await
+        .expect("second waiter joins")
+        .expect("rebuild succeeds after first mutation releases the guard");
+    drain_waiter.await.expect("mutation drain joins");
+    let audit = audit_reader.join().expect("audit reader joins");
+
+    assert!(
+        !drain_finished_before_first_io,
+        "in-flight drain must wait for the cancelled waiter's owned mutation"
+    );
+    assert!(
+        !second_finished_before_first_io,
+        "second same-scope writer entered before the cancelled waiter's underlying I/O ended"
+    );
+    assert_eq!(rebuild["action"], "rebuild");
+    assert!(
+        audit.contains("Owned mutation survives waiter cancellation"),
+        "detached owned mutation completed its audit write"
+    );
 }
 
 #[tokio::test]
@@ -824,6 +960,7 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         "not an all-or-nothing transaction",
         "committed canonical memory",
         "mutation error",
+        "cancellation or disconnect",
         "run `inspect` first",
         "run `rebuild`",
         "never blindly retry",
