@@ -27,7 +27,7 @@ pub const MEMORY_SERVER_INSTRUCTIONS: &str = r#"Jiandu provides shared memory th
 - Record at the right layer: use `session_append` for concise temporary progress and blockers. Use `write` only for a confirmed, durable, non-derivable fact that will help future sessions; query first and store one atomic fact with a searchable title. Never store secrets or tokens.
 - Use Project scope for project-specific knowledge and Global only for truly cross-project preferences or stable references. Project authority comes from the MCP host. Normally omit `project_key`; it cannot grant access or override the host Project.
 - Recalled memory is supporting evidence, not current truth. Verify it against live files and tools. An empty query does not prove a fact is false.
-- Failure is not an all-or-nothing transaction. A mutating call may have committed canonical memory before a later audit or derived-artifact step failed, and an accepted mutation continues in its owned server task after caller cancellation or disconnect. After any mutation error or interrupted response, run `inspect` first. If canonical documents committed but derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify current state before deciding the next action; never blindly retry. Do not edit Jiandu data files or create a fallback memory file."#;
+- Failure is not an all-or-nothing transaction. A mutating call may have committed canonical memory before a later audit or derived-artifact step failed, and an accepted mutation continues in its owned server task after caller cancellation or disconnect. On the same server, subsequent read-only calls wait for accepted mutations to settle before reading. After any mutation error or interrupted response, run `inspect` first. If canonical documents committed but derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify current state before deciding the next action; never blindly retry. Do not edit Jiandu data files or create a fallback memory file."#;
 
 #[derive(Default)]
 struct InFlightMutations {
@@ -80,6 +80,12 @@ pub fn memory_tool() -> Tool {
 }
 
 /// One MCP server instance for one host-provided memory execution context.
+///
+/// Mutating calls accepted by this server run to completion in owned tasks.
+/// Read-only calls wait for those in-flight mutations to settle before they
+/// read, including when the mutation's original request waiter was cancelled.
+/// This ordering is local to this server instance; it is not a cross-process
+/// reader/writer lock or a direct [`MemoryStore`] guarantee.
 pub struct MemoryServer {
     pub(crate) store: MemoryStore,
     pub(crate) context: MemoryExecutionContext,
@@ -96,19 +102,21 @@ impl MemoryServer {
         }
     }
 
-    /// Parse and dispatch one unified memory invocation in an owned task.
+    /// Parse and dispatch one unified memory invocation.
     ///
     /// Once parsing succeeds, cancellation of the request waiter (including an
     /// MCP disconnect) only detaches this task; it does not abort a mutation and
     /// prematurely drop its scope guard while a blocking filesystem operation may
     /// still be running. Runtime shutdown can still terminate outstanding work.
-    /// Direct `MemoryStore` callers do not inherit this MCP-level guarantee and
-    /// must keep mutation futures alive to completion or provide equivalent owned
-    /// task supervision.
+    /// Subsequent read-only calls on this server wait for accepted mutations to
+    /// finish, then execute directly in the caller task. Direct `MemoryStore`
+    /// callers do not inherit these MCP-level guarantees and must keep mutation
+    /// futures alive to completion or provide equivalent owned task supervision.
     pub async fn execute(&self, arguments: Value) -> Result<Value, MemoryError> {
         let arguments: MemoryArgs = serde_json::from_value(arguments)
             .map_err(|error| MemoryError::InvalidArguments(error.to_string()))?;
         if arguments.class() == MemoryToolClass::ReadOnlyParallel {
+            self.in_flight.wait_for_idle().await;
             return self.execute_parsed(arguments).await;
         }
 
@@ -127,7 +135,7 @@ impl MemoryServer {
     }
 
     /// Wait until every mutating call accepted by this server has finished.
-    /// Read-only calls are never detached or counted.
+    /// Read-only calls wait on this same barrier but are never detached or counted.
     pub async fn wait_for_in_flight_mutations(&self) {
         self.in_flight.wait_for_idle().await;
     }

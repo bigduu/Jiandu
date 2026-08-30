@@ -53,7 +53,8 @@ async fn write_global(server: &MemoryServer, title: &str, content: &str) -> Stri
 /// A cancelled MCP request must detach, not abort, a mutation whose Tokio
 /// filesystem open is still blocked while holding the durable scope guard.
 /// Otherwise a second writer could enter while that abandoned blocking open is
-/// still live.
+/// still live, or a same-server recovery read could observe the mutation before
+/// its derived artifacts settle.
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() {
@@ -129,6 +130,17 @@ async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() 
         "outer MCP waiter cancellation is observed"
     );
 
+    let read_server = std::sync::Arc::clone(&server);
+    let read_waiter = tokio::spawn(async move {
+        read_server
+            .execute(json!({"action": "inspect", "scope": "global"}))
+            .await
+    });
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let read_finished_before_first_io = read_waiter.is_finished();
+
     let drain_server = std::sync::Arc::clone(&server);
     let drain_waiter = tokio::spawn(async move {
         drain_server.wait_for_in_flight_mutations().await;
@@ -167,8 +179,16 @@ async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() 
         .expect("second waiter joins")
         .expect("rebuild succeeds after first mutation releases the guard");
     drain_waiter.await.expect("mutation drain joins");
+    let inspect = read_waiter
+        .await
+        .expect("read waiter joins")
+        .expect("inspect succeeds after accepted mutations settle");
     let audit = audit_reader.join().expect("audit reader joins");
 
+    assert!(
+        !read_finished_before_first_io,
+        "same-server recovery read completed before the cancelled waiter's mutation settled"
+    );
     assert!(
         !drain_finished_before_first_io,
         "in-flight drain must wait for the cancelled waiter's owned mutation"
@@ -178,6 +198,24 @@ async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() 
         "second same-scope writer entered before the cancelled waiter's underlying I/O ended"
     );
     assert_eq!(rebuild["action"], "rebuild");
+    assert_eq!(inspect["action"], "inspect");
+    assert_eq!(inspect["data"]["total_memories"], 1);
+    assert!(
+        inspect["data"]["view_files"]
+            .as_array()
+            .expect("view files")
+            .iter()
+            .any(|name| name == "MEMORY.md"),
+        "inspect observes the rebuilt memory view"
+    );
+    assert!(
+        inspect["data"]["index_files"]
+            .as_array()
+            .expect("index files")
+            .iter()
+            .any(|name| name == "lexical.json"),
+        "inspect observes the rebuilt lexical index"
+    );
     assert!(
         audit.contains("Owned mutation survives waiter cancellation"),
         "detached owned mutation completed its audit write"
@@ -961,6 +999,8 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         "committed canonical memory",
         "mutation error",
         "cancellation or disconnect",
+        "same server",
+        "subsequent read-only calls wait",
         "run `inspect` first",
         "run `rebuild`",
         "never blindly retry",

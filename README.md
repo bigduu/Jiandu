@@ -62,10 +62,13 @@ that task instead of aborting it halfway through a blocking filesystem operation
 the same-scope guard remains held until the operation returns. The stdio server
 tracks only mutating calls and drains them after transport EOF/disconnect before
 returning, so its normal runtime shutdown does not cut them off. A forced process
-or runtime termination can still end outstanding work. This is an MCP-surface
-guarantee, not a cancellation guarantee on direct `MemoryStore` mutation
-futures: native callers must keep those futures alive to completion or provide
-equivalent owned-task supervision.
+or runtime termination can still end outstanding work. On the same
+`MemoryServer`, subsequent read-only calls wait for all currently in-flight
+accepted mutations to settle before reading, including mutations whose original
+request waiter was cancelled. This is a server-local MCP ordering guarantee, not
+a cross-process reader/writer lock or a cancellation guarantee on direct
+`MemoryStore` mutation futures: native callers must keep those futures alive to
+completion or provide equivalent owned-task supervision.
 
 Recall access logging remains a best-effort soft signal outside the durable
 scope lock. Under cross-process recall load, a sample can be lost (especially
@@ -76,10 +79,12 @@ fail the recall that produced the sample.
 A mutation is not a filesystem-wide transaction. A call can return an error
 after its canonical memory document was committed but before an audit or
 rebuildable artifact completed; cancellation or disconnect can also leave an
-accepted owned mutation running. After any failure or interrupted response, run
-`inspect` first. If canonical documents committed but derived artifacts are
-stale, run `rebuild`, then use `query` or `get` to verify current state before
-choosing the next action; never blindly retry.
+accepted owned mutation running. A subsequent `inspect`, `query`, or `get` on
+that same server is ordered after the accepted mutation settles. After any
+failure or interrupted response, run `inspect` first. If canonical documents
+committed but derived artifacts are stale, run `rebuild`, then use `query` or
+`get` to verify current state before choosing the next action; never blindly
+retry.
 
 During MCP initialization Jiandu returns concise usage instructions, so hosts
 that surface server instructions can teach the connected agent when to recall,
