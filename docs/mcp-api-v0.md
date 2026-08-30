@@ -582,7 +582,7 @@ count, credential, identity, body, query, or private ledger state.
 
 ## Future event operations
 
-The following are intentionally outside the first public tool set and will be designed after the storage contract is proven:
+The following remain outside the first public tool set:
 
 - submit a committed conversation turn;
 - declare Session branch creation;
@@ -591,6 +591,16 @@ The following are intentionally outside the first public tool set and will be de
 - report host-side memory usage feedback.
 
 These operations will be host-to-service integration endpoints, not automatically model-visible tools.
+
+Issue #44 defines the transport-independent
+`jiandu.dev/branch-snapshot-event/v1alpha1` host-intent shape and the
+`jiandu.dev/session-snapshot-manifest/v1alpha1` resolved visibility shape. It
+does not add either shape to the MCP tool list or make a syntactically valid
+event proof of a committed message. A future host-only endpoint must first
+define trusted authentication/authorization, durable committed-message
+ordering, idempotency, persistence/recovery, and safe error behavior. Exact
+shapes and compatibility rules are in
+[Session Snapshot Contracts `v1alpha1`](session-snapshot-contract-v1alpha1.md).
 
 ## Domain errors
 
@@ -665,20 +675,26 @@ Markdown after the closing delimiter.
 ## Compatibility rules
 
 - New optional response fields may be added within `v1alpha1`.
-- Input objects, scope variants, provenance objects, patches, and canonical
-  frontmatter reject unknown fields. Clients must not send speculative fields.
+- Input objects, lineage events/manifests, scope variants, provenance objects,
+  patches, and canonical frontmatter reject unknown fields. Clients must not
+  send speculative fields.
 - Response records, result envelopes, diagnostics, and error payloads may ignore
   newly added optional fields, but their nested closed types remain strict.
   Ranked and unranked summary projections are closed so the ranking-only `score`
   field cannot cross the search/list boundary.
 - Existing fields cannot change meaning without an API-version change.
-- All current enums are closed: API/schema version, scope kind, memory type,
-  lifecycle status, relation kind, creation actor, extraction method, list sort,
-  validation code, and domain error code. Unknown values fail explicitly; adding
-  or renaming a value requires a contract revision rather than coercion.
+- All current enums are closed: API/schema version, lineage schema/snapshot
+  mode, scope kind, memory type, lifecycle status, relation kind, creation
+  actor, extraction method, list sort, validation code, and domain error code.
+  Unknown values fail explicitly; adding or renaming a value requires a
+  contract revision rather than coercion.
 - Cursors are opaque and short-lived; clients must not parse them.
 - Tool schemas are generated from the Rust domain definitions; conformance
   fixtures are decoded and validated against those types and generated schemas.
+- Snapshot manifests additionally require strictly ascending unique memory IDs,
+  exact revision/ETag anchors, and record revisions no greater than their
+  source store revision. These cross-field invariants are enforced by Rust
+  `Validate`; schema-only acceptance is not authoritative.
 - Store migrations cannot silently widen a client's authorization or scope.
 
 The checked schemas live under `crates/jiandu-core/schemas/v1alpha1`, while

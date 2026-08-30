@@ -10,10 +10,17 @@ pub const API_VERSION: &str = "jiandu.dev/v1alpha1";
 /// Canonical memory record schema identifier.
 pub const MEMORY_SCHEMA: &str = "jiandu.dev/memory/v1alpha1";
 
+/// Host-declared Session branch snapshot event schema identifier.
+pub const BRANCH_SNAPSHOT_EVENT_SCHEMA: &str = "jiandu.dev/branch-snapshot-event/v1alpha1";
+
+/// Jiandu-resolved immutable Session snapshot manifest schema identifier.
+pub const SESSION_SNAPSHOT_MANIFEST_SCHEMA: &str = "jiandu.dev/session-snapshot-manifest/v1alpha1";
+
 pub mod auth;
 pub mod error;
 pub mod frontmatter;
 pub mod ids;
+pub mod lineage;
 pub mod memory;
 pub mod mutation;
 pub mod query;
@@ -25,6 +32,7 @@ pub use auth::*;
 pub use error::*;
 pub use frontmatter::*;
 pub use ids::*;
+pub use lineage::*;
 pub use memory::*;
 pub use mutation::*;
 pub use query::*;

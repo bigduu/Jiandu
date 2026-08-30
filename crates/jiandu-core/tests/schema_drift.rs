@@ -1,5 +1,6 @@
 use jiandu_core::{
-    ContentDigest, MemoryFrontmatterV1Alpha1, MemoryRecord, generated_contract_schemas,
+    BranchSnapshotEvent, ContentDigest, MemoryFrontmatterV1Alpha1, MemoryRecord,
+    SessionSnapshotManifest, Validate, generated_contract_schemas,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -8,6 +9,10 @@ use std::path::Path;
 
 const SCHEMA_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/schemas/v1alpha1");
 const VALID_JSON: &str = include_str!("../fixtures/v1alpha1/valid/memory-record.json");
+const VALID_BRANCH_EVENT: &str =
+    include_str!("../fixtures/v1alpha1/valid/branch-snapshot-event.json");
+const VALID_SNAPSHOT_MANIFEST: &str =
+    include_str!("../fixtures/v1alpha1/valid/session-snapshot-manifest.json");
 const INVALID_JSON: &[&str] = &[
     include_str!("../fixtures/v1alpha1/invalid/memory-record-unknown-type.json"),
     include_str!("../fixtures/v1alpha1/invalid/memory-record-path-project-id.json"),
@@ -100,6 +105,58 @@ fn frontmatter_schema_accepts_the_canonical_header() {
         &generated_contract_schemas()["memory-frontmatter.schema.json"],
         &value
     ));
+}
+
+#[test]
+fn lineage_schemas_accept_canonical_fixtures_and_preserve_runtime_invariants() {
+    let schemas = generated_contract_schemas();
+    let event: Value = serde_json::from_str(VALID_BRANCH_EVENT)
+        .unwrap_or_else(|error| panic!("parse valid branch event: {error}"));
+    let manifest: Value = serde_json::from_str(VALID_SNAPSHOT_MANIFEST)
+        .unwrap_or_else(|error| panic!("parse valid snapshot manifest: {error}"));
+
+    assert!(schema_accepts(
+        &schemas["branch-snapshot-event.schema.json"],
+        &event
+    ));
+    assert!(schema_accepts(
+        &schemas["session-snapshot-manifest.schema.json"],
+        &manifest
+    ));
+
+    let mut unknown_event_field = event.clone();
+    unknown_event_field["principalId"] = Value::String("prn_other".into());
+    assert!(!schema_accepts(
+        &schemas["branch-snapshot-event.schema.json"],
+        &unknown_event_field
+    ));
+    assert!(serde_json::from_value::<BranchSnapshotEvent>(unknown_event_field).is_err());
+
+    let mut out_of_order = manifest;
+    out_of_order["visibleRecords"]
+        .as_array_mut()
+        .expect("visibleRecords array")
+        .reverse();
+    assert!(schema_accepts(
+        &schemas["session-snapshot-manifest.schema.json"],
+        &out_of_order
+    ));
+    let out_of_order: SessionSnapshotManifest =
+        serde_json::from_value(out_of_order).expect("structurally valid manifest");
+    assert!(out_of_order.validate().is_err());
+
+    assert_eq!(
+        schemas["branch-snapshot-event.schema.json"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schemas["session-snapshot-manifest.schema.json"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schemas["session-snapshot-manifest.schema.json"]["properties"]["visibleRecords"]["uniqueItems"],
+        true
+    );
 }
 
 #[test]

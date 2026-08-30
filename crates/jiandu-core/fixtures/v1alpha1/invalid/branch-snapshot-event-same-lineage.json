@@ -1,0 +1,11 @@
+{
+  "schema": "jiandu.dev/branch-snapshot-event/v1alpha1",
+  "eventId": "evt_01K4SAME",
+  "sourceSessionId": "ses_01K4SAME",
+  "sourceBranchId": "br_01K4SAME",
+  "throughMessageId": "msg_000042",
+  "targetSessionId": "ses_01K4SAME",
+  "targetBranchId": "br_01K4SAME",
+  "mode": "snapshot",
+  "occurredAt": "2026-08-30T04:17:10Z"
+}

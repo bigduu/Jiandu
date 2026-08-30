@@ -127,16 +127,25 @@ A branch event contains:
 
 ```json
 {
-  "eventId": "evt_01...",
-  "sourceSessionId": "ses_source",
-  "sourceBranchId": "br_source",
-  "throughMessageId": "msg_42",
-  "targetSessionId": "ses_target",
-  "targetBranchId": "br_target",
+  "schema": "jiandu.dev/branch-snapshot-event/v1alpha1",
+  "eventId": "evt_01K4SNAPSHOT",
+  "sourceSessionId": "ses_01K4SOURCE",
+  "sourceBranchId": "br_01K4SOURCE",
+  "throughMessageId": "msg_000042",
+  "targetSessionId": "ses_01K4TARGET",
+  "targetBranchId": "br_01K4TARGET",
   "mode": "snapshot",
-  "occurredAt": "2026-08-23T10:00:00Z"
+  "occurredAt": "2026-08-30T04:17:10Z"
 }
 ```
+
+Issue #44 defines this as strict host intent, not evidence that the named
+message was committed or belongs to the source lineage. A later authoritative
+resolver must verify that evidence before it can mint an immutable
+`jiandu.dev/session-snapshot-manifest/v1alpha1`. The manifest binds the event,
+one source store revision, and a strictly sorted unique list of exact
+`memoryId`/`revision`/`etag` anchors. Loading a different revision fails closed;
+later source content is never an acceptable substitute.
 
 For `snapshot` mode:
 
@@ -149,6 +158,13 @@ For `snapshot` mode:
 7. Retention or deletion in either lineage follows explicit policy; a branch link cannot resurrect a forgotten record.
 
 This gives the user-visible behavior of “deep copy through this message” without multiplying canonical data or coupling Jiandu to a particular session database.
+
+The checked event/manifest shapes, examples, runtime-only cross-field
+invariants, and compatibility rules are specified in
+[Session Snapshot Contracts `v1alpha1`](session-snapshot-contract-v1alpha1.md).
+Issue #44 adds only those pure contracts. Authoritative committed-message
+validation, persistence/recovery, copy-on-write, tombstone interaction, and
+portable/index conformance remain separate delivery slices.
 
 ## Proposed filesystem layout
 

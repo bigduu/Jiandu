@@ -90,6 +90,7 @@ define_prefixed_id!(
 define_prefixed_id!(ProjectId, "projectId", "prj_", r"^prj_[A-Za-z0-9_-]+$", 5);
 define_prefixed_id!(SessionId, "sessionId", "ses_", r"^ses_[A-Za-z0-9_-]+$", 5);
 define_prefixed_id!(ClientId, "clientId", "cli_", r"^cli_[A-Za-z0-9_-]+$", 5);
+define_prefixed_id!(EventId, "eventId", "evt_", r"^evt_[A-Za-z0-9_-]+$", 5);
 define_prefixed_id!(BranchId, "branchId", "br_", r"^br_[A-Za-z0-9_-]+$", 4);
 define_prefixed_id!(MessageId, "messageId", "msg_", r"^msg_[A-Za-z0-9_-]+$", 5);
 define_prefixed_id!(
