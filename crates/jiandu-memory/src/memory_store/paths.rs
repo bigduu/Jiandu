@@ -17,6 +17,7 @@ pub const INDEXES_DIR: &str = "indexes";
 pub const VIEWS_DIR: &str = "views";
 pub const LOGS_DIR: &str = "logs";
 pub const TOPICS_DIR: &str = "topics";
+pub const SCOPE_WRITE_LOCK_FILE: &str = ".jiandu-write.lock";
 
 #[derive(Debug, Clone)]
 pub struct MemoryPathResolver {
@@ -156,6 +157,18 @@ impl MemoryPathResolver {
         }
     }
 
+    /// Stable advisory-lock file shared by every process mutating one durable
+    /// scope. It lives beside (not inside) any individual record or derived
+    /// artifact, so rebuilds and record lifecycle operations cannot replace it.
+    pub(crate) fn scope_write_lock_path(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> PathBuf {
+        self.scope_root(scope, project_key)
+            .join(SCOPE_WRITE_LOCK_FILE)
+    }
+
     pub fn topic_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
         match scope {
             MemoryScope::Global => self.global_root().join(TOPICS_DIR),
@@ -275,5 +288,18 @@ mod tests {
         for invalid in ["", "../escape", "with/slash", "with space"] {
             assert!(ProjectId::parse(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn scope_write_locks_are_stable_and_scope_local() {
+        let resolver = MemoryPathResolver::from_data_dir("/tmp/jiandu");
+        assert_eq!(
+            resolver.scope_write_lock_path(MemoryScope::Global, None),
+            PathBuf::from("/tmp/jiandu/memory/v1/scopes/global/.jiandu-write.lock")
+        );
+        assert_eq!(
+            resolver.scope_write_lock_path(MemoryScope::Project, Some("project_1")),
+            PathBuf::from("/tmp/jiandu/memory/v1/scopes/projects/project_1/.jiandu-write.lock")
+        );
     }
 }

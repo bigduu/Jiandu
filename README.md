@@ -42,9 +42,32 @@ An MCP host can launch the compiled binary with the same arguments. For example:
 
 Use a distinct `session-id` for each agent workstream. Agents trusted for the
 same Project may use the same opaque `project-id` and data directory to share
-durable Project memory. Until cross-process record locking becomes an explicit
-contract, do not have separate Jiandu processes mutate the same durable memory
-record concurrently.
+durable Project memory.
+
+Durable concurrency is scoped, not record-local. Every mutation holds both a
+process-local mutex and an OS advisory lock for the complete canonical
+read-modify-write, audit append, and derived-artifact refresh. Separate Jiandu
+processes can therefore safely mutate different records in the same Global or
+Project scope; mutations in different scopes remain independent. Lock files are
+internal to each scope and require no host configuration.
+
+Advisory locking is cooperative: every writer to a Jiandu data directory must
+use Jiandu's API. Direct edits to canonical files are unsupported and can bypass
+the concurrency contract. Session notes are intentionally isolated by
+`session-id`; do not share one Session identity across independent processes.
+
+Recall access logging remains a best-effort soft signal outside the durable
+scope lock. Under cross-process recall load, a sample can be lost (especially
+during rare log compaction); this can only make later capacity ranking slightly
+stale. It cannot change canonical memory, corrupt derived recall artifacts, or
+fail the recall that produced the sample.
+
+A mutation is not a filesystem-wide transaction. A call can return an error
+after its canonical memory document was committed but before an audit or
+rebuildable artifact completed. After any mutation failure, run `inspect` first.
+If canonical documents committed but derived artifacts are stale, run `rebuild`,
+then use `query` or `get` to verify current state before choosing the next
+action; never blindly retry.
 
 During MCP initialization Jiandu returns concise usage instructions, so hosts
 that surface server instructions can teach the connected agent when to recall,

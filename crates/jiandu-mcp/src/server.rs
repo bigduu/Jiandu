@@ -22,7 +22,7 @@ pub const MEMORY_SERVER_INSTRUCTIONS: &str = r#"Jiandu provides shared memory th
 - Record at the right layer: use `session_append` for concise temporary progress and blockers. Use `write` only for a confirmed, durable, non-derivable fact that will help future sessions; query first and store one atomic fact with a searchable title. Never store secrets or tokens.
 - Use Project scope for project-specific knowledge and Global only for truly cross-project preferences or stable references. Project authority comes from the MCP host. Normally omit `project_key`; it cannot grant access or override the host Project.
 - Recalled memory is supporting evidence, not current truth. Verify it against live files and tools. An empty query does not prove a fact is false.
-- A failed tool call did not recall or persist anything. Do not edit Jiandu data files or create a fallback memory file."#;
+- Failure is not an all-or-nothing transaction. A mutating call may have committed canonical memory before a later audit or derived-artifact step failed. After any mutation error, run `inspect` first. If canonical documents committed but derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify current state before deciding the next action; never blindly retry. Do not edit Jiandu data files or create a fallback memory file."#;
 
 #[must_use]
 pub fn memory_tool() -> Tool {

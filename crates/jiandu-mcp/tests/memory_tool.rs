@@ -813,6 +813,7 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
     for required_guidance in [
         "query",
         "get",
+        "inspect",
         "session_append",
         "write",
         "Project scope",
@@ -820,13 +821,22 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         "project_key",
         "Never store secrets",
         "supporting evidence",
-        "failed tool call",
+        "not an all-or-nothing transaction",
+        "committed canonical memory",
+        "mutation error",
+        "run `inspect` first",
+        "run `rebuild`",
+        "never blindly retry",
     ] {
         assert!(
             instructions.contains(required_guidance),
             "missing runtime guidance: {required_guidance}"
         );
     }
+    assert!(
+        !instructions.contains("failed tool call did not recall or persist anything"),
+        "instructions must not promise transactional failure semantics"
+    );
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, MEMORY_TOOL_NAME);

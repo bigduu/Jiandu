@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use tokio::fs;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::access_log::{
     self, ACCESS_LOG_COMPACT_TRIGGER_BYTES, ACCESS_LOG_FILE, AccessLogEntry, AccessStats,
@@ -135,7 +135,7 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
         + content.chars().count()
 }
 
-/// Process-global registry of per-scope write locks.
+/// Process-global registry of local per-scope write locks.
 ///
 /// `MemoryStore` is cheap to construct or clone and may exist at many call sites,
 /// so a lock field on the struct
@@ -145,15 +145,37 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
 /// process-global registry keyed by the scope's unique on-disk root therefore
 /// serializes all of them.
 ///
-/// Cross-process concurrency to one data dir is not a supported deployment, so
-/// in-process locking is sufficient and
-/// avoids the complexity / portability cost of OS advisory file locks. The key is
-/// the scope root `PathBuf`, which is globally unique across data dir + scope +
-/// project, so two stores pointed at the same data dir share locks and two pointed
-/// at different dirs (e.g. tests) do not contend.
+/// The key is the scope root `PathBuf`, which is globally unique across data dir +
+/// scope + project, so two stores pointed at the same data dir share locks and two
+/// pointed at different dirs (e.g. tests) do not contend. This local mutex is the
+/// first half of the write guard; an OS advisory file lock supplies the
+/// cross-process half.
 fn scope_locks() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
     static SCOPE_LOCKS: OnceLock<DashMap<PathBuf, Arc<Mutex<()>>>> = OnceLock::new();
     SCOPE_LOCKS.get_or_init(DashMap::new)
+}
+
+/// Owning guard for the OS advisory lock of one durable scope.
+///
+/// `std::fs::File::lock` is blocking, so acquisition happens on Tokio's blocking
+/// pool. Dropping this owner releases the lock even on early return, panic unwind,
+/// or task cancellation after acquisition.
+struct AdvisoryScopeLock {
+    file: std::fs::File,
+}
+
+impl Drop for AdvisoryScopeLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Full same-scope mutation guard. The local guard prevents duplicate blocking
+/// lock waiters inside one process; the advisory guard coordinates independent
+/// Jiandu processes sharing the same data directory.
+struct ScopeWriteGuard {
+    _advisory: AdvisoryScopeLock,
+    _local: OwnedMutexGuard<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,11 +204,11 @@ impl MemoryStore {
         }
     }
 
-    /// Return the process-global write lock guarding the given scope's on-disk
-    /// state. Callers acquire it for the full duration of a read-modify-write +
-    /// `refresh_scope_artifacts` critical section so concurrent writers to the same
-    /// scope are serialized — the scope index/artifacts can never be left
-    /// half-written or inconsistent (the #32 corruption).
+    /// Acquire the process-local mutex and cross-process advisory lock guarding
+    /// the given scope's on-disk state. Callers hold both for the full duration of
+    /// a read-modify-write + `refresh_scope_artifacts` critical section, so writers
+    /// in separate Jiandu processes cannot overlap even when they mutate different
+    /// records in the same scope.
     ///
     /// The five resolve-then-lock methods (archive/split/consolidate/contradict/
     /// merge) resolve the target document once to find its scope, then RE-READ it
@@ -199,33 +221,66 @@ impl MemoryStore {
     /// (never evicted), which is negligible: a scope root is global / sessions /
     /// per-project, so the set is tiny and bounded in practice.
     ///
-    /// Each mutating public method acquires AT MOST this one `scope_lock` and
+    /// Each mutating public method acquires AT MOST this one scope guard and
     /// never holds it while calling another lock-acquiring PUBLIC method, so there
     /// is no lock nesting across the public API and deadlock is structurally
     /// impossible there.
     ///
     /// One documented exception: `enforce_scope_capacity` (the L5 capacity
-    /// gardener) holds `scope_lock` for its whole read-modify-write critical
+    /// gardener) holds the scope guard for its whole read-modify-write critical
     /// section and, while holding it, calls the private `access_log_stats` →
     /// `read_access_log_stats_at`, which acquires a SEPARATE `path_lock` scoped to
     /// that scope's `access_log.jsonl` file (see `record_memory_accesses_inner`'s
     /// doc comment for why the access log gets its own lock instead of reusing
-    /// `scope_lock`: so a burst of concurrent recalls appending access-log entries
+    /// scope guard: so a burst of concurrent recalls appending access-log entries
     /// never contends with concurrent scope writers). This IS lock nesting, but it
     /// is deadlock-safe because the acquisition order is fixed and never reversed
-    /// anywhere in this file: every path that needs both locks takes `scope_lock`
+    /// anywhere in this file: every path that needs both locks takes the scope guard
     /// first and an access-log `path_lock` second; nothing acquires an access-log
-    /// `path_lock` and then tries to acquire a `scope_lock` while still holding it
+    /// `path_lock` and then tries to acquire a scope guard while still holding it
     /// (`record_memory_accesses`, the other access-log caller, never touches
-    /// `scope_lock` at all — it's invoked from the lock-free `query_scope` read
+    /// scope guard at all — it's invoked from the lock-free `query_scope` read
     /// path). A fixed, never-reversed acquisition order rules out the circular
     /// wait a deadlock requires.
-    fn scope_lock(&self, scope: MemoryScope, project_key: Option<&str>) -> Arc<Mutex<()>> {
+    fn local_scope_lock(&self, scope: MemoryScope, project_key: Option<&str>) -> Arc<Mutex<()>> {
         self.path_lock(self.resolver.scope_root(scope, project_key))
     }
 
+    async fn acquire_scope_write_guard(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<ScopeWriteGuard> {
+        // Fixed acquisition order everywhere: local scope mutex, then its OS file
+        // lock. No code holds either while acquiring another scope, so circular
+        // wait is impossible. If file-lock acquisition fails, the local owner is
+        // dropped before the error returns.
+        let local = self.local_scope_lock(scope, project_key).lock_owned().await;
+        let path = self.resolver.scope_write_lock_path(scope, project_key);
+        let advisory = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            file.lock()?;
+            Ok::<_, io::Error>(AdvisoryScopeLock { file })
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("scope lock task failed: {error}")))??;
+
+        Ok(ScopeWriteGuard {
+            _advisory: advisory,
+            _local: local,
+        })
+    }
+
     /// Shared per-path mutex from the global registry — the serialization
-    /// primitive behind [`scope_lock`] and per-session-topic locking.
+    /// primitive behind [`Self::local_scope_lock`] and per-session-topic locking.
     fn path_lock(&self, key: PathBuf) -> Arc<Mutex<()>> {
         scope_locks()
             .entry(key)
@@ -686,8 +741,7 @@ impl MemoryStore {
 
         // Serialize the read-modify-write (find-similar → merge/create → audit →
         // refresh) against concurrent writers to this scope.
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
 
         self.ensure_scope_dirs(scope, project_key).await?;
         let tags = normalize_tags(tags.iter().map(String::as_str));
@@ -863,11 +917,12 @@ impl MemoryStore {
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
-        let lock = self.scope_lock(
-            doc.frontmatter.scope,
-            doc.frontmatter.project_key.as_deref(),
-        );
-        let _guard = lock.lock().await;
+        let _guard = self
+            .acquire_scope_write_guard(
+                doc.frontmatter.scope,
+                doc.frontmatter.project_key.as_deref(),
+            )
+            .await?;
         // Re-read under the lock so the mutation is applied to the latest
         // committed state, not a pre-lock snapshot another writer may have
         // superseded in the meantime (#235).
@@ -950,8 +1005,7 @@ impl MemoryStore {
         let scope = source.frontmatter.scope;
         let project_key_owned = source.frontmatter.project_key.clone();
         let project_key = project_key_owned.as_deref();
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
         // Re-read under the lock to avoid splitting a stale pre-lock snapshot (#235).
         let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
@@ -1366,8 +1420,7 @@ impl MemoryStore {
             ));
         }
         let project_key = project_key_owned.as_deref();
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
         // Re-read every source under the lock: the supersede writes below persist
         // each source doc, so operating on pre-lock snapshots would clobber a
         // concurrent mutation to any of them (#235). ids/scope are stable.
@@ -1510,8 +1563,7 @@ impl MemoryStore {
         reason: Option<&str>,
     ) -> io::Result<MemoryPurgeResult> {
         let project_key = self.require_project_key(scope, project_key)?;
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
         let mut docs = self.list_memory_documents(scope, project_key).await?;
         let mut updated_ids = Vec::new();
         for doc in &mut docs {
@@ -1583,11 +1635,12 @@ impl MemoryStore {
         let Some(mut target) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
-        let lock = self.scope_lock(
-            target.frontmatter.scope,
-            target.frontmatter.project_key.as_deref(),
-        );
-        let _guard = lock.lock().await;
+        let _guard = self
+            .acquire_scope_write_guard(
+                target.frontmatter.scope,
+                target.frontmatter.project_key.as_deref(),
+            )
+            .await?;
         // Re-read under the lock so a concurrent mutation isn't clobbered (#235).
         let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
@@ -1709,11 +1762,12 @@ impl MemoryStore {
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
-        let lock = self.scope_lock(
-            doc.frontmatter.scope,
-            doc.frontmatter.project_key.as_deref(),
-        );
-        let _guard = lock.lock().await;
+        let _guard = self
+            .acquire_scope_write_guard(
+                doc.frontmatter.scope,
+                doc.frontmatter.project_key.as_deref(),
+            )
+            .await?;
         // Re-read under the lock so the merge isn't applied to a stale snapshot (#235).
         let Some(fresh) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
@@ -1857,8 +1911,7 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<()> {
         let project_key = self.require_project_key(scope, project_key)?;
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
         self.refresh_scope_artifacts(scope, project_key).await
     }
 
@@ -1986,8 +2039,7 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let project_key = self.require_project_key(scope, project_key)?;
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
 
         let mut docs = self.list_memory_documents(scope, project_key).await?;
         let is_scorable = |status: DurableMemoryStatus| {
@@ -2122,8 +2174,7 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<Vec<String>> {
         let project_key = self.require_project_key(scope, project_key)?;
-        let lock = self.scope_lock(scope, project_key);
-        let _guard = lock.lock().await;
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
 
         let mut docs = self.list_memory_documents(scope, project_key).await?;
         let mut expired = Vec::new();
@@ -2689,7 +2740,7 @@ impl MemoryStore {
     async fn record_memory_accesses_inner(&self, path: &Path, ids: &[String]) -> io::Result<()> {
         // Guards the append + size-check + (rare) compaction as one critical
         // section, scoped to just this scope's access-log file — NOT the
-        // scope-wide `scope_lock`, so a burst of concurrent recalls never
+        // scope-wide write guard, so a burst of concurrent recalls never
         // contends with concurrent writers mutating the scope's memory docs.
         let lock = self.path_lock(path.to_path_buf());
         let _guard = lock.lock().await;
@@ -4331,6 +4382,55 @@ mod tests {
         );
     }
 
+    /// A mutation may commit its canonical Markdown document before a later
+    /// audit/index/view step fails. Keep this observable so callers do not assume
+    /// an error makes a blind retry safe.
+    #[tokio::test]
+    async fn failed_refresh_can_leave_canonical_memory_committed() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let scope = MemoryScope::Project;
+        let project_key = Some("proj-partial-commit");
+
+        // `ensure_scope_dirs` still succeeds, but publishing the memory view over
+        // this non-empty directory fails after the document and audit line have
+        // already been committed.
+        let blocked_view = store
+            .resolver()
+            .views_dir(scope, project_key)
+            .join(MEMORY_VIEW_FILE);
+        fs::create_dir_all(&blocked_view).await.unwrap();
+        fs::write(blocked_view.join("keep"), b"block replacement")
+            .await
+            .unwrap();
+
+        let result = store
+            .write_memory(
+                scope,
+                project_key,
+                DurableMemoryType::Project,
+                "Canonical write survives refresh failure",
+                "The canonical record is durable even though derived refresh failed.",
+                &[],
+                Some("session-partial"),
+                "main-model",
+                false,
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "blocked derived view must fail the call");
+
+        let docs = store
+            .list_memory_documents(scope, project_key)
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1, "canonical record was already committed");
+        assert_eq!(
+            docs[0].frontmatter.title,
+            "Canonical write survives refresh failure"
+        );
+    }
+
     /// Directly exercises mutual exclusion: tasks sharing the process-global lock
     /// for a scope must never overlap inside the guarded section. A shared counter
     /// incremented on enter / decremented on exit can only ever read 1 while locked
@@ -4347,8 +4447,10 @@ mod tests {
             let in_section = Arc::clone(&in_section);
             let max_seen = Arc::clone(&max_seen);
             handles.push(tokio::spawn(async move {
-                let lock = store.scope_lock(MemoryScope::Global, None);
-                let _guard = lock.lock().await;
+                let _guard = store
+                    .acquire_scope_write_guard(MemoryScope::Global, None)
+                    .await
+                    .unwrap();
                 let now = in_section.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 max_seen.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
                 // Yield to give any racing task a chance to observe overlap if the
@@ -4365,6 +4467,144 @@ mod tests {
             1,
             "at most one task is ever inside a scope-locked critical section"
         );
+    }
+
+    const CROSS_PROCESS_LOCK_TEST: &str = "JIANDU_CROSS_PROCESS_LOCK_TEST";
+    const CROSS_PROCESS_DATA_DIR: &str = "JIANDU_CROSS_PROCESS_DATA_DIR";
+    const CROSS_PROCESS_MARKER_DIR: &str = "JIANDU_CROSS_PROCESS_MARKER_DIR";
+    const CROSS_PROCESS_PROJECT: &str = "proj-cross-process";
+
+    fn wait_for_test_marker(path: &Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    /// Child-process entry point for `scope_lock_serializes_distinct_record_writes_across_processes`.
+    /// A normal test run has no selector and returns immediately.
+    #[test]
+    fn scope_lock_cross_process_worker() {
+        let Ok(mode) = std::env::var(CROSS_PROCESS_LOCK_TEST) else {
+            return;
+        };
+        let data_dir = PathBuf::from(std::env::var(CROSS_PROCESS_DATA_DIR).unwrap());
+        let markers = PathBuf::from(std::env::var(CROSS_PROCESS_MARKER_DIR).unwrap());
+        std::fs::create_dir_all(&markers).unwrap();
+
+        if mode == "holder" {
+            // Take the exact advisory lock another Jiandu process would hold. The
+            // writer below must not complete a DIFFERENT record in this scope
+            // until this owner explicitly releases it.
+            let store = MemoryStore::new(&data_dir);
+            let lock_path = store
+                .resolver()
+                .scope_write_lock_path(MemoryScope::Project, Some(CROSS_PROCESS_PROJECT));
+            std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            file.lock().unwrap();
+            std::fs::write(markers.join("holder-acquired"), b"ready").unwrap();
+            wait_for_test_marker(&markers.join("release-holder"));
+            file.unlock().unwrap();
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                store
+                    .write_memory(
+                        MemoryScope::Project,
+                        Some(CROSS_PROCESS_PROJECT),
+                        DurableMemoryType::Project,
+                        "Holder process record",
+                        "Distinct record written by the holder process.",
+                        &[],
+                        Some("holder-session"),
+                        "test",
+                        false,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            });
+            return;
+        }
+
+        assert_eq!(mode, "writer");
+        std::fs::write(markers.join("writer-attempting"), b"ready").unwrap();
+        let store = MemoryStore::new(&data_dir);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            store
+                .write_memory(
+                    MemoryScope::Project,
+                    Some(CROSS_PROCESS_PROJECT),
+                    DurableMemoryType::Project,
+                    "Writer process record",
+                    "Distinct record written by the competing process.",
+                    &[],
+                    Some("writer-session"),
+                    "test",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+        });
+        std::fs::write(markers.join("writer-done"), b"done").unwrap();
+    }
+
+    #[test]
+    fn scope_lock_serializes_distinct_record_writes_across_processes() {
+        let dir = tempdir().unwrap();
+        let markers = dir.path().join("markers");
+        std::fs::create_dir_all(&markers).unwrap();
+        let test_binary = std::env::current_exe().unwrap();
+        let worker_name = "memory_store::store::tests::scope_lock_cross_process_worker";
+
+        let spawn = |mode: &str| {
+            std::process::Command::new(&test_binary)
+                .args(["--exact", worker_name, "--nocapture"])
+                .env(CROSS_PROCESS_LOCK_TEST, mode)
+                .env(CROSS_PROCESS_DATA_DIR, dir.path())
+                .env(CROSS_PROCESS_MARKER_DIR, &markers)
+                .spawn()
+                .unwrap()
+        };
+
+        let mut holder = spawn("holder");
+        wait_for_test_marker(&markers.join("holder-acquired"));
+        let mut writer = spawn("writer");
+        wait_for_test_marker(&markers.join("writer-attempting"));
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !markers.join("writer-done").exists(),
+            "a different-record mutation must wait for the cross-process scope lock"
+        );
+
+        std::fs::write(markers.join("release-holder"), b"release").unwrap();
+        assert!(holder.wait().unwrap().success(), "holder process failed");
+        assert!(writer.wait().unwrap().success(), "writer process failed");
+
+        let docs = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            MemoryStore::new(dir.path())
+                .list_memory_documents(MemoryScope::Project, Some(CROSS_PROCESS_PROJECT))
+                .await
+                .unwrap()
+        });
+        let titles = docs
+            .iter()
+            .map(|doc| doc.frontmatter.title.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(docs.len(), 2);
+        assert!(titles.contains("Holder process record"));
+        assert!(titles.contains("Writer process record"));
     }
 
     #[tokio::test]

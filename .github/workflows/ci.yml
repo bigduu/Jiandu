@@ -12,6 +12,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Rust 1.95 workspace contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install declared minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Test workspace on Rust 1.95
+        run: cargo test --workspace --all-targets --all-features --locked
+
   workspace:
     name: Jiandu workspace
     runs-on: ubuntu-latest
