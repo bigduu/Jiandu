@@ -11,6 +11,7 @@ use jiandu_memory::{
         DEFAULT_SESSION_TOPIC, DurableMemoryDocument, DurableMemoryStatus, DurableMemoryType,
         MAX_MAX_CHARS, MAX_QUERY_LIMIT, MemoryQueryOptions, MemoryScope, MemorySplitPiece,
         MemoryStore, TemporalGranularity, count_chars, summary_json, truncate_chars,
+        validate_memory_id as validate_store_memory_id,
     },
 };
 use serde_json::{Value, json};
@@ -19,7 +20,6 @@ use tokio::sync::Mutex;
 use crate::{MemoryArgs, MemoryError, MemoryServer, QueryFilters, SplitPiece as ToolSplitPiece};
 
 const MAX_SESSION_NOTE_CHARS: usize = 12_000;
-const MAX_MEMORY_ID_LEN: usize = 128;
 const ACTOR: &str = "main-model";
 
 fn session_locks() -> &'static DashMap<String, Arc<Mutex<()>>> {
@@ -226,7 +226,7 @@ impl MemoryServer {
                 options,
             } => {
                 let id = validate_memory_id(&id)?;
-                let access = self.resolve_id_access(project_key.as_deref(), id).await?;
+                let access = self.resolve_id_access(project_key.as_deref(), id)?;
                 let max_chars = options
                     .and_then(|value| value.max_chars)
                     .unwrap_or(MAX_MAX_CHARS)
@@ -297,10 +297,8 @@ impl MemoryServer {
             } => {
                 let id = validate_memory_id(&id)?;
                 let source_memory_ids = validate_memory_ids(&source_memory_ids)?;
-                let access = self.resolve_id_access(project_key.as_deref(), id).await?;
-                self.ensure_related_ids_accessible(&access, &source_memory_ids)
-                    .await?;
                 let mode = parse_merge_mode(mode.as_deref())?;
+                let access = self.resolve_id_access(project_key.as_deref(), id)?;
                 if mode.as_deref() == Some("contradict") {
                     let Some(result) = access
                         .store
@@ -353,7 +351,7 @@ impl MemoryServer {
                     ));
                 }
                 let id = validate_memory_id(&id)?;
-                let access = self.resolve_id_access(project_key.as_deref(), id).await?;
+                let access = self.resolve_id_access(project_key.as_deref(), id)?;
                 let pieces = parse_split_pieces(pieces)?;
                 let Some(result) = access
                     .store
@@ -463,11 +461,7 @@ impl MemoryServer {
                     ));
                 }
                 let ids = validate_memory_ids(&ids)?;
-                let access = self
-                    .resolve_id_access(project_key.as_deref(), &ids[0])
-                    .await?;
-                self.ensure_related_ids_accessible(&access, &ids[1..])
-                    .await?;
+                let access = self.resolve_id_access(project_key.as_deref(), &ids[0])?;
                 let merged = MemorySplitPiece {
                     title,
                     r#type: r#type.as_deref().map(parse_type).transpose()?,
@@ -513,7 +507,7 @@ impl MemoryServer {
                     .filter(|value| !value.is_empty())
                 {
                     let id = validate_memory_id(id)?;
-                    let access = self.resolve_id_access(project_key.as_deref(), id).await?;
+                    let access = self.resolve_id_access(project_key.as_deref(), id)?;
                     let Some(doc) = access
                         .store
                         .archive_memory(id, access.project_key(), mode, reason.as_deref())
@@ -589,8 +583,7 @@ impl MemoryServer {
         let project_id = self.context.resolve_project_id(requested)?;
         if scope == MemoryScope::Project && project_id.is_none() {
             return Err(MemoryError::InvalidArguments(
-                "project scope requires a project_id in the MCP execution context or project_key"
-                    .to_string(),
+                "project scope requires a project_id in the MCP execution context".to_string(),
             ));
         }
         let store = project_id
@@ -599,51 +592,13 @@ impl MemoryServer {
         Ok(ResolvedMemoryAccess { store, project_id })
     }
 
-    async fn resolve_id_access(
+    fn resolve_id_access(
         &self,
         requested: Option<&str>,
         id: &str,
     ) -> Result<ResolvedMemoryAccess, MemoryError> {
-        let id = validate_memory_id(id)?;
-        let access = self.resolve_access(requested, MemoryScope::Global)?;
-        self.ensure_id_accessible(&access, id).await?;
-        Ok(access)
-    }
-
-    async fn ensure_related_ids_accessible(
-        &self,
-        access: &ResolvedMemoryAccess,
-        ids: &[String],
-    ) -> Result<(), MemoryError> {
-        for id in ids {
-            self.ensure_id_accessible(access, validate_memory_id(id)?)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn ensure_id_accessible(
-        &self,
-        access: &ResolvedMemoryAccess,
-        id: &str,
-    ) -> Result<(), MemoryError> {
-        let id = validate_memory_id(id)?;
-        if access.project_id.is_some() {
-            return Ok(());
-        }
-
-        let exists = access
-            .store
-            .list_memory_documents(MemoryScope::Global, None)
-            .await
-            .map_err(|error| execution("Failed to resolve memory scope", error))?
-            .iter()
-            .any(|doc| doc.frontmatter.id == id);
-        if exists {
-            Ok(())
-        } else {
-            Err(memory_not_found(id))
-        }
+        validate_memory_id(id)?;
+        self.resolve_access(requested, MemoryScope::Global)
     }
 }
 
@@ -666,19 +621,7 @@ fn required_content<'a>(content: &'a str, action: &str) -> Result<&'a str, Memor
 }
 
 fn validate_memory_id(id: &str) -> Result<&str, MemoryError> {
-    let id = id.trim();
-    let valid = !id.is_empty()
-        && id.len() <= MAX_MEMORY_ID_LEN
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
-    if valid {
-        Ok(id)
-    } else {
-        Err(MemoryError::InvalidArguments(format!(
-            "memory id must be a 1-{MAX_MEMORY_ID_LEN} character path-safe identifier containing only ASCII alphanumeric, '-' or '_'"
-        )))
-    }
+    validate_store_memory_id(id).map_err(|error| MemoryError::InvalidArguments(error.to_string()))
 }
 
 fn validate_memory_ids(ids: &[String]) -> Result<Vec<String>, MemoryError> {

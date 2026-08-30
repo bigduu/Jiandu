@@ -47,8 +47,13 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> io::Result<Config>
         );
     }
 
+    let data_dir = data_dir.ok_or_else(|| invalid_input("--data-dir is required"))?;
+    if data_dir.trim().is_empty() {
+        return Err(invalid_input("--data-dir cannot be empty"));
+    }
+
     Ok(Config {
-        data_dir: PathBuf::from(data_dir.ok_or_else(|| invalid_input("--data-dir is required"))?),
+        data_dir: PathBuf::from(data_dir),
         session_id: session_id.ok_or_else(|| invalid_input("--session-id is required"))?,
         project_id,
     })
@@ -82,5 +87,14 @@ mod tests {
     fn rejects_missing_and_unknown_flags() {
         assert!(parse_args(Vec::<String>::new()).is_err());
         assert!(parse_args(["--http".to_string()]).is_err());
+        assert!(
+            parse_args([
+                "--data-dir".to_string(),
+                "  ".to_string(),
+                "--session-id".to_string(),
+                "session_1".to_string(),
+            ])
+            .is_err()
+        );
     }
 }

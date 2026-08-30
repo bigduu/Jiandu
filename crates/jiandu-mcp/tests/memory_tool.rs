@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use jiandu_mcp::{
     MEMORY_ACTIONS, MEMORY_TOOL_NAME, MemoryArgs, MemoryExecutionContext, MemoryServer,
     MemoryToolClass, memory_tool,
 };
-use jiandu_memory::memory_store::MemoryStore;
+use jiandu_memory::memory_store::{MAX_MEMORY_ID_LEN, MemoryStore};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, JsonObject, ProtocolVersion},
@@ -424,7 +426,7 @@ fn assert_enum(schema: &Value, expected: &[&str]) {
 fn assert_id_schema(schema: &Value) {
     assert_eq!(
         find_key(schema, "maxLength").and_then(Value::as_u64),
-        Some(128)
+        Some(MAX_MEMORY_ID_LEN as u64)
     );
     assert_eq!(
         find_key(schema, "pattern").and_then(Value::as_str),
@@ -614,19 +616,28 @@ async fn session_append_lock_is_shared_between_server_instances() {
         MemoryExecutionContext::new("shared_session").expect("context"),
     );
 
-    let (first_result, second_result) = tokio::join!(
-        first.execute(json!({"action":"session_append","content":"alpha"})),
-        second.execute(json!({"action":"session_append","content":"beta"})),
-    );
-    first_result.expect("first append");
-    second_result.expect("second append");
+    for index in 0..50 {
+        let alpha = format!("alpha_{index}");
+        let beta = format!("beta_{index}");
+        let (first_result, second_result) = tokio::join!(
+            first.execute(json!({"action":"session_append","content":alpha})),
+            second.execute(json!({"action":"session_append","content":beta})),
+        );
+        first_result.expect("first append");
+        second_result.expect("second append");
+    }
 
     let read = first
         .execute(json!({"action":"session_read"}))
         .await
-        .expect("read both appends");
+        .expect("read all appends");
     let content = read["content"].as_str().expect("content");
-    assert!(matches!(content, "alpha\n\nbeta" | "beta\n\nalpha"));
+    let fragments = content.split("\n\n").collect::<HashSet<_>>();
+    assert_eq!(fragments.len(), 100);
+    for index in 0..50 {
+        assert!(fragments.contains(format!("alpha_{index}").as_str()));
+        assert!(fragments.contains(format!("beta_{index}").as_str()));
+    }
 }
 
 #[tokio::test]
@@ -715,8 +726,34 @@ async fn malformed_actions_project_ids_and_all_memory_id_shapes_fail_closed() {
             .execute(arguments)
             .await
             .expect_err("unsafe id must fail");
-        assert!(error.to_string().contains("path-safe"));
+        assert!(error.to_string().contains("memory id"));
     }
+
+    for arguments in [
+        json!({"action":"query","scope":"session"}),
+        json!({"action":"write","scope":"global","type":"unknown","title":"x","content":"x"}),
+        json!({"action":"write","scope":"global","type":"project","title":"x","content":"x","granularity":"decade"}),
+        json!({"action":"query","scope":"global","filters":{"type":["unknown"]}}),
+        json!({"action":"query","scope":"global","filters":{"status":["unknown"]}}),
+        json!({"action":"query","scope":"global","filters":{"granularity":["decade"]}}),
+        json!({"action":"merge","id":"safe_id","content":"x","mode":"unknown"}),
+        json!({"action":"purge","id":"safe_id","mode":"unknown"}),
+        json!({"action":"split","id":"safe_id","pieces":[]}),
+        json!({"action":"consolidate","ids":["safe_id"],"title":"x","content":"x"}),
+    ] {
+        server
+            .execute(arguments)
+            .await
+            .expect_err("invalid value domain must fail");
+    }
+
+    assert!(MemoryExecutionContext::new(".").is_err());
+    assert!(
+        MemoryExecutionContext::new("valid_session")
+            .expect("session")
+            .with_project_id("../project")
+            .is_err()
+    );
 
     let blank_purge = server
         .execute(json!({"action":"purge","id":"   "}))
@@ -800,6 +837,17 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
     let get = call_memory(&client, json!({"action":"get","id":id})).await;
     assert_eq!(get["memory"]["body"], "written through the MCP transport");
 
+    let invalid_arguments: JsonObject = json!({"action":"get","id":"../escape"})
+        .as_object()
+        .expect("object")
+        .clone();
+    let invalid = client
+        .call_tool(CallToolRequestParams::new(MEMORY_TOOL_NAME).with_arguments(invalid_arguments))
+        .await
+        .expect("tool errors are returned as call results");
+    assert_eq!(invalid.is_error, Some(true));
+    assert!(invalid.structured_content.is_none());
+
     client.cancel().await.expect("cancel client");
     server_task.await.expect("join server");
 }
@@ -814,5 +862,13 @@ async fn call_memory(
         .await
         .expect("call tool");
     assert_eq!(result.is_error, Some(false));
-    result.structured_content.expect("structured result")
+    let structured = result.structured_content.expect("structured result");
+    let text = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .expect("text result");
+    let text_value: Value = serde_json::from_str(&text.text).expect("text result is JSON");
+    assert_eq!(text_value, structured);
+    structured
 }

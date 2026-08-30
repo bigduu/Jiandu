@@ -8,12 +8,8 @@
 //! startup) always observes either the old content or the complete new content,
 //! never a torn write. Follow-up to #35, tracked in #166.
 //!
-//! bamboo-memory does not depend on bamboo-storage (where the sibling
-//! `atomic_write` for session JSONL lives), so this is a self-contained local
-//! helper rather than a shared one — deliberately keeping the crate boundary.
-//! [`plan_store`](crate::plan_store) has a matching *synchronous* atomic writer
-//! for the plan artifacts; the two stay split because that path is sync and this
-//! one is async, but they share [`unique_temp_path`] so temp naming can't drift.
+//! This module is self-contained because Jiandu has one filesystem-backed
+//! memory store and no separate storage or plan subsystem.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,8 +24,7 @@ use tokio::io::AsyncWriteExt;
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A unique sibling temp path (`.<name>.<pid>.<nanos>.<seq>.tmp`) so concurrent
-/// writers to the same target never collide on the temp file. Shared with
-/// [`crate::plan_store`] so both atomic writers name temps identically.
+/// writers to the same target never collide on the temp file.
 pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

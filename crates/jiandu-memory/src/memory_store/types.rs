@@ -34,15 +34,10 @@ impl MemoryScope {
 /// sort earlier (toward the stable prefix); finer-grained memories (day/week) change
 /// more often and sort later (toward the volatile suffix). See issue #61.
 ///
-/// This warning is specifically about the passive recall-into-prompt path (auto-
-/// injected "Relevant Durable Memories" in the system prompt, ranked/segmented by
-/// `budget::segment_by_granularity_budget`) — that subset must stay prefix-cache
-/// stable across turns, so it is never hard-filtered by granularity. It does NOT
-/// apply to the explicit `filters.granularity` query path (the `memory` tool's
-/// `query`/`purge` actions): when a user or the LLM deliberately asks to see only
-/// e.g. this week's memories, that is a one-shot, caller-driven request outside the
-/// auto-injected prompt prefix, so hard-filtering there is fine and expected — see
-/// `bamboo-server-tools`' `MemoryTool::parse_query_filters`.
+/// Passive recall ordering must remain stable across calls, so it is never
+/// hard-filtered by granularity. This does not apply to an explicit
+/// `filters.granularity` query or purge request, where hard filtering is the
+/// caller's stated intent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporalGranularity {
@@ -104,11 +99,11 @@ impl TemporalGranularity {
 
     /// Whether this granularity is "high churn" per the issue's Prefix Cache
     /// Friendly constraint: day/week memories change often enough that they must
-    /// never land in the stable prompt prefix (see `budget::segment_by_granularity_budget`).
+    /// never land in a caller's stable prefix segment.
     /// `None` and month/quarter/year are low-churn / prefix-eligible; week/day are
-    /// high-churn / suffix-only. Derived from [`cache_stability_rank`] so the
-    /// ordering tie-break (Phase 1) and the budget segmentation (Phase 2) can never
-    /// disagree about which side of the coarse/fine line a granularity falls on.
+    /// high-churn / suffix-only. Derived from [`Self::cache_stability_rank`] so
+    /// callers cannot disagree with the ordering tie-break about which side of
+    /// the coarse/fine line a granularity falls on.
     pub fn is_high_churn(granularity: Option<Self>) -> bool {
         Self::cache_stability_rank(granularity) > Self::cache_stability_rank(Some(Self::Month))
     }

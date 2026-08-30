@@ -137,11 +137,11 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
 
 /// Process-global registry of per-scope write locks.
 ///
-/// `MemoryStore` is cheap and constructed fresh at most call sites (one per HTTP
-/// handler and per gardener pass), so a lock field on the struct
+/// `MemoryStore` is cheap to construct or clone and may exist at many call sites,
+/// so a lock field on the struct
 /// would NOT serialize concurrent writers — each ephemeral instance would get its
 /// own mutex. The actual concurrency is many `MemoryStore` instances inside the
-/// SAME process (the `bamboo serve` server) racing on the same on-disk scope. A
+/// same Jiandu process racing on the same on-disk scope. A
 /// process-global registry keyed by the scope's unique on-disk root therefore
 /// serializes all of them.
 ///
@@ -1960,7 +1960,7 @@ impl MemoryStore {
     }
 
     /// Bound a scope's RECALLABLE size to `capacity` by archiving the
-    /// lowest-[`memory_value`] memories OUT OF the recall index — capacity via
+    /// lowest-scoring memories out of the recall index — capacity via
     /// archive, NEVER delete (L5). Archived docs stay on disk (reversible; a later
     /// pass or the user can restore them) but drop out of recall/scoring.
     ///

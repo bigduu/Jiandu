@@ -1,22 +1,35 @@
 # Jiandu
 
-Jiandu (简牍) is unreleased and has no compatibility promise. The repository is being reset to a small Rust baseline mechanically ported from Bamboo `origin/dev@6135bb4c`.
+Jiandu (简牍) is an unreleased, compatibility-free memory system mechanically ported from Bamboo `origin/dev@6135bb4c`.
 
-The intended workspace contains two crates:
+The workspace contains exactly two crates:
 
-- `crates/jiandu-memory`: atomic filesystem operations and deterministic memory-store behavior.
-- `crates/jiandu-mcp`: the separately integrated MCP boundary.
+- `crates/jiandu-memory`: atomic filesystem persistence, deterministic memory operations, and lexical/BM25/CJK recall.
+- `crates/jiandu-mcp`: one stdio MCP server exposing one unified `memory` tool with Bamboo's current 17 actions.
 
-`jiandu-memory` supports Bamboo's current `memory/v1` layout only. Callers supply a stable, opaque, path-safe `ProjectId`; Jiandu does not derive Project identity from workspace paths.
+Callers provide a stable, opaque, path-safe `ProjectId`; Jiandu never derives Project identity from a workspace path. A request parameter may confirm the host-provided Project identity, but cannot grant Project access.
 
-The phase-one port preserves Session operations, durable memory CRUD and maintenance, rebuildable artifacts, lexical/BM25/CJK recall, and concurrency behavior. It deliberately excludes LLM reranking, Dream, ledger, plan, budget, prompt assembly, `workspace_state`, and all historical readers, aliases, migrations, schemas, and Jiandu `v1alpha` code.
+`memory/v1` is only the name of the current internal on-disk layout. It is not a public `v1alpha` API or a compatibility lifecycle. Jiandu contains no historical readers, aliases, migrations, versioned schemas, or old `v1alpha` crates.
 
-Run the core gates from the repository root:
+The baseline preserves Session notes, durable memory CRUD and maintenance, rebuildable artifacts, recall, and concurrency behavior. Dream, LLM reranking, ledger, plan, budget, prompt assembly, workspace discovery, and `workspace_state` remain Bamboo responsibilities.
+
+Run the server:
+
+```shell
+cargo run -p jiandu-mcp --bin jiandu -- \
+  --data-dir /path/to/data \
+  --session-id session_1
+```
+
+Add `--project-id project_1` when the host grants this server access to that Project's memory.
+
+Run all gates from the repository root:
 
 ```shell
 cargo fmt --all -- --check
-cargo clippy -p jiandu-memory --all-targets -- -D warnings
-cargo test -p jiandu-memory
+cargo metadata --locked --all-features --format-version 1
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
 ```
 
 Jiandu is licensed under the [MIT License](LICENSE).
