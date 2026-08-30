@@ -8,15 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait = "0.1.89"
+dashmap.workspace = true
+jiandu-memory = { path = "../jiandu-memory" }
 rmcp = { workspace = true, features = ["transport-io"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client"] }
-tokio.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

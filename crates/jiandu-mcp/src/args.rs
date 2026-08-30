@@ -54,75 +54,123 @@ pub enum MemoryArgs {
     },
     SessionListTopics,
     Query {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(default)]
         query: Option<String>,
         #[serde(default)]
         filters: Option<QueryFilters>,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
     Get {
+        #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
         id: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
     Write {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(rename = "type")]
+        #[schemars(with = "MemoryTypeSchema")]
         r#type: String,
         title: String,
         content: String,
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
+        #[schemars(with = "Option<GranularitySchema>")]
         granularity: Option<String>,
         #[serde(default)]
         options: Option<WriteOptions>,
     },
     Merge {
+        #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
         id: String,
         content: String,
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
+        #[schemars(inner(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$")))]
         source_memory_ids: Vec<String>,
         #[serde(default)]
+        #[schemars(with = "Option<MergeModeSchema>")]
         mode: Option<String>,
         #[serde(default)]
         reason: Option<String>,
     },
     Split {
+        #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
         id: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
+        #[schemars(length(min = 1))]
         pieces: Vec<SplitPiece>,
     },
     FindDuplicates {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         title: String,
         #[serde(default)]
         content: Option<String>,
         #[serde(rename = "type", default)]
+        #[schemars(with = "Option<MemoryTypeSchema>")]
         r#type: Option<String>,
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
     ScanBlobs {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
         min_sections: Option<usize>,
@@ -130,8 +178,14 @@ pub enum MemoryArgs {
         options: Option<MemoryActionOptions>,
     },
     ScanDuplicates {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
         min_score: Option<f64>,
@@ -139,38 +193,68 @@ pub enum MemoryArgs {
         options: Option<MemoryActionOptions>,
     },
     Consolidate {
+        #[schemars(
+            length(min = 2),
+            inner(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))
+        )]
         ids: Vec<String>,
         title: String,
         content: String,
         #[serde(rename = "type", default)]
+        #[schemars(with = "Option<MemoryTypeSchema>")]
         r#type: Option<String>,
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
     },
     Purge {
         #[serde(default)]
+        #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
         id: Option<String>,
         #[serde(default)]
+        #[schemars(with = "Option<DurableScopeSchema>")]
         scope: Option<String>,
         #[serde(default)]
         reason: Option<String>,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
         #[serde(default)]
         filters: Option<QueryFilters>,
         #[serde(default)]
+        #[schemars(with = "Option<StatusSchema>")]
         mode: Option<String>,
     },
     Inspect {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
     },
     Rebuild {
+        #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 64),
+            regex(pattern = "^[A-Za-z0-9_-]+$"),
+            description = "Must match the host execution context Project id; it cannot grant Project access."
+        )]
         project_key: Option<String>,
     },
 }
@@ -213,28 +297,6 @@ impl MemoryArgs {
             _ => MemoryToolClass::MutatingSerial,
         }
     }
-
-    pub(crate) fn project_key(&self) -> Option<&str> {
-        match self {
-            Self::Query { project_key, .. }
-            | Self::Get { project_key, .. }
-            | Self::Write { project_key, .. }
-            | Self::Merge { project_key, .. }
-            | Self::Split { project_key, .. }
-            | Self::FindDuplicates { project_key, .. }
-            | Self::ScanBlobs { project_key, .. }
-            | Self::ScanDuplicates { project_key, .. }
-            | Self::Consolidate { project_key, .. }
-            | Self::Purge { project_key, .. }
-            | Self::Inspect { project_key, .. }
-            | Self::Rebuild { project_key, .. } => project_key.as_deref(),
-            Self::SessionRead { .. }
-            | Self::SessionAppend { .. }
-            | Self::SessionReplace { .. }
-            | Self::SessionClear { .. }
-            | Self::SessionListTopics => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -252,10 +314,13 @@ pub struct MemoryActionOptions {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct QueryFilters {
     #[serde(default)]
+    #[schemars(with = "Vec<MemoryTypeSchema>")]
     pub r#type: Vec<String>,
     #[serde(default)]
+    #[schemars(with = "Vec<StatusSchema>")]
     pub status: Vec<String>,
     #[serde(default)]
+    #[schemars(with = "Vec<GranularitySchema>")]
     pub granularity: Vec<String>,
 }
 
@@ -269,8 +334,58 @@ pub struct WriteOptions {
 pub struct SplitPiece {
     pub title: String,
     #[serde(rename = "type", default)]
+    #[schemars(with = "Option<MemoryTypeSchema>")]
     pub r#type: Option<String>,
     pub content: String,
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(inline, rename_all = "snake_case")]
+enum DurableScopeSchema {
+    Project,
+    Global,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(inline, rename_all = "snake_case")]
+enum MemoryTypeSchema {
+    User,
+    Feedback,
+    Project,
+    Reference,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(inline, rename_all = "snake_case")]
+enum GranularitySchema {
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(inline, rename_all = "snake_case")]
+enum StatusSchema {
+    Active,
+    Stale,
+    Superseded,
+    Contradicted,
+    Archived,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(inline, rename_all = "snake_case")]
+enum MergeModeSchema {
+    Merge,
+    SemanticMerge,
+    Contradict,
 }

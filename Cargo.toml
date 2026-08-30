@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/jiandu-memory"]
+members = ["crates/jiandu-memory", "crates/jiandu-mcp"]
 resolver = "3"
 
 [workspace.package]
@@ -15,6 +15,9 @@ dashmap = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+rmcp = { version = "3.1.4", default-features = false, features = ["macros", "server"] }
+schemars = { version = "1.2.2", features = ["preserve_order"] }
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 

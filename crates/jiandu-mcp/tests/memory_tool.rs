@@ -1,33 +1,66 @@
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
 use jiandu_mcp::{
-    MEMORY_ACTIONS, MEMORY_TOOL_NAME, MemoryBackend, MemoryError, MemoryExecutionContext,
-    MemoryInvocation, MemoryServer, MemoryToolClass, memory_tool,
+    MEMORY_ACTIONS, MEMORY_TOOL_NAME, MemoryArgs, MemoryExecutionContext, MemoryServer,
+    MemoryToolClass, memory_tool,
 };
+use jiandu_memory::memory_store::MemoryStore;
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, JsonObject, ProtocolVersion},
 };
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
-#[derive(Default)]
-struct RecordingBackend {
-    calls: Mutex<Vec<MemoryInvocation>>,
+struct Fixture {
+    _directory: TempDir,
+    server: MemoryServer,
 }
 
-#[async_trait]
-impl MemoryBackend for RecordingBackend {
-    async fn execute(&self, invocation: MemoryInvocation) -> Result<Value, MemoryError> {
-        let action = invocation.arguments.action_name();
-        self.calls.lock().expect("calls lock").push(invocation);
-        Ok(json!({"action": action, "success": true}))
+impl Fixture {
+    fn global(session_id: &str) -> Self {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let server = MemoryServer::new(
+            MemoryStore::new(directory.path()),
+            MemoryExecutionContext::new(session_id).expect("context"),
+        );
+        Self {
+            _directory: directory,
+            server,
+        }
     }
 }
 
-fn cases() -> Vec<(&'static str, Value, MemoryToolClass)> {
+async fn write_global(server: &MemoryServer, title: &str, content: &str) -> String {
+    let result = server
+        .execute(json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": title,
+            "content": content,
+        }))
+        .await
+        .expect("write memory");
+    result["memory"]["id"]
+        .as_str()
+        .expect("memory id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
     use MemoryToolClass::{MutatingSerial, ReadOnlyParallel};
-    vec![
+
+    let fixture = Fixture::global("session_dispatch");
+    let server = &fixture.server;
+    let get_id = write_global(server, "Dispatch get", "needle get body").await;
+    let merge_id = write_global(server, "Dispatch merge", "merge target body").await;
+    let merge_source_id = write_global(server, "Dispatch merge source", "merge source body").await;
+    let split_id = write_global(server, "Dispatch split", "split source body").await;
+    let consolidate_a = write_global(server, "Dispatch consolidate A", "first source body").await;
+    let consolidate_b = write_global(server, "Dispatch consolidate B", "second source body").await;
+    let purge_id = write_global(server, "Dispatch purge", "purge source body").await;
+
+    let cases = vec![
         (
             "session_read",
             json!({"action":"session_read","topic":"default","options":{"max_chars":8}}),
@@ -55,52 +88,52 @@ fn cases() -> Vec<(&'static str, Value, MemoryToolClass)> {
         ),
         (
             "query",
-            json!({"action":"query","scope":"project","query":"needle","project_key":"project_1","filters":{"type":["project"],"status":["active"],"granularity":["week"]},"options":{"limit":5,"max_chars":1000,"cursor":"5","include_related":true}}),
+            json!({"action":"query","scope":"global","query":"needle","filters":{"type":["reference"],"status":["active"],"granularity":[]},"options":{"limit":5,"max_chars":1000,"include_related":true}}),
             ReadOnlyParallel,
         ),
         (
             "get",
-            json!({"action":"get","id":"mem-1","project_key":"project_1","options":{"max_chars":500}}),
+            json!({"action":"get","id":get_id,"options":{"max_chars":500}}),
             ReadOnlyParallel,
         ),
         (
             "find_duplicates",
-            json!({"action":"find_duplicates","scope":"global","title":"title","content":"body","type":"reference","tags":["one"],"options":{"limit":3}}),
+            json!({"action":"find_duplicates","scope":"global","title":"Dispatch get","content":"needle get body","type":"reference","tags":["one"],"options":{"limit":3}}),
             ReadOnlyParallel,
         ),
         (
             "write",
-            json!({"action":"write","scope":"project","type":"project","title":"title","content":"body","tags":["one"],"project_key":"project_1","granularity":"week","options":{"allow_merge_if_similar":true}}),
+            json!({"action":"write","scope":"global","type":"project","title":"Dispatch explicit write","content":"explicit write body","tags":["one"],"granularity":"week","options":{"allow_merge_if_similar":false}}),
             MutatingSerial,
         ),
         (
             "merge",
-            json!({"action":"merge","id":"mem-1","content":"body","tags":["one"],"project_key":"project_1","source_memory_ids":["mem-2"],"mode":"merge","reason":"dedupe"}),
+            json!({"action":"merge","id":merge_id,"content":"new merged section","tags":["one"],"source_memory_ids":[merge_source_id],"mode":"merge","reason":"dedupe"}),
             MutatingSerial,
         ),
         (
             "split",
-            json!({"action":"split","id":"mem-1","project_key":"project_1","pieces":[{"title":"piece","type":"reference","content":"atomic","tags":["one"]}]}),
+            json!({"action":"split","id":split_id,"pieces":[{"title":"Dispatch atomic piece","type":"reference","content":"atomic split body","tags":["one"]}]}),
             MutatingSerial,
         ),
         (
             "consolidate",
-            json!({"action":"consolidate","ids":["mem-1","mem-2"],"title":"merged","content":"atomic","type":"project","tags":["one"],"project_key":"project_1"}),
+            json!({"action":"consolidate","ids":[consolidate_a,consolidate_b],"title":"Dispatch canonical","content":"canonical body","type":"project","tags":["one"]}),
             MutatingSerial,
         ),
         (
             "purge",
-            json!({"action":"purge","id":"mem-1","reason":"obsolete","project_key":"project_1","mode":"archived"}),
+            json!({"action":"purge","id":purge_id,"reason":"obsolete","mode":"archived"}),
             MutatingSerial,
         ),
         (
             "inspect",
-            json!({"action":"inspect","scope":"project","project_key":"project_1"}),
+            json!({"action":"inspect","scope":"global"}),
             ReadOnlyParallel,
         ),
         (
             "rebuild",
-            json!({"action":"rebuild","scope":"project","project_key":"project_1"}),
+            json!({"action":"rebuild","scope":"global"}),
             MutatingSerial,
         ),
         (
@@ -113,66 +146,25 @@ fn cases() -> Vec<(&'static str, Value, MemoryToolClass)> {
             json!({"action":"scan_duplicates","scope":"global","min_score":0.75,"options":{"limit":10}}),
             ReadOnlyParallel,
         ),
-    ]
-}
+    ];
 
-#[tokio::test]
-async fn all_seventeen_actions_parse_classify_and_dispatch_unchanged() {
-    let backend = Arc::new(RecordingBackend::default());
-    let server = MemoryServer::new(
-        backend.clone(),
-        MemoryExecutionContext::new("session-1").expect("context"),
-    );
-    let cases = cases();
     assert_eq!(cases.len(), 17);
     assert_eq!(
         cases.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
         MEMORY_ACTIONS
     );
 
-    for (name, arguments, class) in cases {
-        let result = server.execute(arguments.clone()).await.expect("dispatch");
+    for (name, arguments, expected_class) in cases {
+        let parsed: MemoryArgs = serde_json::from_value(arguments.clone()).expect("parse args");
+        assert_eq!(parsed.action_name(), name);
+        assert_eq!(parsed.class(), expected_class);
+        let result = server.execute(arguments).await.expect("real dispatch");
         assert_eq!(result["action"], name);
-        let call = backend
-            .calls
-            .lock()
-            .expect("calls lock")
-            .pop()
-            .expect("call");
-        assert_eq!(call.arguments.action_name(), name);
-        assert_eq!(call.arguments.class(), class);
-        assert_json_subset(
-            &arguments,
-            &serde_json::to_value(&call.arguments).expect("serialize"),
-        );
-        assert_eq!(call.session_id, "session-1");
-    }
-}
-
-fn assert_json_subset(expected: &Value, actual: &Value) {
-    match (expected, actual) {
-        (Value::Object(expected), Value::Object(actual)) => {
-            for (key, expected) in expected {
-                assert_json_subset(
-                    expected,
-                    actual
-                        .get(key)
-                        .unwrap_or_else(|| panic!("missing key {key}")),
-                );
-            }
-        }
-        (Value::Array(expected), Value::Array(actual)) => {
-            assert_eq!(expected.len(), actual.len());
-            for (expected, actual) in expected.iter().zip(actual) {
-                assert_json_subset(expected, actual);
-            }
-        }
-        _ => assert_eq!(expected, actual),
     }
 }
 
 #[test]
-fn generated_schema_has_one_complete_branch_per_action() {
+fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
     let tool = memory_tool();
     assert_eq!(tool.name, MEMORY_TOOL_NAME);
     let schema = tool.schema_as_json_value();
@@ -305,11 +297,9 @@ fn generated_schema_has_one_complete_branch_per_action() {
             &["action", "scope"],
         ),
     ];
+
     for (action, properties, required) in contracts {
-        let branch = branches
-            .iter()
-            .find(|branch| branch["properties"]["action"]["const"] == action)
-            .unwrap_or_else(|| panic!("missing schema branch for {action}"));
+        let branch = branch(&schema, action);
         let mut actual_properties = branch["properties"]
             .as_object()
             .expect("properties")
@@ -328,95 +318,374 @@ fn generated_schema_has_one_complete_branch_per_action() {
         assert_eq!(actual_required, required, "required fields for {action}");
     }
 
+    for action in [
+        "query",
+        "write",
+        "find_duplicates",
+        "scan_blobs",
+        "scan_duplicates",
+        "inspect",
+        "rebuild",
+    ] {
+        assert_enum(
+            &branch(&schema, action)["properties"]["scope"],
+            &["project", "global"],
+        );
+    }
+    assert_enum(
+        &branch(&schema, "write")["properties"]["type"],
+        &["user", "feedback", "project", "reference"],
+    );
+    assert_enum(
+        &branch(&schema, "write")["properties"]["granularity"],
+        &["day", "week", "month", "quarter", "year"],
+    );
+    assert_enum(
+        &branch(&schema, "merge")["properties"]["mode"],
+        &["merge", "semantic_merge", "contradict"],
+    );
+    assert_enum(
+        &branch(&schema, "purge")["properties"]["mode"],
+        &["active", "stale", "superseded", "contradicted", "archived"],
+    );
+    let filter_schema =
+        referenced_schema(&schema, &branch(&schema, "query")["properties"]["filters"]);
+    assert_enum(
+        &filter_schema["properties"]["type"]["items"],
+        &["user", "feedback", "project", "reference"],
+    );
+    assert_enum(
+        &filter_schema["properties"]["status"]["items"],
+        &["active", "stale", "superseded", "contradicted", "archived"],
+    );
+    assert_enum(
+        &filter_schema["properties"]["granularity"]["items"],
+        &["day", "week", "month", "quarter", "year"],
+    );
+
+    for (action, field) in [
+        ("get", "id"),
+        ("merge", "id"),
+        ("split", "id"),
+        ("purge", "id"),
+    ] {
+        assert_id_schema(&branch(&schema, action)["properties"][field]);
+    }
+    assert_id_schema(&branch(&schema, "merge")["properties"]["source_memory_ids"]["items"]);
+    assert_id_schema(&branch(&schema, "consolidate")["properties"]["ids"]["items"]);
+    let project_key = &branch(&schema, "write")["properties"]["project_key"];
+    assert_eq!(
+        find_key(project_key, "maxLength").and_then(Value::as_u64),
+        Some(64)
+    );
+    assert_eq!(
+        find_key(project_key, "pattern").and_then(Value::as_str),
+        Some("^[A-Za-z0-9_-]+$")
+    );
+    assert!(
+        find_key(project_key, "description")
+            .and_then(Value::as_str)
+            .expect("project authority description")
+            .contains("cannot grant Project access")
+    );
+
     let serialized = serde_json::to_string(&schema).expect("schema JSON");
     assert!(serialized.contains("allow_merge_if_similar"));
     assert!(serialized.contains("include_related"));
 }
 
-#[tokio::test]
-async fn session_actions_use_host_context_without_changing_request_schema() {
-    let backend = Arc::new(RecordingBackend::default());
-    let server = MemoryServer::new(
-        backend.clone(),
-        MemoryExecutionContext::new("session.context-1").expect("context"),
+fn branch<'a>(schema: &'a Value, action: &str) -> &'a Value {
+    schema["oneOf"]
+        .as_array()
+        .expect("oneOf")
+        .iter()
+        .find(|branch| branch["properties"]["action"]["const"] == action)
+        .unwrap_or_else(|| panic!("missing schema branch for {action}"))
+}
+
+fn referenced_schema<'a>(root: &'a Value, schema: &Value) -> &'a Value {
+    let reference = find_key(schema, "$ref")
+        .and_then(Value::as_str)
+        .expect("schema reference");
+    root.pointer(reference.strip_prefix('#').expect("local reference"))
+        .expect("referenced schema")
+}
+
+fn assert_enum(schema: &Value, expected: &[&str]) {
+    let values = find_key(schema, "enum")
+        .and_then(Value::as_array)
+        .expect("enum values")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(values, expected);
+}
+
+fn assert_id_schema(schema: &Value) {
+    assert_eq!(
+        find_key(schema, "maxLength").and_then(Value::as_u64),
+        Some(128)
     );
-    for action in [
-        json!({"action":"session_read"}),
-        json!({"action":"session_append","content":"a"}),
-        json!({"action":"session_replace","content":"b"}),
-        json!({"action":"session_clear"}),
-        json!({"action":"session_list_topics"}),
-    ] {
-        server.execute(action).await.expect("session dispatch");
+    assert_eq!(
+        find_key(schema, "pattern").and_then(Value::as_str),
+        Some("^[A-Za-z0-9_-]+$")
+    );
+}
+
+fn find_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(object) => object
+            .get(key)
+            .or_else(|| object.values().find_map(|value| find_key(value, key))),
+        Value::Array(array) => array.iter().find_map(|value| find_key(value, key)),
+        _ => None,
     }
-    let calls = backend.calls.lock().expect("calls lock");
-    assert_eq!(calls.len(), 5);
-    assert!(
-        calls
-            .iter()
-            .all(|call| call.session_id == "session.context-1")
-    );
-    assert!(calls.iter().all(|call| call.project_id.is_none()));
 }
 
 #[tokio::test]
-async fn stable_project_identity_comes_from_context_or_matching_argument() {
-    let backend = Arc::new(RecordingBackend::default());
-    let context = MemoryExecutionContext::new("session-1")
-        .expect("context")
-        .with_project_id("project_1")
-        .expect("project context");
-    let server = MemoryServer::new(backend.clone(), context);
-
+async fn session_actions_use_the_host_context_and_real_session_files() {
+    let fixture = Fixture::global("session.context-1");
+    let server = &fixture.server;
     server
+        .execute(json!({"action":"session_append","content":"first"}))
+        .await
+        .expect("append");
+    server
+        .execute(json!({"action":"session_append","content":"second"}))
+        .await
+        .expect("append");
+    let read = server
+        .execute(json!({"action":"session_read","options":{"max_chars":8}}))
+        .await
+        .expect("read");
+    assert_eq!(read["session_id"], "session.context-1");
+    assert_eq!(read["length_chars"], 13);
+    assert_eq!(read["content"], "first\n\ns");
+    assert_eq!(read["body_truncated"], true);
+    let topics = server
+        .execute(json!({"action":"session_list_topics"}))
+        .await
+        .expect("topics");
+    assert_eq!(topics["topics"], json!(["default"]));
+    server
+        .execute(json!({"action":"session_clear"}))
+        .await
+        .expect("clear");
+}
+
+#[tokio::test]
+async fn project_identity_is_stable_scoped_and_cannot_be_overridden() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let project_a = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_a")
+            .expect("context")
+            .with_project_id("project_a")
+            .expect("project"),
+    );
+    let project_b = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_b")
+            .expect("context")
+            .with_project_id("project_b")
+            .expect("project"),
+    );
+    let no_project = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_global").expect("context"),
+    );
+
+    let written = project_a
+        .execute(json!({
+            "action":"write",
+            "scope":"project",
+            "type":"project",
+            "title":"Project A only",
+            "content":"isolated content"
+        }))
+        .await
+        .expect("project write");
+    let id = written["memory"]["id"].as_str().expect("id");
+    assert_eq!(written["memory"]["project_key"], "project_a");
+
+    let query = project_a
         .execute(json!({"action":"query","scope":"project"}))
         .await
-        .expect("context project");
-    server
-        .execute(json!({"action":"get","id":"mem-1","project_key":"project_1"}))
+        .expect("project query");
+    assert_eq!(query["data"]["matched_count"], 1);
+    project_a
+        .execute(json!({"action":"get","id":format!(" {id} "),"project_key":"project_a"}))
         .await
-        .expect("matching project");
-    let mismatch = server
-        .execute(json!({"action":"inspect","scope":"project","project_key":"project_2"}))
+        .expect("matching project with a trimmed id");
+
+    let mismatch = project_a
+        .execute(json!({"action":"inspect","scope":"project","project_key":"project_b"}))
         .await
-        .expect_err("project override must fail");
+        .expect_err("override must fail");
     assert!(mismatch.to_string().contains("cannot override"));
-
-    let calls = backend.calls.lock().expect("calls lock");
-    assert_eq!(calls.len(), 2);
     assert!(
-        calls
-            .iter()
-            .all(|call| { call.project_id.as_ref().expect("project").as_str() == "project_1" })
+        project_b
+            .execute(json!({"action":"get","id":id}))
+            .await
+            .is_err(),
+        "another project context must not discover the memory"
+    );
+    assert!(
+        no_project
+            .execute(json!({"action":"get","id":id}))
+            .await
+            .is_err(),
+        "an unscoped context must not enumerate project memories"
     );
 }
 
 #[tokio::test]
-async fn merge_modes_and_both_purge_shapes_dispatch_without_a_compatibility_protocol() {
-    let backend = Arc::new(RecordingBackend::default());
-    let server = MemoryServer::new(
-        backend.clone(),
-        MemoryExecutionContext::new("session-1").expect("context"),
+async fn request_project_key_never_self_grants_project_authority() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let project_a = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_authority_a")
+            .expect("context")
+            .with_project_id("project_a")
+            .expect("project"),
     );
-    let cases = [
-        json!({"action":"merge","id":"m1","content":"merged","mode":"merge"}),
-        json!({"action":"merge","id":"m1","content":"contradiction","mode":"contradict","source_memory_ids":["m2"]}),
-        json!({"action":"purge","id":"m1","mode":"archived"}),
-        json!({"action":"purge","scope":"global","filters":{"status":["stale"]},"mode":"archived"}),
-    ];
-    for arguments in cases {
-        server.execute(arguments).await.expect("dispatch");
+    let project_b = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_authority_b")
+            .expect("context")
+            .with_project_id("project_b")
+            .expect("project"),
+    );
+    let unassigned = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_unassigned").expect("context"),
+    );
+    let written = project_a
+        .execute(json!({
+            "action":"write",
+            "scope":"project",
+            "type":"project",
+            "title":"Authority boundary",
+            "content":"owned by A"
+        }))
+        .await
+        .expect("seed A");
+    let id = written["memory"]["id"].as_str().expect("id");
+
+    for request in [
+        json!({"action":"get","id":id,"project_key":"project_a"}),
+        json!({"action":"write","scope":"project","project_key":"project_a","type":"project","title":"unauthorized","content":"must fail"}),
+        json!({"action":"merge","id":id,"project_key":"project_a","content":"must fail"}),
+        json!({"action":"purge","id":id,"project_key":"project_a"}),
+        json!({"action":"rebuild","scope":"project","project_key":"project_a"}),
+    ] {
+        let error = unassigned
+            .execute(request)
+            .await
+            .expect_err("request data cannot grant authority");
+        assert!(error.to_string().contains("cannot grant Project access"));
     }
-    assert_eq!(backend.calls.lock().expect("calls lock").len(), 4);
+
+    let project_b_state = project_b
+        .execute(json!({"action":"inspect","scope":"project"}))
+        .await
+        .expect("inspect B");
+    assert_eq!(project_b_state["data"]["total_memories"], 0);
+    let project_a_memory = project_a
+        .execute(json!({"action":"get","id":id}))
+        .await
+        .expect("A remains readable");
+    assert_eq!(project_a_memory["memory"]["body"], "owned by A");
+    assert_eq!(
+        project_a_memory["memory"]["frontmatter"]["status"],
+        "active"
+    );
 }
 
 #[tokio::test]
-async fn malformed_action_and_path_like_project_id_fail_before_backend() {
-    let backend = Arc::new(RecordingBackend::default());
-    let server = MemoryServer::new(
-        backend.clone(),
-        MemoryExecutionContext::new("session-1").expect("context"),
+async fn session_append_lock_is_shared_between_server_instances() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let first = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("shared_session").expect("context"),
     );
+    let second = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("shared_session").expect("context"),
+    );
+
+    let (first_result, second_result) = tokio::join!(
+        first.execute(json!({"action":"session_append","content":"alpha"})),
+        second.execute(json!({"action":"session_append","content":"beta"})),
+    );
+    first_result.expect("first append");
+    second_result.expect("second append");
+
+    let read = first
+        .execute(json!({"action":"session_read"}))
+        .await
+        .expect("read both appends");
+    let content = read["content"].as_str().expect("content");
+    assert!(matches!(content, "alpha\n\nbeta" | "beta\n\nalpha"));
+}
+
+#[tokio::test]
+async fn merge_modes_and_single_and_batch_purge_map_to_the_real_store() {
+    let fixture = Fixture::global("session_lifecycle");
+    let server = &fixture.server;
+
+    let merge_target = write_global(server, "Merge target", "first fact").await;
+    let merge_source = write_global(server, "Merge source", "second fact").await;
+    let merged = server
+        .execute(json!({
+            "action":"merge",
+            "id":format!(" {merge_target} "),
+            "content":"coherent addition",
+            "mode":"semantic_merge",
+            "source_memory_ids":[format!(" {merge_source} ")]
+        }))
+        .await
+        .expect("semantic merge");
+    assert_eq!(merged["mode"], "semantic_merge");
+
+    let contradiction_target = write_global(server, "Old fact", "old value").await;
+    let contradiction_source = write_global(server, "New fact", "new value").await;
+    let contradicted = server
+        .execute(json!({
+            "action":"merge",
+            "id":contradiction_target,
+            "content":"superseded by newer evidence",
+            "mode":"contradict",
+            "source_memory_ids":[contradiction_source]
+        }))
+        .await
+        .expect("contradict");
+    assert_eq!(contradicted["mode"], "contradict");
+
+    let single_id = write_global(server, "Single purge", "archive this").await;
+    let single = server
+        .execute(json!({"action":"purge","id":single_id,"mode":"archived"}))
+        .await
+        .expect("single purge");
+    assert_eq!(single["status"], "archived");
+
+    write_global(server, "Batch purge", "archive active entries").await;
+    let batch = server
+        .execute(json!({
+            "action":"purge",
+            "scope":"global",
+            "filters":{"status":["active"]},
+            "mode":"archived"
+        }))
+        .await
+        .expect("batch purge");
+    assert!(batch["data"]["matched_count"].as_u64().expect("count") >= 1);
+}
+
+#[tokio::test]
+async fn malformed_actions_project_ids_and_all_memory_id_shapes_fail_closed() {
+    let fixture = Fixture::global("session_validation");
+    let server = &fixture.server;
     assert!(
         server
             .execute(json!({"action":"memory_search"}))
@@ -425,11 +694,40 @@ async fn malformed_action_and_path_like_project_id_fail_before_backend() {
     );
     assert!(
         server
-            .execute(json!({"action":"query","scope":"project","project_key":"../workspace"}))
+            .execute(json!({
+                "action":"query",
+                "scope":"project",
+                "project_key":"../workspace"
+            }))
             .await
             .is_err()
     );
-    assert!(backend.calls.lock().expect("calls lock").is_empty());
+
+    for arguments in [
+        json!({"action":"get","id":"../../secret"}),
+        json!({"action":"merge","id":"/tmp/secret","content":"x"}),
+        json!({"action":"split","id":"..","pieces":[{"title":"x","content":"x"}]}),
+        json!({"action":"purge","id":"folder/file"}),
+        json!({"action":"consolidate","ids":["safe_id","../unsafe"],"title":"x","content":"x"}),
+        json!({"action":"merge","id":"safe_id","content":"x","source_memory_ids":["../unsafe"]}),
+    ] {
+        let error = server
+            .execute(arguments)
+            .await
+            .expect_err("unsafe id must fail");
+        assert!(error.to_string().contains("path-safe"));
+    }
+
+    let blank_purge = server
+        .execute(json!({"action":"purge","id":"   "}))
+        .await
+        .expect_err("blank id follows the bulk purge branch");
+    assert!(
+        blank_purge
+            .to_string()
+            .contains("purge supports durable scopes only")
+    );
+    assert!(!blank_purge.to_string().contains("path-safe"));
 }
 
 #[derive(Debug, Clone)]
@@ -444,11 +742,11 @@ impl ClientHandler for V2025Client {
 }
 
 #[tokio::test]
-async fn rmcp_duplex_lists_only_memory_and_calls_backend() {
-    let backend = Arc::new(RecordingBackend::default());
+async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
+    let directory = tempfile::tempdir().expect("tempdir");
     let server = MemoryServer::new(
-        backend.clone(),
-        MemoryExecutionContext::new("session-protocol").expect("context"),
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("session_protocol").expect("context"),
     );
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -478,36 +776,43 @@ async fn rmcp_duplex_lists_only_memory_and_calls_backend() {
             .call_tool(CallToolRequestParams::new("memory_search"))
             .await
             .is_err(),
-        "the removed six-tool surface must not remain as an alias"
+        "the removed multi-tool surface must not remain as an alias"
     );
-    assert!(backend.calls.lock().expect("calls lock").is_empty());
 
-    let arguments: JsonObject = json!({
-        "action": "write",
-        "scope": "global",
-        "type": "project",
-        "title": "Protocol",
-        "content": "Reached backend"
-    })
-    .as_object()
-    .expect("object")
-    .clone();
+    let write = call_memory(
+        &client,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "project",
+            "title": "Protocol persistence",
+            "content": "written through the MCP transport"
+        }),
+    )
+    .await;
+    let id = write["memory"]["id"].as_str().expect("id").to_string();
+    let query = call_memory(
+        &client,
+        json!({"action":"query","scope":"global","query":"transport"}),
+    )
+    .await;
+    assert_eq!(query["data"]["items"][0]["id"], id);
+    let get = call_memory(&client, json!({"action":"get","id":id})).await;
+    assert_eq!(get["memory"]["body"], "written through the MCP transport");
+
+    client.cancel().await.expect("cancel client");
+    server_task.await.expect("join server");
+}
+
+async fn call_memory(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, V2025Client>,
+    arguments: Value,
+) -> Value {
+    let arguments: JsonObject = arguments.as_object().expect("object").clone();
     let result = client
         .call_tool(CallToolRequestParams::new(MEMORY_TOOL_NAME).with_arguments(arguments))
         .await
         .expect("call tool");
     assert_eq!(result.is_error, Some(false));
-    assert_eq!(
-        result.structured_content.expect("structured")["action"],
-        "write"
-    );
-    {
-        let calls = backend.calls.lock().expect("calls lock");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].session_id, "session-protocol");
-        assert_eq!(calls[0].arguments.action_name(), "write");
-    }
-
-    client.cancel().await.expect("cancel client");
-    server_task.await.expect("join server");
+    result.structured_content.expect("structured result")
 }

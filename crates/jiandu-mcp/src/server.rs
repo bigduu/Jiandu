@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use jiandu_memory::memory_store::MemoryStore;
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -12,7 +12,7 @@ use rmcp::{
 };
 use serde_json::Value;
 
-use crate::{MemoryArgs, MemoryBackend, MemoryError, MemoryExecutionContext, MemoryInvocation};
+use crate::{MemoryArgs, MemoryError, MemoryExecutionContext};
 
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const MEMORY_TOOL_DESCRIPTION: &str = "Unified memory management tool for Jiandu. Use session_* actions for session continuity notes, and query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project/global memory.";
@@ -28,22 +28,21 @@ pub fn memory_tool() -> Tool {
 
 /// One MCP server instance for one host-provided memory execution context.
 pub struct MemoryServer {
-    backend: Arc<dyn MemoryBackend>,
-    context: MemoryExecutionContext,
+    pub(crate) store: MemoryStore,
+    pub(crate) context: MemoryExecutionContext,
 }
 
 impl MemoryServer {
     #[must_use]
-    pub fn new(backend: Arc<dyn MemoryBackend>, context: MemoryExecutionContext) -> Self {
-        Self { backend, context }
+    pub fn new(store: MemoryStore, context: MemoryExecutionContext) -> Self {
+        Self { store, context }
     }
 
-    /// Transport-independent dispatch used by the stdio adapter and tests.
+    /// Parse and dispatch one unified memory invocation directly to the store.
     pub async fn execute(&self, arguments: Value) -> Result<Value, MemoryError> {
         let arguments: MemoryArgs = serde_json::from_value(arguments)
             .map_err(|error| MemoryError::InvalidArguments(error.to_string()))?;
-        let invocation = MemoryInvocation::from_context(&self.context, arguments)?;
-        self.backend.execute(invocation).await
+        self.execute_parsed(arguments).await
     }
 }
 
