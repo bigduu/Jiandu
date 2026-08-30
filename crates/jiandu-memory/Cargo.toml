@@ -1,6 +1,6 @@
 [package]
 name = "jiandu-memory"
-description = "Unreleased mechanical port of Bamboo's deterministic memory/v1 store"
+description = "Deterministic filesystem memory store with BM25/CJK recall"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

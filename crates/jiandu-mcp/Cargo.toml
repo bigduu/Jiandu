@@ -1,6 +1,6 @@
 [package]
 name = "jiandu-mcp"
-description = "Thin MCP adapter for Jiandu memory"
+description = "Stdio MCP server for the Jiandu shared memory system"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 dashmap.workspace = true
-jiandu-memory = { path = "../jiandu-memory" }
+jiandu-memory = { version = "0.1.0", path = "../jiandu-memory" }
 rmcp = { workspace = true, features = ["transport-io"] }
 schemars.workspace = true
 serde.workspace = true

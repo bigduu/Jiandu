@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use jiandu_mcp::{
-    MEMORY_ACTIONS, MEMORY_TOOL_NAME, MemoryArgs, MemoryExecutionContext, MemoryServer,
-    MemoryToolClass, memory_tool,
+    MEMORY_ACTIONS, MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_NAME, MemoryArgs,
+    MemoryExecutionContext, MemoryServer, MemoryToolClass, memory_tool,
 };
 use jiandu_memory::memory_store::{MAX_MEMORY_ID_LEN, MemoryStore};
 use rmcp::{
@@ -805,6 +805,28 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         info.server_info.as_ref().expect("server info").name,
         "jiandu"
     );
+    assert_eq!(
+        info.instructions.as_deref(),
+        Some(MEMORY_SERVER_INSTRUCTIONS)
+    );
+    let instructions = info.instructions.as_deref().expect("instructions");
+    for required_guidance in [
+        "query",
+        "get",
+        "session_append",
+        "write",
+        "Project scope",
+        "Global",
+        "project_key",
+        "Never store secrets",
+        "supporting evidence",
+        "failed tool call",
+    ] {
+        assert!(
+            instructions.contains(required_guidance),
+            "missing runtime guidance: {required_guidance}"
+        );
+    }
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, MEMORY_TOOL_NAME);

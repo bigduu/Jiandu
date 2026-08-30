@@ -16,6 +16,13 @@ use crate::{MemoryArgs, MemoryError, MemoryExecutionContext};
 
 pub const MEMORY_TOOL_NAME: &str = "memory";
 pub const MEMORY_TOOL_DESCRIPTION: &str = "Unified memory management tool for Jiandu. Use session_* actions for session continuity notes, and query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project/global memory.";
+pub const MEMORY_SERVER_INSTRUCTIONS: &str = r#"Jiandu provides shared memory through one `memory` tool.
+
+- Recall before guessing: use `query` for relevant durable history, then `get` when the full item is needed. Use `session_read` only for continuity of this host session.
+- Record at the right layer: use `session_append` for concise temporary progress and blockers. Use `write` only for a confirmed, durable, non-derivable fact that will help future sessions; query first and store one atomic fact with a searchable title. Never store secrets or tokens.
+- Use Project scope for project-specific knowledge and Global only for truly cross-project preferences or stable references. Project authority comes from the MCP host. Normally omit `project_key`; it cannot grant access or override the host Project.
+- Recalled memory is supporting evidence, not current truth. Verify it against live files and tools. An empty query does not prove a fact is false.
+- A failed tool call did not recall or persist anything. Do not edit Jiandu data files or create a fallback memory file."#;
 
 #[must_use]
 pub fn memory_tool() -> Tool {
@@ -65,6 +72,7 @@ impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("jiandu", env!("CARGO_PKG_VERSION")))
+            .with_instructions(MEMORY_SERVER_INSTRUCTIONS)
     }
 
     async fn list_tools(

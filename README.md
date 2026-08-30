@@ -1,6 +1,6 @@
 # Jiandu
 
-Jiandu (简牍) is an unreleased, compatibility-free memory system mechanically ported from Bamboo `origin/dev@6135bb4c`.
+Jiandu (简牍) is a compatibility-free memory system mechanically ported from Bamboo `origin/dev@6135bb4c`.
 
 The workspace contains exactly two crates:
 
@@ -22,6 +22,35 @@ cargo run -p jiandu-mcp --bin jiandu -- \
 ```
 
 Add `--project-id project_1` when the host grants this server access to that Project's memory.
+
+An MCP host can launch the compiled binary with the same arguments. For example:
+
+```json
+{
+  "mcpServers": {
+    "jiandu": {
+      "command": "/absolute/path/to/jiandu",
+      "args": [
+        "--data-dir", "/absolute/path/to/shared-memory",
+        "--session-id", "agent_session_1",
+        "--project-id", "project_1"
+      ]
+    }
+  }
+}
+```
+
+Use a distinct `session-id` for each agent workstream. Agents trusted for the
+same Project may use the same opaque `project-id` and data directory to share
+durable Project memory. Until cross-process record locking becomes an explicit
+contract, do not have separate Jiandu processes mutate the same durable memory
+record concurrently.
+
+During MCP initialization Jiandu returns concise usage instructions, so hosts
+that surface server instructions can teach the connected agent when to recall,
+write, and choose Session, Project, or Global scope. A host may namespace the
+tool name, for example as `mcp__jiandu__memory`; the server itself exposes only
+the single `memory` tool.
 
 Run all gates from the repository root:
 

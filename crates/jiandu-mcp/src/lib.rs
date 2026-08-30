@@ -16,5 +16,6 @@ pub use args::{
 pub use context::{MemoryError, MemoryExecutionContext};
 pub use jiandu_memory::ProjectId;
 pub use server::{
-    MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME, MemoryServer, memory_tool, serve_stdio,
+    MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME, MemoryServer,
+    memory_tool, serve_stdio,
 };
