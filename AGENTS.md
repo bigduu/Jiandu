@@ -32,10 +32,12 @@ file as a fallback.
   that will help a future session, as one atomic item with a searchable title.
   Never store secrets, credentials, tokens, raw logs, tentative conclusions, or
   routine task completion.
-- A mutation error or interrupted response has an unknown outcome. Run
-  `inspect` first; if only derived artifacts are stale, run `rebuild`; then use
-  `query` or `get` to verify current state before deciding whether another
-  mutation is needed. Never blindly retry.
+- A mutation error or interrupted response has an unknown outcome. For a Session
+  mutation, verify the same topic with `session_read` (and use
+  `session_list_topics` only when the topic itself is uncertain). For a durable
+  Project/Global mutation, run `inspect` for that scope; if only derived artifacts
+  are stale, run `rebuild`; then use `query` or `get` to verify current state.
+  Never blindly retry.
 
 Bamboo may use `jiandu-memory` natively and optimize recalled memory while it
 assembles dynamic agent context. That ranking and prompt policy remains a Bamboo
