@@ -24,8 +24,8 @@ use super::{
     build_memory_markdown_view, build_recent_markdown_view, build_stale_markdown_view,
     derive_summary, detect_entities, extract_keywords, make_query_cursor, match_memory_query,
     normalize_tags, now_rfc3339, parse_markdown_document, parse_query_cursor, parse_rfc3339,
-    render_markdown_document, short_stable_hash, sort_memories_desc, validate_memory_title,
-    validate_session_id, validate_session_topic,
+    render_markdown_document, short_stable_hash, sort_memories_desc, validate_memory_id,
+    validate_memory_title, validate_session_id, validate_session_topic,
 };
 use super::{
     BlobScanItem, BlobScanReport, DuplicateCluster, DuplicateClusterMember, DuplicateScanReport,
@@ -632,44 +632,32 @@ impl MemoryStore {
         })
     }
 
+    /// Resolve one memory without crossing Project boundaries.
+    ///
+    /// A preferred Project resolves Project first and then Global. Without a
+    /// preferred Project, lookup is Global-only; callers must never receive a
+    /// record from an unrelated Project through an implicit all-Project scan.
     pub async fn get_memory(
         &self,
         id: &str,
         preferred_project_key: Option<&str>,
     ) -> io::Result<Option<DurableMemoryDocument>> {
-        let id = id.trim();
-        if id.is_empty() {
-            return Ok(None);
-        }
+        let id = validate_memory_id(id)?;
 
-        if let Some(project_key) = preferred_project_key
-            && let Some(doc) = self
-                .get_memory_in_scope(MemoryScope::Project, Some(project_key), id)
-                .await?
-        {
-            return Ok(Some(doc));
-        }
-
-        if let Some(doc) = self
-            .get_memory_in_scope(MemoryScope::Global, None, id)
-            .await?
-        {
-            return Ok(Some(doc));
-        }
-
-        for project_key in self.list_project_keys().await? {
-            if Some(project_key.as_str()) == preferred_project_key {
-                continue;
-            }
+        if let Some(project_key) = preferred_project_key {
             if let Some(doc) = self
-                .get_memory_in_scope(MemoryScope::Project, Some(project_key.as_str()), id)
+                .get_memory_in_scope(MemoryScope::Project, Some(project_key), id)
                 .await?
             {
                 return Ok(Some(doc));
             }
+            return self
+                .get_memory_in_scope(MemoryScope::Global, None, id)
+                .await;
         }
 
-        Ok(None)
+        self.get_memory_in_scope(MemoryScope::Global, None, id)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -834,7 +822,7 @@ impl MemoryStore {
             },
         };
         let doc = DurableMemoryDocument {
-            path: self.resolver.topic_path(scope, project_key, &id),
+            path: self.resolver.topic_path(scope, project_key, &id)?,
             frontmatter,
             body: content.to_string(),
         };
@@ -871,6 +859,7 @@ impl MemoryStore {
         mode: DurableMemoryStatus,
         reason: Option<&str>,
     ) -> io::Result<Option<DurableMemoryDocument>> {
+        let id = validate_memory_id(id)?;
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
@@ -929,6 +918,7 @@ impl MemoryStore {
         session_id: Option<&str>,
         actor: &str,
     ) -> io::Result<Option<MemorySplitResult>> {
+        let id = validate_memory_id(id)?;
         let Some(mut source) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
@@ -1023,7 +1013,7 @@ impl MemoryStore {
                 },
             };
             let doc = DurableMemoryDocument {
-                path: self.resolver.topic_path(scope, project_key, &new_id),
+                path: self.resolver.topic_path(scope, project_key, &new_id)?,
                 frontmatter,
                 body: content.to_string(),
             };
@@ -1318,6 +1308,10 @@ impl MemoryStore {
         session_id: Option<&str>,
         actor: &str,
     ) -> io::Result<Option<MemoryConsolidateResult>> {
+        let ids = ids
+            .iter()
+            .map(|id| validate_memory_id(id))
+            .collect::<io::Result<Vec<_>>>()?;
         if ids.len() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1346,7 +1340,6 @@ impl MemoryStore {
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut sources: Vec<DurableMemoryDocument> = Vec::with_capacity(ids.len());
         for id in ids {
-            let id = id.trim();
             if !seen_ids.insert(id.to_string()) {
                 continue;
             }
@@ -1456,7 +1449,7 @@ impl MemoryStore {
             },
         };
         let doc = DurableMemoryDocument {
-            path: self.resolver.topic_path(scope, project_key, &new_id),
+            path: self.resolver.topic_path(scope, project_key, &new_id)?,
             frontmatter,
             body: content.to_string(),
         };
@@ -1579,6 +1572,14 @@ impl MemoryStore {
         session_id: Option<&str>,
         actor: &str,
     ) -> io::Result<Option<MemoryContradictionResult>> {
+        let id = validate_memory_id(id)?;
+        let requested_ids = contradicted_by_ids
+            .iter()
+            .map(|value| validate_memory_id(value).map(ToString::to_string))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|value| value != id)
+            .collect::<Vec<_>>();
         let Some(mut target) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
@@ -1592,14 +1593,6 @@ impl MemoryStore {
             return Ok(None);
         };
         target = fresh;
-
-        let requested_ids: Vec<String> = contradicted_by_ids
-            .iter()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .filter(|value| *value != target.frontmatter.id)
-            .map(ToString::to_string)
-            .collect();
 
         let mut contradicted_ids = Vec::new();
         let mut missing_ids = Vec::new();
@@ -1705,6 +1698,14 @@ impl MemoryStore {
         actor: &str,
         source_memory_ids: &[String],
     ) -> io::Result<Option<MemoryMergeResult>> {
+        let id = validate_memory_id(id)?;
+        let source_ids = source_memory_ids
+            .iter()
+            .map(|value| validate_memory_id(value).map(ToString::to_string))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|value| value != id)
+            .collect::<Vec<_>>();
         let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
@@ -1760,13 +1761,6 @@ impl MemoryStore {
             tags_updated = true;
         }
 
-        let source_ids: Vec<String> = source_memory_ids
-            .iter()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .filter(|value| value != &doc.frontmatter.id)
-            .collect();
         if !source_ids.is_empty() {
             let mut supersedes = doc.frontmatter.relations.supersedes.clone();
             supersedes.extend(source_ids.iter().cloned());
@@ -2319,6 +2313,7 @@ impl MemoryStore {
         project_key: Option<&str>,
         id: &str,
     ) -> io::Result<Option<DurableMemoryDocument>> {
+        let id = validate_memory_id(id)?;
         let project_key = self.require_project_key(scope, project_key)?;
         for root in self.resolver.scope_read_roots(scope, project_key) {
             let path = root.join(super::TOPICS_DIR).join(format!("{id}.md"));
@@ -2342,6 +2337,7 @@ impl MemoryStore {
     }
 
     async fn write_document(&self, doc: &DurableMemoryDocument) -> io::Result<()> {
+        validate_memory_id(&doc.frontmatter.id)?;
         if let Some(parent) = doc.path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -2362,7 +2358,7 @@ impl MemoryStore {
             let seed = format!("{}:{}:{}", title, timestamp, counter);
             let suffix = short_stable_hash(&seed).unwrap_or_else(|| "00000000".to_string());
             let id = format!("mem_{}_{}", timestamp, &suffix[..6.min(suffix.len())]);
-            let path = self.resolver.topic_path(scope, project_key, &id);
+            let path = self.resolver.topic_path(scope, project_key, &id)?;
             if !path.exists() {
                 return Ok(id);
             }

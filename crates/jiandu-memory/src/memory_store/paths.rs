@@ -1,8 +1,9 @@
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::ProjectId;
 
-use super::types::MemoryScope;
+use super::{types::MemoryScope, validate_memory_id};
 
 pub const MEMORY_ROOT_DIR: &str = "memory";
 pub const MEMORY_VERSION_DIR: &str = "v1";
@@ -170,9 +171,11 @@ impl MemoryPathResolver {
         scope: MemoryScope,
         project_key: Option<&str>,
         memory_id: &str,
-    ) -> PathBuf {
-        self.topic_dir(scope, project_key)
-            .join(format!("{}.md", memory_id))
+    ) -> io::Result<PathBuf> {
+        let memory_id = validate_memory_id(memory_id)?;
+        Ok(self
+            .topic_dir(scope, project_key)
+            .join(format!("{}.md", memory_id)))
     }
 
     pub fn indexes_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
@@ -249,7 +252,9 @@ mod tests {
             PathBuf::from("/tmp/memory/v1/sessions/session-1/note/default.md")
         );
         assert_eq!(
-            resolver.topic_path(MemoryScope::Project, Some("proj-1"), "mem_1"),
+            resolver
+                .topic_path(MemoryScope::Project, Some("proj-1"), "mem_1")
+                .unwrap(),
             PathBuf::from("/tmp/memory/v1/scopes/projects/proj-1/topics/mem_1.md")
         );
     }

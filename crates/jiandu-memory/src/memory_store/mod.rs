@@ -36,6 +36,7 @@ pub use types::{
 pub const MEMORY_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_SESSION_TOPIC: &str = "default";
 pub const MAX_SESSION_TOPIC_LEN: usize = 50;
+pub const MAX_MEMORY_ID_LEN: usize = 128;
 pub const MAX_MEMORY_TITLE_LEN: usize = 160;
 pub const MAX_MEMORY_TAGS: usize = 32;
 pub const DEFAULT_QUERY_LIMIT: usize = 5;
@@ -55,6 +56,39 @@ pub const RECENT_INDEX_FILE: &str = "recent.json";
 pub const STALE_CANDIDATES_INDEX_FILE: &str = "stale_candidates.json";
 pub const TAXONOMY_INDEX_FILE: &str = "taxonomy.json";
 
+/// Validate an opaque durable-memory identifier before it is used for lookup or
+/// as part of a filesystem path. Leading and trailing whitespace is accepted at
+/// API boundaries and the returned slice is the canonical, trimmed identifier.
+pub fn validate_memory_id(memory_id: &str) -> io::Result<&str> {
+    let trimmed = memory_id.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "memory id cannot be empty",
+        ));
+    }
+    if trimmed.len() > MAX_MEMORY_ID_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "memory id too long (max {} bytes, got {})",
+                MAX_MEMORY_ID_LEN,
+                trimmed.len()
+            ),
+        ));
+    }
+    if !trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "memory id must contain only ASCII alphanumeric, dash, or underscore characters",
+        ));
+    }
+    Ok(trimmed)
+}
+
 pub fn validate_session_id(session_id: &str) -> io::Result<&str> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
@@ -63,7 +97,11 @@ pub fn validate_session_id(session_id: &str) -> io::Result<&str> {
             "session_id cannot be empty",
         ));
     }
-    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+    if matches!(trimmed, "." | "..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "session_id contains invalid path characters",
@@ -325,12 +363,20 @@ pub fn parse_markdown_document(content: &str) -> io::Result<(DurableMemoryFrontm
     };
     let yaml = &rest[..end_idx];
     let body = &rest[end_idx + "\n---\n".len()..];
-    let frontmatter: DurableMemoryFrontmatter = serde_yaml::from_str(yaml).map_err(|error| {
+    let mut frontmatter: DurableMemoryFrontmatter =
+        serde_yaml::from_str(yaml).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse memory frontmatter: {error}"),
+            )
+        })?;
+    let memory_id = validate_memory_id(&frontmatter.id).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("failed to parse memory frontmatter: {error}"),
+            format!("invalid memory frontmatter id: {error}"),
         )
     })?;
+    frontmatter.id = memory_id.to_string();
     Ok((frontmatter, body.trim().to_string()))
 }
 
@@ -338,7 +384,9 @@ pub fn render_markdown_document(
     frontmatter: &DurableMemoryFrontmatter,
     body: &str,
 ) -> io::Result<String> {
-    let yaml = build_yaml_frontmatter(frontmatter)?;
+    let mut frontmatter = frontmatter.clone();
+    frontmatter.id = validate_memory_id(&frontmatter.id)?.to_string();
+    let yaml = build_yaml_frontmatter(&frontmatter)?;
     Ok(format!("---\n{}---\n\n{}\n", yaml, body.trim()))
 }
 
@@ -660,6 +708,51 @@ mod tests {
     fn parse_markdown_document_requires_frontmatter() {
         let result = parse_markdown_document("plain body");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn memory_and_session_ids_reject_path_syntax_and_reserved_components() {
+        assert_eq!(
+            validate_memory_id("Memory_01-safe").unwrap(),
+            "Memory_01-safe"
+        );
+        assert_eq!(validate_memory_id(" mem_1 ").unwrap(), "mem_1");
+        assert!(validate_memory_id(&"a".repeat(MAX_MEMORY_ID_LEN)).is_ok());
+        for invalid in ["", "/tmp/escape", "../escape", "nested/id", "nested\\id"] {
+            assert!(validate_memory_id(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(validate_memory_id(&"a".repeat(MAX_MEMORY_ID_LEN + 1)).is_err());
+
+        for invalid in [".", "..", " . ", " .. "] {
+            assert!(
+                validate_session_id(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_frontmatter_ids_are_normalized_before_use_or_persistence() {
+        let document = "---\n\
+id: ' mem_1 '\n\
+title: Canonical id\n\
+type: project\n\
+scope: project\n\
+project_key: proj-1\n\
+status: active\n\
+created_at: 2026-01-01T00:00:00Z\n\
+updated_at: 2026-01-01T00:00:00Z\n\
+created_by:\n  kind: session\n\
+updated_by:\n  kind: memory_write\n\
+---\n\
+Body.\n";
+        let (mut frontmatter, body) = parse_markdown_document(document).unwrap();
+        assert_eq!(frontmatter.id, "mem_1");
+
+        frontmatter.id = " mem_2 ".to_string();
+        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
+        assert!(rendered.contains("id: mem_2\n"));
+        assert!(!rendered.contains(" mem_2 "));
     }
 
     /// A granularity set on the frontmatter round-trips through render + parse.
