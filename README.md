@@ -79,12 +79,14 @@ fail the recall that produced the sample.
 A mutation is not a filesystem-wide transaction. A call can return an error
 after its canonical memory document was committed but before an audit or
 rebuildable artifact completed; cancellation or disconnect can also leave an
-accepted owned mutation running. A subsequent `inspect`, `query`, or `get` on
-that same server is ordered after the accepted mutation settles. After any
-failure or interrupted response, run `inspect` first. If canonical documents
-committed but derived artifacts are stale, run `rebuild`, then use `query` or
-`get` to verify current state before choosing the next action; never blindly
-retry.
+accepted owned mutation running. A subsequent read-only call on that same server
+is ordered after the accepted mutation settles. After a Session mutation failure
+or interrupted response, verify the same topic with `session_read`; use
+`session_list_topics` only when the topic itself is uncertain. After a durable
+Project/Global mutation failure or interrupted response, `inspect` the known
+affected scope and do not guess the scope. If canonical documents committed but
+derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify
+current state before choosing the next action; never blindly retry.
 
 During MCP initialization Jiandu returns concise usage instructions, so hosts
 that surface server instructions can teach the connected agent when to recall,
