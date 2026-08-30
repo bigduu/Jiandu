@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::io;
 
-use super::{DurableMemoryStatus, MemoryScope, MemoryStore, TemporalGranularity, parse_rfc3339};
+use super::{
+    DurableMemoryStatus, LexicalIndex, MemoryScope, MemoryStore, TemporalGranularity, parse_rfc3339,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRecallCandidate {
@@ -76,51 +78,29 @@ pub async fn select_relevant_memories(
     })
 }
 
-async fn lexical_shortlist_relevant_memories(
-    store: &MemoryStore,
-    project_key: Option<&str>,
+/// Rank recall candidates from a caller-provided lexical index.
+///
+/// This function is deterministic and performs no filesystem or network I/O. It
+/// applies Jiandu's fixed BM25/CJK scoring, status eligibility, and deterministic
+/// ordering, while remaining policy-neutral about cross-index composition: it
+/// ranks only the items in `index`. The caller remains responsible for scope
+/// precedence, fallback behavior, index unions, and any primary-first ID
+/// deduplication. `limit` is an exact upper bound; a zero limit, a blank query,
+/// or a query without scorable matches returns an empty vector.
+#[must_use]
+pub fn recall_candidates_from_lexical_index(
+    index: &LexicalIndex,
     query: &str,
-    options: &MemoryRecallOptions,
-) -> io::Result<Vec<MemoryRecallCandidate>> {
+    limit: usize,
+) -> Vec<MemoryRecallCandidate> {
     let query = query.trim();
-    if query.is_empty() {
-        return Ok(Vec::new());
+    if limit == 0 || query.is_empty() {
+        return Vec::new();
     }
-
-    let limit = options.shortlist_limit.max(1);
-    let per_scope_limit = options.max_candidates_per_scope.max(limit);
-
-    if let Some(project_key) = project_key.map(str::trim).filter(|value| !value.is_empty()) {
-        let mut project_hits =
-            shortlist_scope(store, MemoryScope::Project, Some(project_key), query).await?;
-        project_hits.truncate(per_scope_limit);
-        if !project_hits.is_empty() {
-            return Ok(project_hits);
-        }
-    }
-
-    if options.include_global_fallback {
-        let mut global_hits = shortlist_scope(store, MemoryScope::Global, None, query).await?;
-        global_hits.truncate(per_scope_limit);
-        return Ok(global_hits);
-    }
-
-    Ok(Vec::new())
-}
-
-async fn shortlist_scope(
-    store: &MemoryStore,
-    scope: MemoryScope,
-    project_key: Option<&str>,
-    query: &str,
-) -> io::Result<Vec<MemoryRecallCandidate>> {
-    let Some(index) = store.read_lexical_index(scope, project_key).await? else {
-        return Ok(Vec::new());
-    };
 
     let query_tokens = super::lexical_bm25::tokenize(query);
     if query_tokens.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let corpus = super::lexical_bm25::Bm25Corpus::build(&index.items);
@@ -147,7 +127,56 @@ async fn shortlist_scope(
         .collect::<Vec<_>>();
 
     sort_recall_candidates(&mut candidates);
-    Ok(candidates)
+    candidates.truncate(limit);
+    candidates
+}
+
+async fn lexical_shortlist_relevant_memories(
+    store: &MemoryStore,
+    project_key: Option<&str>,
+    query: &str,
+    options: &MemoryRecallOptions,
+) -> io::Result<Vec<MemoryRecallCandidate>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let limit = options.shortlist_limit.max(1);
+    let per_scope_limit = options.max_candidates_per_scope.max(limit);
+
+    if let Some(project_key) = project_key.map(str::trim).filter(|value| !value.is_empty()) {
+        let project_hits = shortlist_scope(
+            store,
+            MemoryScope::Project,
+            Some(project_key),
+            query,
+            per_scope_limit,
+        )
+        .await?;
+        if !project_hits.is_empty() {
+            return Ok(project_hits);
+        }
+    }
+
+    if options.include_global_fallback {
+        return shortlist_scope(store, MemoryScope::Global, None, query, per_scope_limit).await;
+    }
+
+    Ok(Vec::new())
+}
+
+async fn shortlist_scope(
+    store: &MemoryStore,
+    scope: MemoryScope,
+    project_key: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> io::Result<Vec<MemoryRecallCandidate>> {
+    let Some(index) = store.read_lexical_index(scope, project_key).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(recall_candidates_from_lexical_index(&index, query, limit))
 }
 
 fn sort_recall_candidates(candidates: &mut [MemoryRecallCandidate]) {
@@ -175,7 +204,7 @@ fn sort_recall_candidates(candidates: &mut [MemoryRecallCandidate]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_store::DurableMemoryType;
+    use crate::memory_store::{DurableMemoryType, LexicalIndexItem};
     use tempfile::tempdir;
 
     fn candidate(
@@ -193,6 +222,25 @@ mod tests {
             updated_at: "2026-04-09T00:00:00Z".to_string(),
             summary: "summary".to_string(),
             granularity,
+        }
+    }
+
+    fn lexical_item(id: &str, status: DurableMemoryStatus, title: &str) -> LexicalIndexItem {
+        LexicalIndexItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            scope: MemoryScope::Project,
+            project_key: Some("proj-1".to_string()),
+            r#type: DurableMemoryType::Project,
+            status,
+            tags: Vec::new(),
+            keywords: Vec::new(),
+            entities: Vec::new(),
+            updated_at: "2026-04-09T00:00:00Z".to_string(),
+            created_at: "2026-04-09T00:00:00Z".to_string(),
+            summary: title.to_string(),
+            granularity: None,
+            embedding: None,
         }
     }
 
@@ -220,6 +268,77 @@ mod tests {
         ];
         sort_recall_candidates(&mut candidates);
         assert_eq!(candidates[0].id, "day-high");
+    }
+
+    #[test]
+    fn lexical_index_recall_is_cjk_status_aware_limited_and_deterministic() {
+        let index = LexicalIndex {
+            generated_at: "2026-04-09T00:00:00Z".to_string(),
+            items: vec![
+                lexical_item("stale", DurableMemoryStatus::Stale, "多租户隔离设计"),
+                lexical_item("active", DurableMemoryStatus::Active, "多租户隔离设计"),
+                lexical_item("archived", DurableMemoryStatus::Archived, "多租户隔离设计"),
+                lexical_item("unrelated", DurableMemoryStatus::Active, "缓存前缀稳定性"),
+            ],
+        };
+
+        let limited = recall_candidates_from_lexical_index(&index, "多租户", 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "active");
+        assert_eq!(limited[0].status, DurableMemoryStatus::Active);
+
+        let all = recall_candidates_from_lexical_index(&index, "多租户", 10);
+        assert_eq!(
+            all.iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active", "stale"]
+        );
+        assert_eq!(
+            all,
+            recall_candidates_from_lexical_index(&index, "多租户", 10)
+        );
+        assert!(recall_candidates_from_lexical_index(&index, "多租户", 0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_shortlist_matches_pure_lexical_index_recall() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        store
+            .write_memory(
+                MemoryScope::Project,
+                Some("proj-1"),
+                DurableMemoryType::Project,
+                "Checkpoint recovery decision",
+                "Restore the database snapshot before reopening traffic.",
+                &[],
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let options = MemoryRecallOptions {
+            shortlist_limit: 2,
+            include_global_fallback: false,
+            max_candidates_per_scope: 4,
+        };
+        let from_store =
+            shortlist_relevant_memories(&store, Some("proj-1"), "checkpoint", &options)
+                .await
+                .unwrap();
+        let index = store
+            .read_lexical_index(MemoryScope::Project, Some("proj-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let from_index =
+            recall_candidates_from_lexical_index(&index, "checkpoint", options.shortlist_limit);
+
+        assert_eq!(from_store, from_index);
     }
 
     #[tokio::test]

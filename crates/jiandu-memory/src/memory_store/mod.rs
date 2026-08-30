@@ -20,7 +20,7 @@ pub use freshness::{
 pub use paths::{MemoryPathResolver, ProjectMemoryPathResolver, SESSIONS_DIR, TOPICS_DIR};
 pub use recall::{
     MemoryRecallCandidate, MemoryRecallOptions, MemoryRecallSelection, MemoryRecallStrategy,
-    select_relevant_memories, shortlist_relevant_memories,
+    recall_candidates_from_lexical_index, select_relevant_memories, shortlist_relevant_memories,
 };
 pub use store::MemoryStore;
 pub use types::{
