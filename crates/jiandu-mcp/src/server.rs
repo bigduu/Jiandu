@@ -201,3 +201,52 @@ fn success_result(value: Value) -> CallToolResult {
     result.structured_content = Some(value);
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, task::Poll};
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn read_only_execute_waits_for_the_internal_mutation_barrier() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let server = MemoryServer::new(
+            MemoryStore::new(directory.path()),
+            MemoryExecutionContext::new("session_read_barrier").expect("context"),
+        );
+
+        // Missing-memory lookup performs no asynchronous filesystem operation.
+        // Prove that premise so Pending below can only come from the barrier.
+        let mut unblocked =
+            Box::pin(server.execute(json!({"action": "get", "id": "missing-unblocked"})));
+        let unblocked_first_poll =
+            std::future::poll_fn(|context| Poll::Ready(unblocked.as_mut().poll(context))).await;
+        assert!(
+            matches!(
+                &unblocked_first_poll,
+                Poll::Ready(Err(MemoryError::Execution(message)))
+                    if message == "memory not found: missing-unblocked"
+            ),
+            "missing get should synchronously reach its handler: {unblocked_first_poll:?}"
+        );
+
+        let guard = server.in_flight.begin();
+        let mut blocked =
+            Box::pin(server.execute(json!({"action": "get", "id": "missing-blocked"})));
+        let blocked_first_poll =
+            std::future::poll_fn(|context| Poll::Ready(blocked.as_mut().poll(context))).await;
+        assert!(
+            matches!(&blocked_first_poll, Poll::Pending),
+            "read-only execute bypassed the in-flight mutation barrier: {blocked_first_poll:?}"
+        );
+
+        drop(guard);
+        assert_eq!(
+            blocked.await.expect_err("missing memory remains an error"),
+            MemoryError::Execution("memory not found: missing-blocked".to_string())
+        );
+    }
+}
