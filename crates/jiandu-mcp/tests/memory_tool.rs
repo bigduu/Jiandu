@@ -972,7 +972,10 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         "cancellation or disconnect",
         "same server",
         "subsequent read-only calls wait",
-        "run `inspect` first",
+        "same topic with `session_read`",
+        "`session_list_topics` only when the topic itself is uncertain",
+        "`inspect` the known affected scope",
+        "do not guess the scope",
         "run `rebuild`",
         "never blindly retry",
     ] {
@@ -984,6 +987,10 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
     assert!(
         !instructions.contains("failed tool call did not recall or persist anything"),
         "instructions must not promise transactional failure semantics"
+    );
+    assert!(
+        !instructions.contains("run `inspect` first"),
+        "Session recovery must not be routed through durable-only inspect"
     );
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(tools.len(), 1);
