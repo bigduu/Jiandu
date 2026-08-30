@@ -1,100 +1,64 @@
 # Jiandu
 
-Jiandu (简牍) is a compatibility-free memory system mechanically ported from Bamboo `origin/dev@6135bb4c`.
+Jiandu (简牍) is a small, filesystem-backed memory system for AI agents. It stores
+session notes and durable knowledge with deterministic lexical recall and MCP.
 
-The workspace contains exactly two crates:
+## Components
 
-- `crates/jiandu-memory`: atomic filesystem persistence, deterministic memory operations, and lexical/BM25/CJK recall.
-- `crates/jiandu-mcp`: one stdio MCP server exposing one unified `memory` tool with Bamboo's current 17 actions.
+- `jiandu-memory` provides persistence, maintenance, and lexical/BM25/CJK recall.
+- `jiandu-mcp` exposes the store over stdio as one MCP tool named `memory`.
+  Its `action` argument selects one of 17 memory operations.
 
-Callers provide a stable, opaque, path-safe `ProjectId`; Jiandu never derives Project identity from a workspace path. A request parameter may confirm the host-provided Project identity, but cannot grant Project access.
+## Memory scopes
 
-`memory/v1` is only the name of the current internal on-disk layout. It is not a public `v1alpha` API or a compatibility lifecycle. Jiandu contains no historical readers, aliases, migrations, versioned schemas, or old `v1alpha` crates.
+- **Session** is temporary continuity for one host-identified agent workstream.
+- **Project** is durable knowledge shared by agents working on the same project.
+  The MCP host grants access with a stable, opaque `project-id`.
+- **Global** is durable knowledge that is genuinely useful across projects.
 
-The baseline preserves Session notes, durable memory CRUD and maintenance, rebuildable artifacts, recall, and concurrency behavior. Dream, LLM reranking, ledger, plan, budget, prompt assembly, workspace discovery, and `workspace_state` remain Bamboo responsibilities.
-
-Run the server:
+## Install and connect
 
 ```shell
-cargo run -p jiandu-mcp --bin jiandu -- \
-  --data-dir /path/to/data \
-  --session-id session_1
+cargo install jiandu-mcp --locked
 ```
 
-Add `--project-id project_1` when the host grants this server access to that Project's memory.
-
-An MCP host can launch the compiled binary with the same arguments. For example:
+Configure an MCP host to launch it:
 
 ```json
 {
   "mcpServers": {
     "jiandu": {
-      "command": "/absolute/path/to/jiandu",
+      "command": "jiandu",
       "args": [
         "--data-dir", "/absolute/path/to/shared-memory",
-        "--session-id", "agent_session_1",
-        "--project-id", "project_1"
+        "--session-id", "agent-session-1",
+        "--project-id", "project-1"
       ]
     }
   }
 }
 ```
 
-Use a distinct `session-id` for each agent workstream. Agents trusted for the
-same Project may use the same opaque `project-id` and data directory to share
-durable Project memory.
+The host may namespace the tool as `mcp__jiandu__memory`. A typical Project
+recall call still uses the same tool arguments:
 
-Durable concurrency is scoped, not record-local. Every mutation holds both a
-process-local mutex and an OS advisory lock for the complete canonical
-read-modify-write, audit append, and derived-artifact refresh. Separate Jiandu
-processes can therefore safely mutate different records in the same Global or
-Project scope; mutations in different scopes remain independent. Lock files are
-internal to each scope and require no host configuration.
+```json
+{"action":"query","scope":"project","query":"release decision"}
+```
 
-Advisory locking is cooperative: every writer to a Jiandu data directory must
-use Jiandu's API. Direct edits to canonical files are unsupported and can bypass
-the concurrency contract. Session notes are intentionally isolated by
-`session-id`; do not share one Session identity across independent processes.
+Use a different `session-id` for each workstream. Agents that should share
+Project memory use the same data directory and host-authorized `project-id`.
+Query before writing, keep durable items concise, and never edit Jiandu's data
+files directly.
 
-After MCP argument validation, Jiandu executes the complete call in an owned
-server task. Cancelling the request waiter or disconnecting the client detaches
-that task instead of aborting it halfway through a blocking filesystem operation;
-the same-scope guard remains held until the operation returns. The stdio server
-tracks only mutating calls and drains them after transport EOF/disconnect before
-returning, so its normal runtime shutdown does not cut them off. A forced process
-or runtime termination can still end outstanding work. On the same
-`MemoryServer`, subsequent read-only calls wait for all currently in-flight
-accepted mutations to settle before reading, including mutations whose original
-request waiter was cancelled. This is a server-local MCP ordering guarantee, not
-a cross-process reader/writer lock or a cancellation guarantee on direct
-`MemoryStore` mutation futures: native callers must keep those futures alive to
-completion or provide equivalent owned-task supervision.
+## Host integration
 
-Recall access logging remains a best-effort soft signal outside the durable
-scope lock. Under cross-process recall load, a sample can be lost (especially
-during rare log compaction); this can only make later capacity ranking slightly
-stale. It cannot change canonical memory, corrupt derived recall artifacts, or
-fail the recall that produced the sample.
+Bamboo can use `jiandu-memory` directly and optimize recall while assembling
+its dynamic context. Ranking, prompt placement, and token budgeting remain
+Bamboo responsibilities. Other agents use `jiandu-mcp` as shared memory without
+depending on Bamboo runtime types.
 
-A mutation is not a filesystem-wide transaction. A call can return an error
-after its canonical memory document was committed but before an audit or
-rebuildable artifact completed; cancellation or disconnect can also leave an
-accepted owned mutation running. A subsequent read-only call on that same server
-is ordered after the accepted mutation settles. After a Session mutation failure
-or interrupted response, verify the same topic with `session_read`; use
-`session_list_topics` only when the topic itself is uncertain. After a durable
-Project/Global mutation failure or interrupted response, `inspect` the known
-affected scope and do not guess the scope. If canonical documents committed but
-derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify
-current state before choosing the next action; never blindly retry.
-
-During MCP initialization Jiandu returns concise usage instructions, so hosts
-that surface server instructions can teach the connected agent when to recall,
-write, and choose Session, Project, or Global scope. A host may namespace the
-tool name, for example as `mcp__jiandu__memory`; the server itself exposes only
-the single `memory` tool.
-
-Run all gates from the repository root:
+## Verify
 
 ```shell
 cargo fmt --all -- --check

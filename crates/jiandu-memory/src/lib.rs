@@ -1,8 +1,7 @@
-//! Unreleased, compatibility-free port of Bamboo's current `memory/v1` store.
+//! Filesystem-backed memory persistence and deterministic lexical recall.
 //!
-//! The implementation deliberately contains only deterministic filesystem
-//! memory behavior. Model reranking, Dream, MCP, and historical formats remain
-//! outside this crate.
+//! This crate owns the native memory model and store. MCP transport, model
+//! reranking, and host-side prompt assembly remain outside the crate.
 
 mod atomic_fs;
 mod project_id;
