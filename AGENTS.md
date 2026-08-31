@@ -11,6 +11,19 @@ Keep MCP concerns out of the memory crate, and map MCP actions directly to
 provide a stable opaque `ProjectId`; prompt assembly and ranking policy belong
 to the consuming host.
 
+Jiandu owns one independent authoritative data root, normally `~/.jiandu`.
+Bamboo native memory and other agents' MCP processes use that same root after
+cutover; do not add a second Bamboo-owned durable store, dual-write path,
+fallback root, synchronization service, or compatibility layer.
+
+The only Bamboo migration surface is the existing `jiandu` binary's one-shot
+`import-bamboo` command. The source must be read-only in practice (Bamboo writes
+stopped or a static snapshot), and the destination must be absent or empty. It
+accepts only current Global and typed-Project `memory/v1` topic Markdown, stages
+beside the final root, rebuilds each imported scope once, and publishes after
+full validation. Do not extend it into a generic importer, daemon, WAL, receipt,
+migration ledger, or historical-format platform.
+
 ## Agent Use Through MCP
 
 Use the single `memory` tool; a host may namespace it as
@@ -26,6 +39,9 @@ Use the single `memory` tool; a host may namespace it as
   will help a future session, as concise atomic items with searchable titles.
 - Never edit Jiandu data files directly or create a repository memory file as a
   fallback; all reads and mutations go through `jiandu-memory` or the MCP tool.
+- Configure every agent that shares memory with the same Jiandu-owned
+  `--data-dir`. The host must still grant an explicit `project-id`; sharing a
+  root does not grant cross-Project access.
 
 ## Development Gates
 
