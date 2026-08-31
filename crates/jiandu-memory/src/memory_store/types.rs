@@ -228,10 +228,19 @@ pub struct DurableMemoryRetrieval {
     pub keywords: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<String>,
-    #[serde(default)]
-    pub embedding_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<String>,
+}
+
+/// Optional lexical hints supplied by the calling model while it already has
+/// semantic context. The store bounds, normalizes, and expands these with its
+/// deterministic fallback extraction; no model/provider call happens here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryRetrievalInput {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -3,9 +3,9 @@ use std::io;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 mod access_log;
-pub mod embedding;
 pub mod freshness;
 mod lexical_bm25;
 pub mod paths;
@@ -29,8 +29,9 @@ pub use types::{
     DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource,
     DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult, MemoryContradictionResult,
     MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPurgeResult,
-    MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemoryScope,
-    MemorySplitPiece, MemorySplitResult, SessionState, TemporalGranularity,
+    MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
+    MemoryRetrievalInput, MemoryScope, MemorySplitPiece, MemorySplitResult, SessionState,
+    TemporalGranularity,
 };
 
 pub const MEMORY_SCHEMA_VERSION: u32 = 1;
@@ -39,7 +40,16 @@ pub const MAX_SESSION_TOPIC_LEN: usize = 50;
 pub const MAX_MEMORY_ID_LEN: usize = 128;
 pub const MAX_MEMORY_TITLE_LEN: usize = 160;
 pub const MAX_MEMORY_TAGS: usize = 32;
-pub const DEFAULT_QUERY_LIMIT: usize = 5;
+/// Caller-supplied retrieval hints stay intentionally small; deterministic
+/// fallback expansion retains the wider legacy coverage below.
+pub const MAX_EXPLICIT_MEMORY_KEYWORDS: usize = 32;
+pub const MAX_EXPLICIT_MEMORY_ENTITIES: usize = 16;
+pub const MAX_MEMORY_KEYWORDS: usize = 128;
+pub const MAX_MEMORY_ENTITIES: usize = 64;
+pub const MAX_RETRIEVAL_TERM_CHARS: usize = 96;
+pub const MAX_MEMORY_TAG_CHARS: usize = 64;
+pub const MAX_MEMORY_QUERY_CHARS: usize = 512;
+pub const DEFAULT_QUERY_LIMIT: usize = 3;
 pub const MAX_QUERY_LIMIT: usize = 20;
 pub const DEFAULT_MAX_CHARS: usize = 3_000;
 pub const MAX_MAX_CHARS: usize = 6_000;
@@ -173,31 +183,29 @@ pub fn validate_memory_title(title: &str) -> io::Result<&str> {
 }
 
 pub fn normalize_tag(tag: &str) -> Option<String> {
-    let trimmed = tag.trim();
+    let normalized = tag.nfkc().collect::<String>();
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return None;
     }
     let mut out = String::with_capacity(trimmed.len());
     let mut prev_dash = false;
-    for ch in trimmed.chars() {
-        let normalized = match ch {
-            'A'..='Z' => ch.to_ascii_lowercase(),
-            'a'..='z' | '0'..='9' => ch,
-            '-' | '_' | ' ' | '.' | '/' => '-',
-            _ => continue,
-        };
-        if normalized == '-' {
-            if prev_dash {
-                continue;
-            }
-            prev_dash = true;
-            out.push(normalized);
-        } else {
+    for ch in trimmed.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
             prev_dash = false;
-            out.push(normalized);
+            out.push(ch);
+        } else if (matches!(ch, '-' | '_' | '.' | '/') || ch.is_whitespace()) && !prev_dash {
+            prev_dash = true;
+            out.push('-');
         }
     }
-    let normalized = out.trim_matches('-').to_string();
+    let normalized = out
+        .trim_matches('-')
+        .chars()
+        .take(MAX_MEMORY_TAG_CHARS)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
     (!normalized.is_empty()).then_some(normalized)
 }
 
@@ -216,6 +224,119 @@ where
         }
     }
     seen.into_iter().collect()
+}
+
+fn normalize_retrieval_term(value: &str) -> Option<String> {
+    let normalized = value.nfkc().collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded = collapsed
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_RETRIEVAL_TERM_CHARS)
+        .collect::<String>();
+    let bounded = bounded.trim();
+    (!bounded.is_empty()).then(|| bounded.to_string())
+}
+
+/// Normalize, deduplicate, and bound stored or returned lexical retrieval terms.
+///
+/// This does not derive or expand terms; callers choose the appropriate count
+/// limit for model input, canonical storage, or a response surface.
+pub fn normalize_retrieval_terms<I, S>(values: I, limit: usize) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let Some(value) = normalize_retrieval_term(value.as_ref()) else {
+            continue;
+        };
+        let key = value.to_lowercase();
+        if seen.insert(key) {
+            normalized.push(value);
+            if normalized.len() >= limit {
+                break;
+            }
+        }
+    }
+    normalized
+}
+
+fn merge_retrieval_terms(
+    explicit: &[String],
+    fallback: &[String],
+    explicit_limit: usize,
+    total_limit: usize,
+) -> Vec<String> {
+    let explicit = normalize_retrieval_terms(explicit, explicit_limit);
+    normalize_retrieval_terms(
+        explicit.iter().chain(fallback.iter()).map(String::as_str),
+        total_limit,
+    )
+}
+
+pub fn retrieval_keywords(
+    title: &str,
+    content: &str,
+    tags: &[String],
+    explicit: &[String],
+) -> Vec<String> {
+    let fallback = extract_keywords(title, content, tags);
+    merge_retrieval_terms(
+        explicit,
+        &fallback,
+        MAX_EXPLICIT_MEMORY_KEYWORDS,
+        MAX_MEMORY_KEYWORDS,
+    )
+}
+
+fn retrieval_keywords_preserving(
+    title: &str,
+    content: &str,
+    tags: &[String],
+    explicit: &[String],
+    preserved: &[String],
+) -> Vec<String> {
+    let explicit = normalize_retrieval_terms(explicit, MAX_EXPLICIT_MEMORY_KEYWORDS);
+    let fallback = extract_keywords(title, content, tags);
+    normalize_retrieval_terms(
+        explicit
+            .iter()
+            .chain(preserved.iter())
+            .chain(fallback.iter())
+            .map(String::as_str),
+        MAX_MEMORY_KEYWORDS,
+    )
+}
+
+pub fn retrieval_entities(title: &str, content: &str, explicit: &[String]) -> Vec<String> {
+    let fallback = detect_entities(title, content);
+    merge_retrieval_terms(
+        explicit,
+        &fallback,
+        MAX_EXPLICIT_MEMORY_ENTITIES,
+        MAX_MEMORY_ENTITIES,
+    )
+}
+
+fn retrieval_entities_preserving(
+    title: &str,
+    content: &str,
+    explicit: &[String],
+    preserved: &[String],
+) -> Vec<String> {
+    let explicit = normalize_retrieval_terms(explicit, MAX_EXPLICIT_MEMORY_ENTITIES);
+    let fallback = detect_entities(title, content);
+    normalize_retrieval_terms(
+        explicit
+            .iter()
+            .chain(preserved.iter())
+            .chain(fallback.iter())
+            .map(String::as_str),
+        MAX_MEMORY_ENTITIES,
+    )
 }
 
 pub fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
@@ -271,7 +392,7 @@ pub fn extract_keywords(title: &str, content: &str, tags: &[String]) -> Vec<Stri
         seen.insert(token);
     }
 
-    seen.into_iter().take(128).collect()
+    seen.into_iter().take(MAX_MEMORY_KEYWORDS).collect()
 }
 
 pub fn detect_entities(title: &str, content: &str) -> Vec<String> {
@@ -289,7 +410,7 @@ pub fn detect_entities(title: &str, content: &str) -> Vec<String> {
             entities.insert(trimmed.to_string());
         }
     }
-    entities.into_iter().take(64).collect()
+    entities.into_iter().take(MAX_MEMORY_ENTITIES).collect()
 }
 
 pub fn sanitize_component(input: &str) -> String {
@@ -415,12 +536,6 @@ pub struct LexicalIndexItem {
     /// older `lexical.json` index files predate this field and deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granularity: Option<TemporalGranularity>,
-    /// Optional dense embedding (title+keywords+summary), populated at index-build
-    /// time WHEN a [`embedding::MemoryEmbedder`] backend is configured. Reserved by
-    /// L1: absent today (recall is pure BM25) so this seam is inert; when present,
-    /// recall adds a β·cosine term. Back-compat: older index files → `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -702,6 +817,74 @@ mod tests {
     fn normalize_tags_dedupes_and_sanitizes() {
         let tags = normalize_tags(["User Preference", "user-preference", "release/freeze"]);
         assert_eq!(tags, vec!["release-freeze", "user-preference"]);
+    }
+
+    #[test]
+    fn retrieval_metadata_is_cjk_safe_bounded_and_keeps_legacy_expansion() {
+        let tags = normalize_tags([" Ａuth 认证 ", "auth-认证", "发布/流程"]);
+        assert!(tags.contains(&"auth-认证".to_string()));
+        assert!(tags.contains(&"发布-流程".to_string()));
+
+        let legacy_body = (0..160)
+            .map(|index| format!("legacyterm{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fallback = extract_keywords("legacy", &legacy_body, &[]);
+        assert_eq!(fallback.len(), MAX_MEMORY_KEYWORDS);
+
+        let explicit = (0..40)
+            .map(|index| format!("model-alias-{index:02}"))
+            .chain(["专用别名".to_string(), "model-alias-00".to_string()])
+            .collect::<Vec<_>>();
+        let keywords = retrieval_keywords("legacy", &legacy_body, &[], &explicit);
+        assert_eq!(keywords.len(), MAX_MEMORY_KEYWORDS);
+        assert_eq!(keywords[0], "model-alias-00");
+        assert!(keywords.contains(&"model-alias-31".to_string()));
+        assert!(!keywords.contains(&"model-alias-32".to_string()));
+        assert!(
+            keywords.iter().any(|value| value.starts_with("legacyterm")),
+            "bounded explicit hints must not displace all legacy fallback coverage"
+        );
+    }
+
+    #[test]
+    fn legacy_embedding_fields_are_read_but_never_rendered_again() {
+        let document = "---\n\
+id: legacy_memory\n\
+title: Legacy metadata\n\
+type: project\n\
+scope: global\n\
+status: active\n\
+created_at: 2026-01-01T00:00:00Z\n\
+updated_at: 2026-01-01T00:00:00Z\n\
+created_by:\n  kind: session\n\
+updated_by:\n  kind: memory_write\n\
+retrieval:\n  keywords: [legacy]\n  embedding_ready: true\n\
+---\n\
+Legacy body.\n";
+        let (frontmatter, body) = parse_markdown_document(document).unwrap();
+        assert_eq!(frontmatter.retrieval.keywords, vec!["legacy"]);
+        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
+        assert!(!rendered.contains("embedding_ready"));
+
+        let legacy_index_item = serde_json::json!({
+            "id": "legacy_memory",
+            "title": "Legacy metadata",
+            "scope": "global",
+            "project_key": null,
+            "type": "project",
+            "status": "active",
+            "tags": [],
+            "keywords": ["legacy"],
+            "entities": [],
+            "updated_at": "2026-01-01T00:00:00Z",
+            "created_at": "2026-01-01T00:00:00Z",
+            "summary": "Legacy body.",
+            "embedding": [0.1, 0.2]
+        });
+        let parsed: LexicalIndexItem = serde_json::from_value(legacy_index_item).unwrap();
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("embedding"));
     }
 
     #[test]

@@ -21,8 +21,10 @@ The only Bamboo migration surface is the existing `jiandu` binary's one-shot
 stopped or a static snapshot), and the destination must be absent or empty. It
 accepts only current Global and typed-Project `memory/v1` topic Markdown, stages
 beside the final root, rebuilds each imported scope once, and publishes after
-full validation. Do not extend it into a generic importer, daemon, WAL, receipt,
-migration ledger, or historical-format platform.
+full validation. Import renders validated documents through the current typed
+schema so retired fields do not enter the Jiandu root; it reports separate raw
+source and imported content identities. Do not extend it into a generic
+importer, daemon, WAL, receipt, migration ledger, or historical-format platform.
 
 ## Agent Use Through MCP
 

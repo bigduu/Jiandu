@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 
 use jiandu_mcp::{
-    MEMORY_ACTIONS, MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_NAME, MemoryArgs,
-    MemoryExecutionContext, MemoryServer, MemoryToolClass, memory_tool,
+    MEMORY_ACTIONS, MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME,
+    MemoryArgs, MemoryExecutionContext, MemoryServer, MemoryToolClass, memory_tool,
 };
-use jiandu_memory::memory_store::{MAX_MEMORY_ID_LEN, MemoryStore};
+use jiandu_memory::memory_store::{
+    MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_TAG_CHARS,
+    MAX_MEMORY_TAGS, MAX_RETRIEVAL_TERM_CHARS, MemoryStore, render_markdown_document,
+};
 #[cfg(unix)]
 use jiandu_memory::memory_store::{MemoryScope, WRITE_AUDIT_LOG};
 use rmcp::{
@@ -245,27 +248,27 @@ async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
         ),
         (
             "find_duplicates",
-            json!({"action":"find_duplicates","scope":"global","title":"Dispatch get","content":"needle get body","type":"reference","tags":["one"],"options":{"limit":3}}),
+            json!({"action":"find_duplicates","scope":"global","title":"Dispatch get","content":"needle get body","type":"reference","tags":["one"],"keywords":["dispatch-alias"],"entities":["Dispatch API"],"options":{"limit":3}}),
             ReadOnlyParallel,
         ),
         (
             "write",
-            json!({"action":"write","scope":"global","type":"project","title":"Dispatch explicit write","content":"explicit write body","tags":["one"],"granularity":"week","options":{"allow_merge_if_similar":false}}),
+            json!({"action":"write","scope":"global","type":"project","title":"Dispatch explicit write","content":"explicit write body","tags":["one"],"keywords":["write-alias"],"entities":["Write API"],"granularity":"week","options":{"allow_merge_if_similar":false}}),
             MutatingSerial,
         ),
         (
             "merge",
-            json!({"action":"merge","id":merge_id,"content":"new merged section","tags":["one"],"source_memory_ids":[merge_source_id],"mode":"merge","reason":"dedupe"}),
+            json!({"action":"merge","id":merge_id,"content":"new merged section","tags":["one"],"keywords":["merge-alias"],"entities":["Merge API"],"source_memory_ids":[merge_source_id],"mode":"merge","reason":"dedupe"}),
             MutatingSerial,
         ),
         (
             "split",
-            json!({"action":"split","id":split_id,"pieces":[{"title":"Dispatch atomic piece","type":"reference","content":"atomic split body","tags":["one"]}]}),
+            json!({"action":"split","id":split_id,"pieces":[{"title":"Dispatch atomic piece","type":"reference","content":"atomic split body","tags":["one"],"keywords":["split-alias"],"entities":["Split API"]}]}),
             MutatingSerial,
         ),
         (
             "consolidate",
-            json!({"action":"consolidate","ids":[consolidate_a,consolidate_b],"title":"Dispatch canonical","content":"canonical body","type":"project","tags":["one"]}),
+            json!({"action":"consolidate","ids":[consolidate_a,consolidate_b],"title":"Dispatch canonical","content":"canonical body","type":"project","tags":["one"],"keywords":["canonical-alias"],"entities":["Canonical API"]}),
             MutatingSerial,
         ),
         (
@@ -308,6 +311,90 @@ async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
         let result = server.execute(arguments).await.expect("real dispatch");
         assert_eq!(result["action"], name);
     }
+}
+
+#[tokio::test]
+async fn split_and_consolidate_metadata_are_visible_through_get_and_query() {
+    let fixture = Fixture::global("session_write_family_metadata");
+    let server = &fixture.server;
+
+    let split_source = write_global(server, "Split metadata source", "source body").await;
+    let split = server
+        .execute(json!({
+            "action": "split",
+            "id": split_source,
+            "pieces": [{
+                "title": "Split metadata target",
+                "content": "Atomic split fact without its alias in prose.",
+                "keywords": ["split-metadata-only-alias"],
+                "entities": ["Split Entity"],
+                "tags": ["拆分 标签"]
+            }]
+        }))
+        .await
+        .expect("split");
+    let split_id = split["data"]["new_ids"][0].as_str().expect("split id");
+    let split_get = server
+        .execute(json!({"action": "get", "id": split_id}))
+        .await
+        .expect("get split target");
+    assert_eq!(
+        split_get["memory"]["frontmatter"]["retrieval"]["keywords"][0],
+        "split-metadata-only-alias"
+    );
+    assert_eq!(split_get["memory"]["retrieval_metadata_truncated"], false);
+    let split_query = server
+        .execute(json!({
+            "action": "query",
+            "scope": "global",
+            "query": "split-metadata-only-alias"
+        }))
+        .await
+        .expect("query split target");
+    assert_eq!(split_query["data"]["items"][0]["id"], split_id);
+
+    let source_a = write_global(server, "Consolidate metadata A", "source A").await;
+    let source_b = write_global(server, "Consolidate metadata B", "source B").await;
+    let consolidate = server
+        .execute(json!({
+            "action": "consolidate",
+            "ids": [source_a, source_b],
+            "title": "Consolidated metadata target",
+            "content": "One canonical fact without its model alias in prose.",
+            "type": "reference",
+            "keywords": ["consolidated-metadata-only-alias"],
+            "entities": ["Canonical Entity"],
+            "tags": ["合并 标签"]
+        }))
+        .await
+        .expect("consolidate");
+    let consolidated_id = consolidate["data"]["new_id"]
+        .as_str()
+        .expect("consolidated id");
+    let consolidated_get = server
+        .execute(json!({"action": "get", "id": consolidated_id}))
+        .await
+        .expect("get consolidated target");
+    assert_eq!(
+        consolidated_get["memory"]["frontmatter"]["retrieval"]["keywords"][0],
+        "consolidated-metadata-only-alias"
+    );
+    assert_eq!(
+        consolidated_get["memory"]["retrieval_metadata_truncated"],
+        false
+    );
+    let consolidated_query = server
+        .execute(json!({
+            "action": "query",
+            "scope": "global",
+            "query": "consolidated-metadata-only-alias"
+        }))
+        .await
+        .expect("query consolidated target");
+    assert_eq!(
+        consolidated_query["data"]["items"][0]["id"],
+        consolidated_id
+    );
 }
 
 #[test]
@@ -354,6 +441,8 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
             &[
                 "action",
                 "content",
+                "entities",
+                "keywords",
                 "options",
                 "project_key",
                 "scope",
@@ -368,7 +457,9 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
             &[
                 "action",
                 "content",
+                "entities",
                 "granularity",
+                "keywords",
                 "options",
                 "project_key",
                 "scope",
@@ -383,7 +474,9 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
             &[
                 "action",
                 "content",
+                "entities",
                 "id",
+                "keywords",
                 "mode",
                 "project_key",
                 "reason",
@@ -402,7 +495,9 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
             &[
                 "action",
                 "content",
+                "entities",
                 "ids",
+                "keywords",
                 "project_key",
                 "tags",
                 "title",
@@ -539,6 +634,57 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
     let serialized = serde_json::to_string(&schema).expect("schema JSON");
     assert!(serialized.contains("allow_merge_if_similar"));
     assert!(serialized.contains("include_related"));
+    for action in ["query", "get", "write"] {
+        assert!(
+            branch(&schema, action)["description"]
+                .as_str()
+                .is_some_and(|description| !description.is_empty()),
+            "{action} branch must explain its model-facing contract"
+        );
+    }
+    for action in ["write", "merge", "find_duplicates", "consolidate"] {
+        for (field, max_items) in [("keywords", 32_u64), ("entities", 16)] {
+            let field_schema = &branch(&schema, action)["properties"][field];
+            assert_eq!(
+                find_key(field_schema, "maxItems").and_then(Value::as_u64),
+                Some(max_items),
+                "{action}.{field} maxItems"
+            );
+            assert_eq!(
+                find_key(field_schema, "maxLength").and_then(Value::as_u64),
+                Some(96),
+                "{action}.{field} item maxLength"
+            );
+        }
+    }
+    let split_piece = referenced_schema(
+        &schema,
+        &branch(&schema, "split")["properties"]["pieces"]["items"],
+    );
+    for field in ["keywords", "entities", "tags"] {
+        assert!(
+            split_piece["properties"].get(field).is_some(),
+            "split piece must expose {field}"
+        );
+    }
+
+    let description = tool.description.as_deref().expect("tool description");
+    assert_eq!(description, MEMORY_TOOL_DESCRIPTION);
+    for guidance in [
+        "short set of discriminative keywords",
+        "compact top-3 hits",
+        "get(id)",
+        "retrieval_metadata_truncated",
+        "run rebuild for the same authorized scope",
+        "Before write, query",
+        "keywords/entities/tags",
+        "omitted/blank query",
+    ] {
+        assert!(
+            description.contains(guidance),
+            "tool description must be self-sufficient: {guidance}"
+        );
+    }
 }
 
 fn branch<'a>(schema: &'a Value, action: &str) -> &'a Value {
@@ -648,7 +794,8 @@ async fn project_identity_is_stable_scoped_and_cannot_be_overridden() {
             "scope":"project",
             "type":"project",
             "title":"Project A only",
-            "content":"isolated content"
+            "content":"isolated content",
+            "keywords":["quasarvx927"]
         }))
         .await
         .expect("project write");
@@ -660,6 +807,26 @@ async fn project_identity_is_stable_scoped_and_cannot_be_overridden() {
         .await
         .expect("project query");
     assert_eq!(query["data"]["matched_count"], 1);
+    project_b
+        .execute(json!({
+            "action":"write",
+            "scope":"project",
+            "type":"project",
+            "title":"Project B seed",
+            "content":"creates B's independent lexical index"
+        }))
+        .await
+        .expect("project B seed");
+    let a_recall = project_a
+        .execute(json!({"action":"query","scope":"project","query":"quasarvx927"}))
+        .await
+        .expect("project A indexed recall");
+    let b_recall = project_b
+        .execute(json!({"action":"query","scope":"project","query":"quasarvx927"}))
+        .await
+        .expect("project B isolated indexed recall");
+    assert_eq!(a_recall["data"]["matched_count"], 1);
+    assert_eq!(b_recall["data"]["matched_count"], 0);
     project_a
         .execute(json!({"action":"get","id":format!(" {id} "),"project_key":"project_a"}))
         .await
@@ -958,6 +1125,7 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
     for required_guidance in [
         "query",
         "get",
+        "retrieval_metadata_truncated",
         "inspect",
         "session_append",
         "write",
@@ -995,6 +1163,10 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, MEMORY_TOOL_NAME);
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some(MEMORY_TOOL_DESCRIPTION)
+    );
     assert!(
         client
             .call_tool(CallToolRequestParams::new("memory_search"))
@@ -1010,19 +1182,51 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
             "scope": "global",
             "type": "project",
             "title": "Protocol persistence",
-            "content": "written through the MCP transport"
+            "content": "written through the MCP transport",
+            "keywords": ["朱雀别名", "transport-alias"],
+            "entities": ["ＡＰＩ 网关"],
+            "tags": ["MCP 认证"]
         }),
     )
     .await;
     let id = write["memory"]["id"].as_str().expect("id").to_string();
     let query = call_memory(
         &client,
-        json!({"action":"query","scope":"global","query":"transport"}),
+        json!({"action":"query","scope":"global","query":"朱雀别名"}),
     )
     .await;
     assert_eq!(query["data"]["items"][0]["id"], id);
+    let hit = query["data"]["items"][0]
+        .as_object()
+        .expect("compact query hit");
+    for forbidden in ["body", "path", "frontmatter", "keywords", "entities"] {
+        assert!(!hit.contains_key(forbidden), "query leaked {forbidden}");
+    }
     let get = call_memory(&client, json!({"action":"get","id":id})).await;
     assert_eq!(get["memory"]["body"], "written through the MCP transport");
+    assert_eq!(get["memory"]["body_truncated"], false);
+    assert_eq!(get["memory"]["retrieval_metadata_truncated"], false);
+    assert_eq!(
+        get["memory"]["frontmatter"]["retrieval"]["keywords"][0],
+        "朱雀别名"
+    );
+    assert!(
+        get["memory"]["frontmatter"]["retrieval"]["entities"]
+            .as_array()
+            .expect("entities")
+            .contains(&json!("API 网关"))
+    );
+    assert!(
+        get["memory"]["frontmatter"]["tags"]
+            .as_array()
+            .expect("tags")
+            .contains(&json!("mcp-认证"))
+    );
+    assert!(
+        !serde_json::to_string(&get)
+            .expect("serialize get")
+            .contains("embedding_ready")
+    );
 
     let invalid_arguments: JsonObject = json!({"action":"get","id":"../escape"})
         .as_object()
@@ -1037,6 +1241,175 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
 
     client.cancel().await.expect("cancel client");
     server_task.await.expect("join server");
+}
+
+#[tokio::test]
+async fn direct_write_enforces_metadata_bounds_and_get_bounds_legacy_metadata() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store = MemoryStore::new(directory.path());
+    let server = MemoryServer::new(
+        store.clone(),
+        MemoryExecutionContext::new("metadata_bounds").expect("context"),
+    );
+    let oversized_query = "界".repeat(513);
+    let query_error = server
+        .execute(json!({
+            "action": "query",
+            "scope": "global",
+            "query": oversized_query
+        }))
+        .await
+        .expect_err("runtime query bound must not depend on JSON Schema enforcement");
+    assert!(query_error.to_string().contains("exceeds 512 characters"));
+
+    let keywords = (0..40)
+        .map(|index| {
+            if index == 0 {
+                "Ｋ".repeat(MAX_RETRIEVAL_TERM_CHARS + 24)
+            } else {
+                format!("explicit-keyword-{index:02}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let entities = (0..20)
+        .map(|index| {
+            if index == 0 {
+                "Ｅ".repeat(MAX_RETRIEVAL_TERM_CHARS + 24)
+            } else {
+                format!("explicit-entity-{index:02}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let tags = (0..40)
+        .map(|index| {
+            if index == 0 {
+                "标签".repeat(MAX_MEMORY_TAG_CHARS)
+            } else {
+                format!("explicit-tag-{index:02}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let write = server
+        .execute(json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Runtime metadata bounds",
+            "content": "The MCP handler delegates to store-enforced metadata limits.",
+            "keywords": keywords,
+            "entities": entities,
+            "tags": tags,
+        }))
+        .await
+        .expect("direct MCP execution accepts and bounds metadata");
+    let id = write["memory"]["id"].as_str().expect("id");
+    let mut doc = store
+        .get_memory(id, None)
+        .await
+        .expect("read stored memory")
+        .expect("stored memory exists");
+    assert!(
+        doc.frontmatter
+            .retrieval
+            .keywords
+            .contains(&"explicit-keyword-31".to_string())
+    );
+    assert!(
+        !doc.frontmatter
+            .retrieval
+            .keywords
+            .contains(&"explicit-keyword-32".to_string())
+    );
+    assert!(
+        doc.frontmatter
+            .retrieval
+            .entities
+            .contains(&"explicit-entity-15".to_string())
+    );
+    assert!(
+        !doc.frontmatter
+            .retrieval
+            .entities
+            .contains(&"explicit-entity-16".to_string())
+    );
+    assert_eq!(doc.frontmatter.tags.len(), MAX_MEMORY_TAGS);
+    assert!(
+        doc.frontmatter
+            .tags
+            .iter()
+            .all(|value| value.chars().count() <= MAX_MEMORY_TAG_CHARS)
+    );
+    assert!(
+        doc.frontmatter
+            .retrieval
+            .keywords
+            .iter()
+            .all(|value| value.chars().count() <= MAX_RETRIEVAL_TERM_CHARS)
+    );
+    assert!(
+        doc.frontmatter
+            .retrieval
+            .entities
+            .iter()
+            .all(|value| value.chars().count() <= MAX_RETRIEVAL_TERM_CHARS)
+    );
+
+    // Simulate canonical bytes copied from a legacy store: typed `get` must
+    // remain bounded without requiring an eager migration or rewriting the file.
+    doc.frontmatter.tags = (0..40)
+        .map(|index| format!("legacy-tag-{index:03}"))
+        .collect();
+    doc.frontmatter.retrieval.keywords = (0..140)
+        .map(|index| {
+            if index == 0 {
+                "旧".repeat(MAX_RETRIEVAL_TERM_CHARS + 24)
+            } else {
+                format!("legacy-keyword-{index:03}")
+            }
+        })
+        .collect();
+    doc.frontmatter.retrieval.entities = (0..70)
+        .map(|index| format!("legacy-entity-{index:03}"))
+        .collect();
+    let rendered = render_markdown_document(&doc.frontmatter, &doc.body).expect("render legacy");
+    tokio::fs::write(&doc.path, rendered)
+        .await
+        .expect("replace canonical bytes");
+
+    let get = server
+        .execute(json!({"action": "get", "id": id}))
+        .await
+        .expect("bounded legacy get");
+    assert_eq!(get["memory"]["retrieval_metadata_truncated"], true);
+    assert_eq!(
+        get["memory"]["frontmatter"]["tags"]
+            .as_array()
+            .expect("tags")
+            .len(),
+        MAX_MEMORY_TAGS
+    );
+    assert_eq!(
+        get["memory"]["frontmatter"]["retrieval"]["keywords"]
+            .as_array()
+            .expect("keywords")
+            .len(),
+        MAX_MEMORY_KEYWORDS
+    );
+    assert_eq!(
+        get["memory"]["frontmatter"]["retrieval"]["entities"]
+            .as_array()
+            .expect("entities")
+            .len(),
+        MAX_MEMORY_ENTITIES
+    );
+    assert!(
+        get["memory"]["frontmatter"]["retrieval"]["keywords"]
+            .as_array()
+            .expect("keywords")
+            .iter()
+            .all(|value| value.as_str().expect("keyword").chars().count()
+                <= MAX_RETRIEVAL_TERM_CHARS)
+    );
 }
 
 async fn call_memory(

@@ -9,9 +9,10 @@ use jiandu_memory::{
     ProjectId,
     memory_store::{
         DEFAULT_SESSION_TOPIC, DurableMemoryDocument, DurableMemoryStatus, DurableMemoryType,
-        MAX_MAX_CHARS, MAX_QUERY_LIMIT, MemoryQueryOptions, MemoryScope, MemorySplitPiece,
-        MemoryStore, TemporalGranularity, count_chars, summary_json, truncate_chars,
-        validate_memory_id as validate_store_memory_id,
+        MAX_MAX_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_KEYWORDS, MAX_QUERY_LIMIT,
+        MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemorySplitPiece, MemoryStore,
+        TemporalGranularity, count_chars, normalize_retrieval_terms, normalize_tags, summary_json,
+        truncate_chars, validate_memory_id as validate_store_memory_id,
     },
 };
 use serde_json::{Value, json};
@@ -241,7 +242,13 @@ impl MemoryServer {
                 };
                 let (body, body_truncated) = truncate_chars(&doc.body, max_chars);
                 doc.body = body;
-                Ok(document_result("get", doc, body_truncated))
+                let retrieval_metadata_truncated = bound_retrieval_metadata(&mut doc);
+                Ok(document_result(
+                    "get",
+                    doc,
+                    body_truncated,
+                    retrieval_metadata_truncated,
+                ))
             }
             MemoryArgs::Write {
                 scope,
@@ -249,6 +256,8 @@ impl MemoryServer {
                 title,
                 content,
                 tags,
+                keywords,
+                entities,
                 project_key,
                 granularity,
                 options,
@@ -257,13 +266,14 @@ impl MemoryServer {
                 let access = self.resolve_access(project_key.as_deref(), scope)?;
                 let doc = access
                     .store
-                    .write_memory(
+                    .write_memory_with_retrieval(
                         scope,
                         access.project_key(),
                         parse_type(&r#type)?,
                         &title,
                         &content,
                         &tags,
+                        &MemoryRetrievalInput { keywords, entities },
                         Some(self.context.session_id()),
                         ACTOR,
                         options
@@ -290,6 +300,8 @@ impl MemoryServer {
                 id,
                 content,
                 tags,
+                keywords,
+                entities,
                 project_key,
                 source_memory_ids,
                 mode,
@@ -319,11 +331,12 @@ impl MemoryServer {
                 } else {
                     let Some(result) = access
                         .store
-                        .merge_memory(
+                        .merge_memory_with_retrieval(
                             id,
                             access.project_key(),
                             &content,
                             &tags,
+                            &MemoryRetrievalInput { keywords, entities },
                             Some(self.context.session_id()),
                             ACTOR,
                             &source_memory_ids,
@@ -352,13 +365,14 @@ impl MemoryServer {
                 }
                 let id = validate_memory_id(&id)?;
                 let access = self.resolve_id_access(project_key.as_deref(), id)?;
-                let pieces = parse_split_pieces(pieces)?;
+                let (pieces, retrieval) = parse_split_pieces(pieces)?;
                 let Some(result) = access
                     .store
-                    .split_memory(
+                    .split_memory_with_retrieval(
                         id,
                         access.project_key(),
                         &pieces,
+                        &retrieval,
                         Some(self.context.session_id()),
                         ACTOR,
                     )
@@ -375,6 +389,8 @@ impl MemoryServer {
                 content,
                 r#type,
                 tags,
+                keywords,
+                entities,
                 project_key,
                 options,
             } => {
@@ -387,13 +403,14 @@ impl MemoryServer {
                     .clamp(1, MAX_QUERY_LIMIT);
                 let candidates = access
                     .store
-                    .find_duplicate_candidates(
+                    .find_duplicate_candidates_with_retrieval(
                         scope,
                         access.project_key(),
                         r#type,
                         &title,
                         content.as_deref().unwrap_or(""),
                         &tags,
+                        &MemoryRetrievalInput { keywords, entities },
                         limit,
                     )
                     .await
@@ -453,6 +470,8 @@ impl MemoryServer {
                 content,
                 r#type,
                 tags,
+                keywords,
+                entities,
                 project_key,
             } => {
                 if ids.len() < 2 {
@@ -468,12 +487,14 @@ impl MemoryServer {
                     content,
                     tags,
                 };
+                let retrieval = MemoryRetrievalInput { keywords, entities };
                 let Some(result) = access
                     .store
-                    .consolidate_memories(
+                    .consolidate_memories_with_retrieval(
                         &ids,
                         access.project_key(),
                         &merged,
+                        &retrieval,
                         Some(self.context.session_id()),
                         ACTOR,
                     )
@@ -741,21 +762,52 @@ fn parse_merge_mode(value: Option<&str>) -> Result<Option<String>, MemoryError> 
     }
 }
 
-fn parse_split_pieces(pieces: Vec<ToolSplitPiece>) -> Result<Vec<MemorySplitPiece>, MemoryError> {
-    pieces
-        .into_iter()
-        .map(|piece| {
-            Ok(MemorySplitPiece {
-                title: piece.title,
-                r#type: piece.r#type.as_deref().map(parse_type).transpose()?,
-                content: piece.content,
-                tags: piece.tags,
-            })
-        })
-        .collect()
+fn parse_split_pieces(
+    pieces: Vec<ToolSplitPiece>,
+) -> Result<(Vec<MemorySplitPiece>, Vec<MemoryRetrievalInput>), MemoryError> {
+    let mut parsed = Vec::with_capacity(pieces.len());
+    let mut retrieval = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        parsed.push(MemorySplitPiece {
+            title: piece.title,
+            r#type: piece.r#type.as_deref().map(parse_type).transpose()?,
+            content: piece.content,
+            tags: piece.tags,
+        });
+        retrieval.push(MemoryRetrievalInput {
+            keywords: piece.keywords,
+            entities: piece.entities,
+        });
+    }
+    Ok((parsed, retrieval))
 }
 
-fn document_result(action: &str, doc: DurableMemoryDocument, body_truncated: bool) -> Value {
+fn bound_retrieval_metadata(doc: &mut DurableMemoryDocument) -> bool {
+    let original_tags = doc.frontmatter.tags.clone();
+    let original_keywords = doc.frontmatter.retrieval.keywords.clone();
+    let original_entities = doc.frontmatter.retrieval.entities.clone();
+
+    doc.frontmatter.tags = normalize_tags(original_tags.iter().map(String::as_str));
+    doc.frontmatter.retrieval.keywords = normalize_retrieval_terms(
+        original_keywords.iter().map(String::as_str),
+        MAX_MEMORY_KEYWORDS,
+    );
+    doc.frontmatter.retrieval.entities = normalize_retrieval_terms(
+        original_entities.iter().map(String::as_str),
+        MAX_MEMORY_ENTITIES,
+    );
+
+    original_tags != doc.frontmatter.tags
+        || original_keywords != doc.frontmatter.retrieval.keywords
+        || original_entities != doc.frontmatter.retrieval.entities
+}
+
+fn document_result(
+    action: &str,
+    doc: DurableMemoryDocument,
+    body_truncated: bool,
+    retrieval_metadata_truncated: bool,
+) -> Value {
     json!({
         "action": action,
         "id": doc.frontmatter.id,
@@ -764,6 +816,7 @@ fn document_result(action: &str, doc: DurableMemoryDocument, body_truncated: boo
             "body": doc.body,
             "path": doc.path,
             "body_truncated": body_truncated,
+            "retrieval_metadata_truncated": retrieval_metadata_truncated,
         }
     })
 }

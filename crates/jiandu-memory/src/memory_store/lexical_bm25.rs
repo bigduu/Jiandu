@@ -11,16 +11,16 @@
 //!    SUM with no inverse-document-frequency and no length normalization, so a
 //!    common word counted as much as a rare one and long docs were over-favored.
 //!
-//! This is embedding-FREE by design (no hosted model needed): the LLM already
-//! is not required because documents already carry keywords/entities. BM25 over
-//! those fields plus CJK tokenization provides deterministic recall. A
-//! vector-cosine term can be added as an additive score without disturbing the
-//! cache-stable ordering (#61).
+//! This is lexical-only by design: documents already carry caller-provided and
+//! deterministically-expanded keywords/entities, so BM25 over those fields plus
+//! CJK tokenization provides deterministic recall without a second model call.
 //!
 //! Pure read path: scores the existing `lexical.json` at recall time without
 //! rebuilding or mutating it.
 
 use std::collections::{HashMap, HashSet};
+
+use unicode_normalization::UnicodeNormalization;
 
 use super::{DurableMemoryStatus, LexicalIndexItem};
 
@@ -55,7 +55,10 @@ pub(super) fn tokenize(text: &str) -> Vec<String> {
     let mut latin = String::new();
     let mut cjk: Vec<char> = Vec::new();
 
-    for ch in text.chars() {
+    // Match the NFKC normalization used when canonical retrieval metadata is
+    // written, so compatibility-equivalent CJK/mixed-width queries stay
+    // symmetric with their indexed terms.
+    for ch in text.nfkc() {
         // CJK must be checked BEFORE is_alphanumeric (Unicode considers CJK
         // ideographs alphanumeric, which would wrongly fold them into a latin run).
         if is_cjk(ch) {
@@ -112,8 +115,6 @@ struct DocBag {
     tf: HashMap<String, f64>,
     /// Document length = sum of weighted term frequencies.
     dl: f64,
-    /// Optional dense embedding for the hybrid semantic term (L1). `None` today.
-    embedding: Option<Vec<f32>>,
 }
 
 /// BM25(F) scorer over one scope's lexical index. Corpus statistics (document
@@ -129,16 +130,28 @@ pub(super) struct Bm25Corpus {
 
 impl Bm25Corpus {
     pub(super) fn build(items: &[LexicalIndexItem]) -> Self {
+        Self::build_with_status_policy(items, false)
+    }
+
+    /// Explicit maintenance queries may request a normally non-recalled status
+    /// such as `archived`. The caller filters that set first, then opts into
+    /// scoring every remaining item without changing ordinary recall eligibility.
+    pub(super) fn build_including_all_statuses(items: &[LexicalIndexItem]) -> Self {
+        Self::build_with_status_policy(items, true)
+    }
+
+    fn build_with_status_policy(items: &[LexicalIndexItem], include_all_statuses: bool) -> Self {
         let mut docs = Vec::with_capacity(items.len());
         let mut df: HashMap<String, usize> = HashMap::new();
         let mut total_dl = 0.0;
         let mut n = 0usize;
 
         for item in items {
-            let scorable = matches!(
-                item.status,
-                DurableMemoryStatus::Active | DurableMemoryStatus::Stale
-            );
+            let scorable = include_all_statuses
+                || matches!(
+                    item.status,
+                    DurableMemoryStatus::Active | DurableMemoryStatus::Stale
+                );
             if !scorable {
                 // Superseded / Contradicted / Archived never recall; keep the slot
                 // so `docs` stays aligned with `items` for index-based scoring.
@@ -147,7 +160,6 @@ impl Bm25Corpus {
                     status: item.status,
                     tf: HashMap::new(),
                     dl: 0.0,
-                    embedding: None,
                 });
                 continue;
             }
@@ -176,7 +188,6 @@ impl Bm25Corpus {
                 status: item.status,
                 tf,
                 dl,
-                embedding: item.embedding.clone(),
             });
         }
 
@@ -184,20 +195,10 @@ impl Bm25Corpus {
         Bm25Corpus { docs, df, avgdl, n }
     }
 
-    /// Hybrid score = BM25(F) `+ cosine_weight·cosine(query_vec, doc.embedding)`.
-    /// With `query_vec == None` (no embedder wired) the semantic term drops out and
-    /// this is pure BM25, byte-identical to L0 — the seam is inert. A doc recalls if
-    /// it matches lexically OR (when vectors are present) its cosine clears
-    /// [`super::embedding::SEMANTIC_FLOOR`], so paraphrase matches the lexical pass
-    /// would miss still surface. Stale docs are scaled down. `None` for a
-    /// non-scorable doc or no match.
-    pub(super) fn score_hybrid(
-        &self,
-        index: usize,
-        query_tokens: &[String],
-        query_vec: Option<&[f32]>,
-        cosine_weight: f64,
-    ) -> Option<f64> {
+    /// Pure BM25(F) score. Stale documents remain eligible but rank below an
+    /// otherwise-equal active document. Returns `None` for ineligible documents
+    /// or when no query token matches.
+    pub(super) fn score(&self, index: usize, query_tokens: &[String]) -> Option<f64> {
         let doc = self.docs.get(index)?;
         if !doc.scorable || self.n == 0 {
             return None;
@@ -226,23 +227,11 @@ impl Bm25Corpus {
             lexical_matched = true;
         }
 
-        // Optional semantic term — inert when either vector is absent.
-        let cos = match (query_vec, doc.embedding.as_deref()) {
-            (Some(q), Some(d)) => super::embedding::cosine(q, d),
-            _ => 0.0,
-        };
-        let semantic_matched = cos >= super::embedding::SEMANTIC_FLOOR;
-
-        if !lexical_matched && !semantic_matched {
+        if !lexical_matched {
             return None;
         }
 
-        // The semantic term only ever BOOSTS: clamp cosine to >= 0 so a future
-        // backend's negative/anti-correlated vector can never demote (or, with a
-        // large weight, sink) a strong lexical match. `cosine()` already maps
-        // empty/degenerate/non-finite inputs to 0.0, so this term is always a
-        // finite, non-negative addend.
-        let mut score = bm25 + cosine_weight * cos.max(0.0);
+        let mut score = bm25;
         if matches!(doc.status, DurableMemoryStatus::Stale) {
             score *= STALE_MULTIPLIER;
         }
@@ -252,12 +241,6 @@ impl Bm25Corpus {
         // `sort_recall_candidates` still fires and the recalled block stays stable
         // across repeated calls (BM25's raw f64 rarely ties on its own).
         Some((score * 1000.0).round() / 1000.0)
-    }
-
-    /// Pure BM25(F) score (no semantic term) — the recall default until a
-    /// [`super::embedding::MemoryEmbedder`] backend is wired.
-    pub(super) fn score(&self, index: usize, query_tokens: &[String]) -> Option<f64> {
-        self.score_hybrid(index, query_tokens, None, 0.0)
     }
 }
 
@@ -277,7 +260,7 @@ fn add_field(tf: &mut HashMap<String, f64>, text: &str, weight: f64) {
 // stating the same fact in different words could be missed. This replaces that
 // with an IDF-weighted cosine over the SAME field-weighted token bags recall uses,
 // so rare/specific shared terms drive the score and common ones are discounted.
-// Bounded [0, 1], symmetric, embedding-FREE.
+// Bounded [0, 1], symmetric, and computed only from lexical term bags.
 // ---------------------------------------------------------------------------
 
 /// A field-weighted term-frequency bag for one memory, using the same
@@ -386,7 +369,6 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             summary: String::new(),
             granularity: None,
-            embedding: None,
         }
     }
 
@@ -446,6 +428,11 @@ mod tests {
         );
         // digits ride with latin; single-char latin dropped.
         assert_eq!(tokenize("gpt4 a x9"), vec!["gpt4", "x9"]);
+        assert_eq!(
+            tokenize("ＯＬＤ＿ＥＮＴＩＴＹ"),
+            tokenize("OLD_ENTITY"),
+            "query tokenization must mirror canonical NFKC metadata"
+        );
     }
 
     #[test]
@@ -604,57 +591,5 @@ mod tests {
             "summary-only Chinese match"
         );
         assert!(corpus.score(1, &tokenize("多租户")).is_none());
-    }
-
-    #[test]
-    fn hybrid_surfaces_a_paraphrase_via_cosine_when_lexical_misses() {
-        // Two docs with NO lexical overlap with the query; "sem" has an embedding
-        // close to the query vector, "orth" is (near-)orthogonal.
-        let mut sem = item(
-            "sem",
-            DurableMemoryStatus::Active,
-            "guardian resume design",
-            &["guardian"],
-        );
-        sem.embedding = Some(vec![1.0, 0.0, 0.0]);
-        let mut orth = item(
-            "orth",
-            DurableMemoryStatus::Active,
-            "cache prefix stability",
-            &["cache"],
-        );
-        orth.embedding = Some(vec![0.0, 1.0, 0.0]);
-        let corpus = Bm25Corpus::build(&[sem, orth]);
-
-        let q = tokenize("hibernation checkpoint"); // matches neither doc lexically
-        let qvec = [0.9_f32, 0.05, 0.0]; // ~parallel to sem, ~orthogonal to orth
-        let w = super::super::embedding::HYBRID_COSINE_WEIGHT;
-
-        // Pure BM25 (no query vector) finds nothing — the seam is inert.
-        assert!(corpus.score(0, &q).is_none());
-        // Hybrid surfaces the semantically-close doc, rejects the orthogonal one.
-        assert!(
-            corpus.score_hybrid(0, &q, Some(&qvec), w).is_some(),
-            "a cosine-close paraphrase must surface even with no lexical overlap"
-        );
-        assert!(
-            corpus.score_hybrid(1, &q, Some(&qvec), w).is_none(),
-            "an orthogonal-embedding doc stays below the semantic floor"
-        );
-    }
-
-    #[test]
-    fn hybrid_with_no_query_vector_equals_pure_bm25() {
-        let mut d = item(
-            "d",
-            DurableMemoryStatus::Active,
-            "guardian resume",
-            &["guardian"],
-        );
-        d.embedding = Some(vec![1.0, 0.0]); // present but unused without a query vector
-        let corpus = Bm25Corpus::build(&[d]);
-        let q = tokenize("guardian");
-        let w = super::super::embedding::HYBRID_COSINE_WEIGHT;
-        assert_eq!(corpus.score_hybrid(0, &q, None, w), corpus.score(0, &q));
     }
 }

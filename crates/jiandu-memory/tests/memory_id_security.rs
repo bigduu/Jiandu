@@ -44,7 +44,6 @@ fn fixture_frontmatter(
         retrieval: DurableMemoryRetrieval {
             keywords: vec!["shared".to_string()],
             entities: Vec::new(),
-            embedding_ready: true,
             last_accessed_at: None,
         },
     }

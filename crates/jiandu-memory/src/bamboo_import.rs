@@ -3,7 +3,8 @@
 //! This is deliberately not a generic migration framework. The source is read
 //! only, every topic is validated before any destination staging begins, and a
 //! fully rebuilt sibling staging directory is renamed into an absent or empty
-//! Jiandu data root only after source and staged content identities match.
+//! Jiandu data root only after the raw source and current-schema staged content
+//! identities match their independently validated expectations.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
@@ -15,7 +16,9 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::ProjectId;
-use crate::memory_store::{MemoryScope, MemoryStore, parse_markdown_document, validate_memory_id};
+use crate::memory_store::{
+    MemoryScope, MemoryStore, parse_markdown_document, render_markdown_document, validate_memory_id,
+};
 
 const TOPIC_BATCH_SIZE: usize = 128;
 
@@ -31,13 +34,15 @@ pub struct BambooImportReport {
     pub project_topics: usize,
     pub project_scopes: usize,
     pub rebuilt_scopes: usize,
-    pub content_identity_sha256: String,
+    pub source_content_identity_sha256: String,
+    pub imported_content_identity_sha256: String,
 }
 
 #[derive(Debug, Clone)]
 struct ImportTopic {
     relative_path: PathBuf,
-    bytes: Vec<u8>,
+    source_bytes: Vec<u8>,
+    imported_bytes: Vec<u8>,
     id: String,
     project_id: Option<ProjectId>,
 }
@@ -47,7 +52,8 @@ struct ValidatedSource {
     topics: Vec<ImportTopic>,
     project_counts: BTreeMap<ProjectId, usize>,
     global_topics: usize,
-    content_identity_sha256: String,
+    source_content_identity_sha256: String,
+    imported_content_identity_sha256: String,
 }
 
 /// Seed an independent Jiandu data root from Bamboo's current canonical
@@ -55,7 +61,9 @@ struct ValidatedSource {
 ///
 /// The caller must stop Bamboo memory writes or pass a static snapshot. Jiandu
 /// verifies that the selected source topics did not change while staging, but
-/// never writes to or locks the Bamboo source.
+/// never writes to or locks the Bamboo source. Validated topics are rendered
+/// through the current Jiandu schema before publication, so retired metadata is
+/// not copied into the new authoritative root.
 pub async fn import_bamboo_durable_memory(
     source_data_dir: impl AsRef<Path>,
     destination_data_dir: impl AsRef<Path>,
@@ -108,7 +116,7 @@ pub async fn import_bamboo_durable_memory(
             .map(|topic| {
                 (
                     staging.path().join(&topic.relative_path),
-                    topic.bytes.clone(),
+                    topic.imported_bytes.clone(),
                 )
             })
             .collect();
@@ -133,17 +141,21 @@ pub async fn import_bamboo_durable_memory(
 
     let staged = scan_bamboo_topics(staging.path()).await?;
     if staged.topics.len() != source.topics.len()
-        || staged.content_identity_sha256 != source.content_identity_sha256
+        || staged.source_content_identity_sha256 != source.imported_content_identity_sha256
+        || staged.imported_content_identity_sha256 != source.imported_content_identity_sha256
     {
         return Err(invalid_data(
-            "staged Jiandu topics do not match the validated Bamboo source",
+            "staged Jiandu topics do not match the validated current-schema import",
         ));
     }
 
     // Refuse publication if Bamboo changed while the import was being built.
     let source_after_staging = scan_bamboo_topics(&source_data_dir).await?;
     if source_after_staging.topics.len() != source.topics.len()
-        || source_after_staging.content_identity_sha256 != source.content_identity_sha256
+        || source_after_staging.source_content_identity_sha256
+            != source.source_content_identity_sha256
+        || source_after_staging.imported_content_identity_sha256
+            != source.imported_content_identity_sha256
     {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -187,7 +199,8 @@ pub async fn import_bamboo_durable_memory(
         project_topics: source.topics.len() - source.global_topics,
         project_scopes: source.project_counts.len(),
         rebuilt_scopes,
-        content_identity_sha256: source.content_identity_sha256,
+        source_content_identity_sha256: source.source_content_identity_sha256,
+        imported_content_identity_sha256: source.imported_content_identity_sha256,
     })
 }
 
@@ -318,13 +331,15 @@ async fn scan_bamboo_topics(data_dir: &Path) -> io::Result<ValidatedSource> {
             None => global_topics += 1,
         }
     }
-    let content_identity_sha256 = content_identity(&topics);
+    let source_content_identity_sha256 = content_identity(&topics, false);
+    let imported_content_identity_sha256 = content_identity(&topics, true);
 
     Ok(ValidatedSource {
         topics,
         project_counts,
         global_topics,
-        content_identity_sha256,
+        source_content_identity_sha256,
+        imported_content_identity_sha256,
     })
 }
 
@@ -391,14 +406,14 @@ async fn scan_topic_directory(
                 entry.path().display()
             ))
         })?;
-        let bytes = fs::read(entry.path()).await?;
-        let raw = std::str::from_utf8(&bytes).map_err(|error| {
+        let source_bytes = fs::read(entry.path()).await?;
+        let raw = std::str::from_utf8(&source_bytes).map_err(|error| {
             invalid_data(format!(
                 "Bamboo topic is not UTF-8 '{}': {error}",
                 entry.path().display()
             ))
         })?;
-        let (frontmatter, _) = parse_markdown_document(raw).map_err(|error| {
+        let (frontmatter, body) = parse_markdown_document(raw).map_err(|error| {
             invalid_data(format!(
                 "invalid Bamboo topic '{}': {error}",
                 entry.path().display()
@@ -427,10 +442,19 @@ async fn scan_topic_directory(
                 entry.path().display()
             )));
         }
+        let imported_bytes = render_markdown_document(&frontmatter, &body)
+            .map_err(|error| {
+                invalid_data(format!(
+                    "failed to render current-schema Jiandu topic '{}': {error}",
+                    entry.path().display()
+                ))
+            })?
+            .into_bytes();
 
         topics.push(ImportTopic {
             relative_path: relative_dir.join(file_name),
-            bytes,
+            source_bytes,
+            imported_bytes,
             id: frontmatter.id,
             project_id: project_id.cloned(),
         });
@@ -438,15 +462,20 @@ async fn scan_topic_directory(
     Ok(())
 }
 
-fn content_identity(topics: &[ImportTopic]) -> String {
+fn content_identity(topics: &[ImportTopic], imported: bool) -> String {
     let mut digest = Sha256::new();
     digest.update(b"jiandu-bamboo-current-topics\0");
     for topic in topics {
+        let bytes = if imported {
+            &topic.imported_bytes
+        } else {
+            &topic.source_bytes
+        };
         let path = topic.relative_path.to_string_lossy();
         digest.update((path.len() as u64).to_be_bytes());
         digest.update(path.as_bytes());
-        digest.update((topic.bytes.len() as u64).to_be_bytes());
-        digest.update(&topic.bytes);
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
     }
     let mut hex = String::with_capacity(64);
     for byte in digest.finalize() {
