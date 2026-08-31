@@ -6,6 +6,8 @@
 mod atomic_fs;
 mod project_id;
 
+pub mod bamboo_import;
 pub mod memory_store;
 
+pub use bamboo_import::{BambooImportReport, import_bamboo_durable_memory};
 pub use project_id::{InvalidProjectId, ProjectId};
