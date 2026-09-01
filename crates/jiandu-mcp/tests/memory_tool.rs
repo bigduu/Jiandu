@@ -4,12 +4,12 @@ use jiandu_mcp::{
     MEMORY_ACTIONS, MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME,
     MemoryArgs, MemoryExecutionContext, MemoryServer, MemoryToolClass, memory_tool,
 };
+#[cfg(unix)]
+use jiandu_memory::memory_store::WRITE_AUDIT_LOG;
 use jiandu_memory::memory_store::{
     MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_TAG_CHARS,
-    MAX_MEMORY_TAGS, MAX_RETRIEVAL_TERM_CHARS, MemoryStore, render_markdown_document,
+    MAX_MEMORY_TAGS, MAX_RETRIEVAL_TERM_CHARS, MemoryScope, MemoryStore, render_markdown_document,
 };
-#[cfg(unix)]
-use jiandu_memory::memory_store::{MemoryScope, WRITE_AUDIT_LOG};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, JsonObject, ProtocolVersion},
@@ -197,7 +197,7 @@ async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() 
 }
 
 #[tokio::test]
-async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
+async fn all_nineteen_actions_parse_classify_and_dispatch_to_the_real_store() {
     use MemoryToolClass::{MutatingSerial, ReadOnlyParallel};
 
     let fixture = Fixture::global("session_dispatch");
@@ -209,6 +209,13 @@ async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
     let consolidate_a = write_global(server, "Dispatch consolidate A", "first source body").await;
     let consolidate_b = write_global(server, "Dispatch consolidate B", "second source body").await;
     let purge_id = write_global(server, "Dispatch purge", "purge source body").await;
+    let dream_generation = server
+        .execute(json!({"action":"dream_read","scope":"global"}))
+        .await
+        .expect("read cold Dream generation")["current_generation"]
+        .as_str()
+        .expect("Dream generation")
+        .to_string();
 
     let cases = vec![
         (
@@ -245,6 +252,16 @@ async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
             "get",
             json!({"action":"get","id":get_id,"options":{"max_chars":500}}),
             ReadOnlyParallel,
+        ),
+        (
+            "dream_read",
+            json!({"action":"dream_read","scope":"global"}),
+            ReadOnlyParallel,
+        ),
+        (
+            "dream_publish",
+            json!({"action":"dream_publish","scope":"global","source_generation":dream_generation,"content":"## Current orientation\n\n- Compact host-generated context."}),
+            MutatingSerial,
         ),
         (
             "find_duplicates",
@@ -298,7 +315,7 @@ async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
         ),
     ];
 
-    assert_eq!(cases.len(), 17);
+    assert_eq!(cases.len(), 19);
     assert_eq!(
         cases.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
         MEMORY_ACTIONS
@@ -311,6 +328,277 @@ async fn all_seventeen_actions_parse_classify_and_dispatch_to_the_real_store() {
         let result = server.execute(arguments).await.expect("real dispatch");
         assert_eq!(result["action"], name);
     }
+}
+
+#[tokio::test]
+async fn dream_is_generation_stamped_atomic_and_project_isolated() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let global_store = MemoryStore::new(directory.path());
+    let global = MemoryServer::new(
+        global_store.clone(),
+        MemoryExecutionContext::new("dream_global").expect("context"),
+    );
+    write_global(&global, "Dream source one", "First canonical Dream source.").await;
+
+    std::fs::remove_file(
+        global_store
+            .resolver()
+            .scope_generation_path(MemoryScope::Global, None),
+    )
+    .expect("simulate an existing pre-generation store");
+    let upgrade_error = global
+        .execute(json!({"action":"dream_read","scope":"global"}))
+        .await
+        .expect_err("non-empty old store requires rebuild");
+    assert!(upgrade_error.to_string().contains("run action=rebuild"));
+    global
+        .execute(json!({"action":"rebuild","scope":"global"}))
+        .await
+        .expect("upgrade rebuild");
+
+    let cold = global
+        .execute(json!({"action":"dream_read","scope":"global"}))
+        .await
+        .expect("cold Dream read");
+    assert_eq!(cold["found"], false);
+    assert_eq!(cold["stale"], false);
+    assert_eq!(cold["content"], Value::Null);
+    let first_generation = cold["current_generation"]
+        .as_str()
+        .expect("first generation")
+        .to_string();
+    assert_eq!(first_generation.len(), 64);
+
+    let published = global
+        .execute(json!({
+            "action":"dream_publish",
+            "scope":"global",
+            "source_generation":first_generation,
+            "content":"## Current orientation\n\n- First stable signal."
+        }))
+        .await
+        .expect("publish Dream");
+    assert_eq!(published["published"], true);
+    assert_eq!(published["stale"], false);
+    assert_eq!(
+        global_store
+            .count_scope_memories(MemoryScope::Global, None)
+            .await
+            .expect("canonical count"),
+        1,
+        "Dream is not a canonical topic"
+    );
+    assert_eq!(
+        global_store
+            .read_lexical_index(MemoryScope::Global, None)
+            .await
+            .expect("lexical index")
+            .expect("lexical index exists")
+            .items
+            .len(),
+        1,
+        "Dream is absent from lexical recall"
+    );
+
+    let fresh = global
+        .execute(json!({"action":"dream_read","scope":"global"}))
+        .await
+        .expect("fresh Dream read");
+    assert_eq!(fresh["found"], true);
+    assert_eq!(fresh["stale"], false);
+    assert_eq!(
+        fresh["content"],
+        "## Current orientation\n\n- First stable signal."
+    );
+    let prior_bytes = std::fs::read(
+        global_store
+            .resolver()
+            .dream_path(MemoryScope::Global, None),
+    )
+    .expect("Dream bytes");
+
+    write_global(
+        &global,
+        "Dream source two",
+        "A later canonical mutation changes the source generation.",
+    )
+    .await;
+    let stale = global
+        .execute(json!({"action":"dream_read","scope":"global"}))
+        .await
+        .expect("stale Dream read");
+    assert_eq!(stale["stale"], true);
+    assert_ne!(stale["current_generation"], stale["source_generation"]);
+    let current_generation = stale["current_generation"]
+        .as_str()
+        .expect("current generation")
+        .to_string();
+    let rejected = global
+        .execute(json!({
+            "action":"dream_publish",
+            "scope":"global",
+            "source_generation":first_generation,
+            "content":"This synthesis raced with canonical memory."
+        }))
+        .await
+        .expect_err("stale publish rejected");
+    assert!(
+        rejected
+            .to_string()
+            .contains("stale Dream source_generation")
+    );
+    assert_eq!(
+        std::fs::read(
+            global_store
+                .resolver()
+                .dream_path(MemoryScope::Global, None)
+        )
+        .expect("prior Dream remains"),
+        prior_bytes
+    );
+
+    global
+        .execute(json!({"action":"rebuild","scope":"global"}))
+        .await
+        .expect("rebuild");
+    assert_eq!(
+        global_store
+            .current_scope_generation(MemoryScope::Global, None)
+            .await
+            .expect("generation after rebuild"),
+        current_generation,
+        "rebuild does not invent a new canonical generation"
+    );
+    assert_eq!(
+        std::fs::read(
+            global_store
+                .resolver()
+                .dream_path(MemoryScope::Global, None)
+        )
+        .expect("rebuild preserves Dream"),
+        prior_bytes
+    );
+    let rejected = global
+        .execute(json!({
+            "action":"dream_publish",
+            "scope":"global",
+            "source_generation":&current_generation,
+            "content":"   "
+        }))
+        .await
+        .expect_err("empty Dream rejected");
+    assert!(rejected.to_string().contains("1..=12000"));
+    let oversized = "界".repeat(12_001);
+    let rejected = global
+        .execute(json!({
+            "action":"dream_publish",
+            "scope":"global",
+            "source_generation":&current_generation,
+            "content":oversized
+        }))
+        .await
+        .expect_err("oversized Dream rejected");
+    assert!(rejected.to_string().contains("1..=12000"));
+    assert_eq!(
+        std::fs::read(
+            global_store
+                .resolver()
+                .dream_path(MemoryScope::Global, None)
+        )
+        .expect("failed publish preserves Dream"),
+        prior_bytes
+    );
+
+    let context_a = MemoryExecutionContext::new("dream_project_a")
+        .expect("context")
+        .with_project_id("project_a")
+        .expect("project A");
+    let context_b = MemoryExecutionContext::new("dream_project_b")
+        .expect("context")
+        .with_project_id("project_b")
+        .expect("project B");
+    let project_a = MemoryServer::new(MemoryStore::new(directory.path()), context_a);
+    let project_b = MemoryServer::new(MemoryStore::new(directory.path()), context_b);
+    let empty_project = project_a
+        .execute(json!({"action":"dream_read","scope":"project"}))
+        .await
+        .expect("fresh empty Project Dream is a cold state");
+    assert_eq!(empty_project["found"], false);
+    assert_eq!(empty_project["stale"], false);
+    assert_eq!(
+        empty_project["current_generation"]
+            .as_str()
+            .expect("empty Project generation")
+            .len(),
+        64
+    );
+    let write_a = project_a
+        .execute(json!({
+            "action":"write",
+            "scope":"project",
+            "type":"project",
+            "title":"Project A Dream source",
+            "content":"Only Project A may orient from this fact."
+        }))
+        .await
+        .expect("write Project A");
+    assert_eq!(write_a["memory"]["scope"], "project");
+    project_b
+        .execute(json!({
+            "action":"write",
+            "scope":"project",
+            "type":"project",
+            "title":"Project B Dream source",
+            "content":"Only Project B may orient from this fact."
+        }))
+        .await
+        .expect("write Project B");
+    let cold_a = project_a
+        .execute(json!({"action":"dream_read","scope":"project"}))
+        .await
+        .expect("Project A cold Dream");
+    project_a
+        .execute(json!({
+            "action":"dream_publish",
+            "scope":"project",
+            "source_generation":cold_a["current_generation"],
+            "content":"## Project A orientation\n\n- A only."
+        }))
+        .await
+        .expect("publish Project A Dream");
+    let read_a = project_a
+        .execute(json!({"action":"dream_read","scope":"project"}))
+        .await
+        .expect("read Project A Dream");
+    let read_b = project_b
+        .execute(json!({"action":"dream_read","scope":"project"}))
+        .await
+        .expect("read Project B Dream");
+    assert_eq!(read_a["project_key"], "project_a");
+    assert_eq!(read_a["found"], true);
+    assert_eq!(read_b["project_key"], "project_b");
+    assert_eq!(read_b["found"], false);
+
+    let unbound = MemoryServer::new(
+        MemoryStore::new(directory.path()),
+        MemoryExecutionContext::new("dream_unbound").expect("context"),
+    );
+    assert!(
+        unbound
+            .execute(json!({"action":"dream_read","scope":"project"}))
+            .await
+            .expect_err("Project Dream requires host authority")
+            .to_string()
+            .contains("project scope requires a project_id")
+    );
+    assert!(
+        global
+            .execute(json!({"action":"dream_read","scope":"session"}))
+            .await
+            .expect_err("Session Dream unsupported")
+            .to_string()
+            .contains("supports durable scopes only")
+    );
 }
 
 #[tokio::test]
@@ -403,9 +691,9 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
     assert_eq!(tool.name, MEMORY_TOOL_NAME);
     let schema = tool.schema_as_json_value();
     let branches = schema["oneOf"].as_array().expect("tagged enum oneOf");
-    assert_eq!(branches.len(), 17);
+    assert_eq!(branches.len(), 19);
 
-    let contracts: [(&str, &[&str], &[&str]); 17] = [
+    let contracts: [(&str, &[&str], &[&str]); 19] = [
         ("session_read", &["action", "options", "topic"], &["action"]),
         (
             "session_append",
@@ -435,6 +723,22 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
             "get",
             &["action", "id", "options", "project_key"],
             &["action", "id"],
+        ),
+        (
+            "dream_read",
+            &["action", "project_key", "scope"],
+            &["action", "scope"],
+        ),
+        (
+            "dream_publish",
+            &[
+                "action",
+                "content",
+                "project_key",
+                "scope",
+                "source_generation",
+            ],
+            &["action", "content", "scope", "source_generation"],
         ),
         (
             "find_duplicates",
@@ -562,6 +866,8 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
 
     for action in [
         "query",
+        "dream_read",
+        "dream_publish",
         "write",
         "find_duplicates",
         "scan_blobs",
@@ -634,7 +940,28 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
     let serialized = serde_json::to_string(&schema).expect("schema JSON");
     assert!(serialized.contains("allow_merge_if_similar"));
     assert!(serialized.contains("include_related"));
-    for action in ["query", "get", "write"] {
+    let dream_publish = branch(&schema, "dream_publish");
+    assert_eq!(
+        find_key(
+            &dream_publish["properties"]["source_generation"],
+            "minLength"
+        )
+        .and_then(Value::as_u64),
+        Some(64)
+    );
+    assert_eq!(
+        find_key(
+            &dream_publish["properties"]["source_generation"],
+            "maxLength"
+        )
+        .and_then(Value::as_u64),
+        Some(64)
+    );
+    assert_eq!(
+        find_key(&dream_publish["properties"]["content"], "maxLength").and_then(Value::as_u64),
+        Some(12_000)
+    );
+    for action in ["query", "get", "dream_read", "dream_publish", "write"] {
         assert!(
             branch(&schema, action)["description"]
                 .as_str()
@@ -679,6 +1006,11 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
         "Before write, query",
         "keywords/entities/tags",
         "omitted/blank query",
+        "dream_read",
+        "current_generation",
+        "dream_publish",
+        "rejects stale synthesis",
+        "never makes the model call",
     ] {
         assert!(
             description.contains(guidance),
@@ -1129,6 +1461,12 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         "inspect",
         "session_append",
         "write",
+        "dream_read",
+        "dream_publish",
+        "lower-trust",
+        "current_generation",
+        "rejects a stale generation",
+        "never chooses a model",
         "Project scope",
         "Global",
         "project_key",
@@ -1173,6 +1511,17 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
             .await
             .is_err(),
         "the removed multi-tool surface must not remain as an alias"
+    );
+
+    let cold_dream = call_memory(&client, json!({"action":"dream_read","scope":"global"})).await;
+    assert_eq!(cold_dream["found"], false);
+    assert_eq!(cold_dream["stale"], false);
+    assert_eq!(
+        cold_dream["current_generation"]
+            .as_str()
+            .expect("empty Global generation")
+            .len(),
+        64
     );
 
     let write = call_memory(

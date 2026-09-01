@@ -39,6 +39,11 @@ Use the single `memory` tool; a host may namespace it as
   comes from the MCP host.
 - Query before `write`. Store only confirmed, durable, non-secret facts that
   will help a future session, as concise atomic items with searchable titles.
+- Use `dream_read` only for low-cost orientation. A missing snapshot is a normal
+  cold state; a stale snapshot is advisory only. A host may generate bounded
+  Markdown with its own model and call `dream_publish` using the observed
+  `current_generation`, but factual work must still use `query`/`get` and live
+  tools. Jiandu owns no Dream model, prompt, cadence, or scheduler.
 - Never edit Jiandu data files directly or create a repository memory file as a
   fallback; all reads and mutations go through `jiandu-memory` or the MCP tool.
 - Configure every agent that shares memory with the same Jiandu-owned

@@ -24,12 +24,12 @@ pub use recall::{
 };
 pub use store::MemoryStore;
 pub use types::{
-    BlobScanItem, BlobScanReport, CreatedBy, DuplicateCluster, DuplicateClusterMember,
-    DuplicateScanReport, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,
-    DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource,
-    DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult, MemoryContradictionResult,
-    MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPurgeResult,
-    MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
+    BlobScanItem, BlobScanReport, CreatedBy, DreamReadResult, DreamSnapshot, DuplicateCluster,
+    DuplicateClusterMember, DuplicateScanReport, DurableContentLocation, DurableMemoryDocument,
+    DurableMemoryFrontmatter, DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval,
+    DurableMemorySource, DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult,
+    MemoryContradictionResult, MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult,
+    MemoryPurgeResult, MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
     MemoryRetrievalInput, MemoryScope, MemorySplitPiece, MemorySplitResult, SessionState,
     TemporalGranularity,
 };
@@ -60,6 +60,9 @@ pub const CONTRADICTION_AUDIT_LOG: &str = "contradiction_audit.jsonl";
 pub const MEMORY_VIEW_FILE: &str = "MEMORY.md";
 pub const RECENT_VIEW_FILE: &str = "RECENT.md";
 pub const STALE_VIEW_FILE: &str = "STALE.md";
+pub const DREAM_VIEW_FILE: &str = "DREAM.md";
+pub const SCOPE_GENERATION_FILE: &str = "source_generation.json";
+pub const MAX_DREAM_CONTENT_CHARS: usize = 12_000;
 pub const LEXICAL_INDEX_FILE: &str = "lexical.json";
 pub const GRAPH_INDEX_FILE: &str = "graph.json";
 pub const RECENT_INDEX_FILE: &str = "recent.json";

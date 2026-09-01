@@ -11,7 +11,7 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 
 - `jiandu-memory` provides persistence, maintenance, and lexical/BM25/CJK recall.
 - `jiandu-mcp` exposes the store over stdio as one MCP tool named `memory`.
-  Its `action` argument selects one of 17 memory operations.
+  Its `action` argument selects one of 19 memory operations.
 
 ## Memory scopes
 
@@ -55,6 +55,34 @@ Project memory use the same data directory and host-authorized `project-id`.
 Query before writing, keep durable items concise, and never edit Jiandu's data
 files directly.
 
+## Dream orientation
+
+Dream is one compact host-generated orientation snapshot for Global memory and
+each authorized Project. It is derived prose, not canonical truth, and never
+enters topic counts, lifecycle operations, or lexical recall.
+
+First call `dream_read`. It returns a missing cold state or the current snapshot,
+plus the canonical-memory `current_generation` and an advisory `stale` flag. A
+host that owns a model, prompt, cadence, and budget may synthesize up to 12,000
+characters of Markdown, then call `dream_publish` with the generation observed
+before synthesis began:
+
+```json
+{
+  "action": "dream_publish",
+  "scope": "project",
+  "source_generation": "<current_generation from dream_read>",
+  "content": "## Current orientation\n\n- ..."
+}
+```
+
+Jiandu publishes the body and metadata atomically and rejects the result if
+canonical memory changed meanwhile. A missing generation marker after upgrading
+an existing store requires one `rebuild` for that authorized scope. For factual
+decisions, always use `query`/`get` and current tools; Dream is only a cheap first
+orientation. Jiandu never selects or calls a model/provider and does not schedule
+Dream generation.
+
 ## One-time import from Bamboo
 
 Before Bamboo switches its native memory store to the Jiandu root, stop Bamboo
@@ -90,8 +118,10 @@ using the Bamboo source as a fallback memory root.
 
 Bamboo can use `jiandu-memory` directly and optimize recall while assembling
 its dynamic context. Ranking, prompt placement, and token budgeting remain
-Bamboo responsibilities. Other agents use `jiandu-mcp` as shared memory without
-depending on Bamboo runtime types.
+Bamboo responsibilities. Bamboo also owns Dream synthesis prompts, model choice,
+cadence, failure policy, and prompt placement; Jiandu only persists the resulting
+generation-stamped snapshot. Other agents use `jiandu-mcp` as shared memory
+without depending on Bamboo runtime types.
 
 ## Verify
 
