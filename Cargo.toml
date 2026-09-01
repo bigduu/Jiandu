@@ -21,6 +21,7 @@ schemars = { version = "1.2.2", features = ["preserve_order"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
+unicode-normalization = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

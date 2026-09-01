@@ -72,11 +72,14 @@ current canonical durable topics under `memory/v1/scopes/global/topics/*.md`
 and `projects/<ProjectId>/memory/v1/topics/*.md`; Session notes, Dream/Ledger/
 plan data, indexes, views, logs, locks, state, and migration administration are
 not copied. Every topic is validated before a sibling staging store is built,
-each imported scope is rebuilt once, and the completed store is published only
-after source and staged content identities match. The JSON result reports
-scanned/imported/failed counts and a SHA-256 identity for the exact topic paths
-and bytes. The command never deletes the Bamboo source and refuses to overwrite
-an initialized Jiandu root.
+then rendered once through Jiandu's current typed schema so retired metadata such
+as `embedding_ready` does not become new Jiandu state. Each imported scope is
+rebuilt once, and the completed store is published only after the raw source and
+current-schema staged identities match their validated expectations. The JSON
+result reports scanned/imported/failed counts plus separate SHA-256 identities
+for the raw source topic paths/bytes and imported current-schema paths/bytes.
+The command never deletes the Bamboo source and refuses to overwrite an
+initialized Jiandu root.
 
 After a successful cutover, Bamboo should construct its native
 `jiandu-memory::MemoryStore` with this Jiandu-owned root. Other agents should

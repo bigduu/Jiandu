@@ -65,13 +65,18 @@ async fn existing_jiandu_binary_imports_once_and_a_fresh_reader_uses_the_store()
     assert_eq!(report["imported"], 2);
     assert_eq!(report["failed"], 0);
     assert_eq!(report["rebuilt_scopes"], 2);
-    assert_eq!(
-        report["content_identity_sha256"]
-            .as_str()
-            .expect("content identity")
-            .len(),
-        64
-    );
+    for field in [
+        "source_content_identity_sha256",
+        "imported_content_identity_sha256",
+    ] {
+        assert_eq!(
+            report[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} identity"))
+                .len(),
+            64
+        );
+    }
 
     // This integration-test process is independent from the completed importer
     // process and opens the published root exactly like a native Jiandu host.

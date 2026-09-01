@@ -60,7 +60,6 @@ fn fixture_frontmatter(
         retrieval: DurableMemoryRetrieval {
             keywords: vec!["bamboo".to_string(), format!("marker{ordinal}")],
             entities: vec![format!("Entity-{ordinal}")],
-            embedding_ready: false,
             last_accessed_at: Some("2026-08-30T00:00:00+00:00".to_string()),
         },
     }
@@ -213,6 +212,68 @@ async fn global_only_import_accepts_an_existing_empty_destination() {
 }
 
 #[tokio::test]
+async fn import_canonicalizes_retired_embedding_metadata_without_touching_source() {
+    let root = tempdir().expect("root");
+    let source = root.path().join("bamboo");
+    let destination = root.path().join("jiandu");
+    fs::create_dir(&source).expect("source");
+    let frontmatter = write_topic(
+        &source,
+        "mem_legacy_embedding",
+        MemoryScope::Global,
+        None,
+        2,
+        "Legacy source body remains exact after current-schema import.",
+    );
+    let source_topic = topic_path(&source, MemoryScope::Global, None, "mem_legacy_embedding");
+    let current = fs::read_to_string(&source_topic).expect("current-schema source");
+    let legacy = current.replacen(
+        "  last_accessed_at:",
+        "  embedding_ready: true\n  last_accessed_at:",
+        1,
+    );
+    assert_ne!(legacy, current, "fixture must add the retired field");
+    fs::write(&source_topic, legacy).expect("write legacy source topic");
+    let source_before = tree_snapshot(&source);
+
+    let report = import_bamboo_durable_memory(&source, &destination)
+        .await
+        .expect("legacy import");
+    assert_ne!(
+        report.source_content_identity_sha256,
+        report.imported_content_identity_sha256
+    );
+    assert_eq!(tree_snapshot(&source), source_before);
+    assert!(
+        fs::read_to_string(&source_topic)
+            .expect("unchanged source topic")
+            .contains("embedding_ready: true")
+    );
+
+    let destination_topic = topic_path(
+        &destination,
+        MemoryScope::Global,
+        None,
+        "mem_legacy_embedding",
+    );
+    let imported = fs::read_to_string(destination_topic).expect("imported topic");
+    assert!(!imported.contains("embedding_ready"));
+    assert_eq!(
+        imported,
+        render_markdown_document(
+            &frontmatter,
+            "Legacy source body remains exact after current-schema import."
+        )
+        .expect("expected current-schema topic")
+    );
+    assert!(
+        !fs::read_to_string(destination.join("memory/v1/scopes/global/indexes/lexical.json"))
+            .expect("rebuilt lexical index")
+            .contains("\"embedding\"")
+    );
+}
+
+#[tokio::test]
 async fn project_only_import_keeps_the_opaque_project_id() {
     let root = tempdir().expect("root");
     let source = root.path().join("bamboo");
@@ -305,22 +366,42 @@ async fn combined_import_preserves_topics_and_ignores_non_topic_bamboo_state() {
     assert_eq!(report.global_topics, 1);
     assert_eq!(report.project_topics, 1);
     assert_eq!(report.rebuilt_scopes, 2);
-    assert_eq!(report.content_identity_sha256.len(), 64);
+    assert_eq!(report.source_content_identity_sha256.len(), 64);
+    assert_eq!(report.imported_content_identity_sha256.len(), 64);
+    assert_eq!(
+        report.source_content_identity_sha256, report.imported_content_identity_sha256,
+        "already current-schema fixtures should remain byte-identical"
+    );
     assert_eq!(tree_snapshot(&source), source_before);
 
-    for (scope, id, project) in [
-        (MemoryScope::Global, "mem_combined_global", None),
-        (
+    assert_eq!(
+        fs::read_to_string(topic_path(
+            &destination,
+            MemoryScope::Global,
+            None,
+            "mem_combined_global"
+        ))
+        .expect("destination Global topic"),
+        render_markdown_document(
+            &global_frontmatter,
+            "Global exact body with a combined-global-needle."
+        )
+        .expect("expected Global topic")
+    );
+    assert_eq!(
+        fs::read_to_string(topic_path(
+            &destination,
             MemoryScope::Project,
-            "mem_combined_project",
             Some(&project_id),
-        ),
-    ] {
-        assert_eq!(
-            fs::read(topic_path(&destination, scope, project, id)).expect("destination topic"),
-            fs::read(topic_path(&source, scope, project, id)).expect("source topic")
-        );
-    }
+            "mem_combined_project"
+        ))
+        .expect("destination Project topic"),
+        render_markdown_document(
+            &project_frontmatter,
+            "Project exact body with a combined-project-needle."
+        )
+        .expect("expected Project topic")
+    );
 
     for excluded in [
         "memory/v1/sessions",
@@ -389,8 +470,12 @@ async fn combined_import_preserves_topics_and_ignores_non_topic_bamboo_state() {
         .await
         .expect("repeat import into another root");
     assert_eq!(
-        second_report.content_identity_sha256,
-        report.content_identity_sha256
+        second_report.source_content_identity_sha256,
+        report.source_content_identity_sha256
+    );
+    assert_eq!(
+        second_report.imported_content_identity_sha256,
+        report.imported_content_identity_sha256
     );
     assert_eq!(
         fs::read_to_string(destination.join("memory/v1/scopes/global/views/MEMORY.md"))

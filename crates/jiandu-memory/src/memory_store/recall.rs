@@ -93,6 +93,15 @@ pub fn recall_candidates_from_lexical_index(
     query: &str,
     limit: usize,
 ) -> Vec<MemoryRecallCandidate> {
+    recall_candidates_from_lexical_index_with_status_policy(index, query, limit, false)
+}
+
+pub(crate) fn recall_candidates_from_lexical_index_with_status_policy(
+    index: &LexicalIndex,
+    query: &str,
+    limit: usize,
+    include_all_statuses: bool,
+) -> Vec<MemoryRecallCandidate> {
     let query = query.trim();
     if limit == 0 || query.is_empty() {
         return Vec::new();
@@ -103,7 +112,11 @@ pub fn recall_candidates_from_lexical_index(
         return Vec::new();
     }
 
-    let corpus = super::lexical_bm25::Bm25Corpus::build(&index.items);
+    let corpus = if include_all_statuses {
+        super::lexical_bm25::Bm25Corpus::build_including_all_statuses(&index.items)
+    } else {
+        super::lexical_bm25::Bm25Corpus::build(&index.items)
+    };
     let mut candidates = index
         .items
         .iter()
@@ -240,7 +253,6 @@ mod tests {
             created_at: "2026-04-09T00:00:00Z".to_string(),
             summary: title.to_string(),
             granularity: None,
-            embedding: None,
         }
     }
 

@@ -12,20 +12,23 @@ use super::access_log::{
 };
 use super::freshness;
 use super::lexical_bm25;
+use super::recall::recall_candidates_from_lexical_index_with_status_policy;
 use super::{
     AuditLogEntry, CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT,
     GRAPH_INDEX_FILE, GraphIndex, GraphIndexItem, LEXICAL_INDEX_FILE, LexicalIndex,
-    LexicalIndexItem, MAX_MAX_CHARS, MAX_QUERY_LIMIT, MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE,
-    MERGE_AUDIT_LOG, MemoryContradictionResult, MemoryDuplicateCandidate, MemoryInspectResult,
-    MemoryMergeResult, MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions,
-    MemoryQueryResult, MemorySplitPiece, MemorySplitResult, PURGE_AUDIT_LOG, RECENT_INDEX_FILE,
-    RECENT_VIEW_FILE, RecentIndex, RecentIndexItem, STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE,
-    StaleCandidateItem, StaleCandidatesIndex, TAXONOMY_INDEX_FILE, TaxonomyIndex, WRITE_AUDIT_LOG,
+    LexicalIndexItem, MAX_MAX_CHARS, MAX_MEMORY_QUERY_CHARS, MAX_QUERY_LIMIT,
+    MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, MemoryContradictionResult,
+    MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPathResolver,
+    MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemorySplitPiece,
+    MemorySplitResult, PURGE_AUDIT_LOG, RECENT_INDEX_FILE, RECENT_VIEW_FILE, RecentIndex,
+    RecentIndexItem, STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, StaleCandidateItem,
+    StaleCandidatesIndex, TAXONOMY_INDEX_FILE, TaxonomyIndex, WRITE_AUDIT_LOG,
     build_memory_markdown_view, build_recent_markdown_view, build_stale_markdown_view,
-    derive_summary, detect_entities, extract_keywords, make_query_cursor, match_memory_query,
-    normalize_tags, now_rfc3339, parse_markdown_document, parse_query_cursor, parse_rfc3339,
-    render_markdown_document, sort_memories_desc, validate_memory_id, validate_memory_title,
-    validate_session_id, validate_session_topic,
+    derive_summary, make_query_cursor, match_memory_query, normalize_tags, now_rfc3339,
+    parse_markdown_document, parse_query_cursor, parse_rfc3339, render_markdown_document,
+    retrieval_entities, retrieval_entities_preserving, retrieval_keywords,
+    retrieval_keywords_preserving, sort_memories_desc, truncate_chars, validate_memory_id,
+    validate_memory_title, validate_session_id, validate_session_topic,
 };
 use super::{
     BlobScanItem, BlobScanReport, DuplicateCluster, DuplicateClusterMember, DuplicateScanReport,
@@ -34,7 +37,7 @@ use super::{
 use super::{
     CreatedBy, DurableMemoryDocument, DurableMemoryFrontmatter, DurableMemoryRelations,
     DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus, DurableMemoryType,
-    MemoryScope, SessionState, TemporalGranularity,
+    MemoryRetrievalInput, MemoryScope, SessionState, TemporalGranularity,
 };
 
 /// Hard structural cap on a durable memory body (characters). Appends that would
@@ -552,6 +555,14 @@ impl MemoryStore {
         options: &MemoryQueryOptions,
     ) -> io::Result<MemoryQueryResult> {
         let project_key = self.require_project_key(scope, project_key)?;
+        if query.map(str::trim).is_some_and(|value| {
+            !value.is_empty() && value.chars().count() > MAX_MEMORY_QUERY_CHARS
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("memory query exceeds {MAX_MEMORY_QUERY_CHARS} characters"),
+            ));
+        }
         let max_chars = options
             .max_chars
             .unwrap_or(DEFAULT_MAX_CHARS)
@@ -561,6 +572,126 @@ impl MemoryStore {
             .unwrap_or(DEFAULT_QUERY_LIMIT)
             .clamp(1, MAX_QUERY_LIMIT);
         let offset = parse_query_cursor(options.cursor.as_deref());
+
+        if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
+            let index = self
+                .read_lexical_index(scope, project_key)
+                .await
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "lexical index is invalid; run action=rebuild for scope={}: {error}",
+                            scope.as_str()
+                        ),
+                    )
+                })?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "lexical index is missing; run action=rebuild for scope={}",
+                            scope.as_str()
+                        ),
+                    )
+                })?;
+            let filtered_index = LexicalIndex {
+                generated_at: index.generated_at,
+                items: index
+                    .items
+                    .into_iter()
+                    .filter(|item| {
+                        filter_types.is_none_or(|types| types.contains(&item.r#type))
+                            && filter_statuses
+                                .is_none_or(|statuses| statuses.contains(&item.status))
+                            && filter_granularity.is_none_or(|granularities| {
+                                item.granularity
+                                    .is_some_and(|value| granularities.contains(&value))
+                            })
+                    })
+                    .collect(),
+            };
+            let candidates = recall_candidates_from_lexical_index_with_status_policy(
+                &filtered_index,
+                query,
+                filtered_index.items.len(),
+                // `query_scope` historically supports reviewing every durable
+                // status (including contradicted/archived) and exposes `status`
+                // on each hit. Preserve that management/verification contract;
+                // passive host recall still uses the stricter Active/Stale-only
+                // `recall_candidates_from_lexical_index` path.
+                true,
+            );
+            let matched_count = candidates.len();
+            let remaining = candidates.into_iter().skip(offset).collect::<Vec<_>>();
+            let per_item_max = (max_chars / limit.max(1)).max(120);
+            let indexed_by_id = filtered_index
+                .items
+                .iter()
+                .map(|item| (item.id.as_str(), item))
+                .collect::<HashMap<_, _>>();
+            let mut items = Vec::with_capacity(limit.min(remaining.len()));
+            for candidate in remaining.iter().take(limit) {
+                let Some(indexed) = indexed_by_id.get(candidate.id.as_str()) else {
+                    continue;
+                };
+                let related_ids = if options.include_related {
+                    let Some(doc) = self
+                        .get_memory_at_locator(scope, project_key, &candidate.id)
+                        .await?
+                    else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "lexical index references missing memory {}; run action=rebuild for scope={}",
+                                candidate.id,
+                                scope.as_str()
+                            ),
+                        ));
+                    };
+                    Self::combined_related_ids(&doc)
+                } else {
+                    Vec::new()
+                };
+                let (summary, summary_truncated) = truncate_chars(&indexed.summary, per_item_max);
+                items.push(MemoryQueryItem {
+                    id: indexed.id.clone(),
+                    title: indexed.title.clone(),
+                    r#type: indexed.r#type,
+                    scope: indexed.scope,
+                    status: indexed.status,
+                    summary: if summary_truncated {
+                        format!("{}...", summary.trim_end())
+                    } else {
+                        summary
+                    },
+                    tags: indexed.tags.clone(),
+                    granularity: indexed.granularity,
+                    relevance: candidate.score,
+                    related_ids,
+                    project_key: indexed.project_key.clone(),
+                });
+            }
+            let returned_count = items.len();
+            let remaining_count = remaining.len().saturating_sub(returned_count);
+            let next_cursor =
+                (remaining_count > 0).then(|| make_query_cursor(scope, offset + returned_count));
+
+            if !items.is_empty() {
+                let accessed_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+                self.record_memory_accesses(scope, project_key, &accessed_ids)
+                    .await;
+            }
+
+            return Ok(MemoryQueryResult {
+                items,
+                returned_count,
+                matched_count,
+                truncated: remaining_count > 0,
+                remaining_count,
+                next_cursor,
+            });
+        }
 
         let docs = self.list_memory_documents(scope, project_key).await?;
         let mut matches = docs
@@ -788,6 +919,37 @@ impl MemoryStore {
         allow_merge_if_similar: bool,
         granularity: Option<TemporalGranularity>,
     ) -> io::Result<DurableMemoryDocument> {
+        self.write_memory_with_retrieval(
+            scope,
+            project_key,
+            r#type,
+            title,
+            content,
+            tags,
+            &MemoryRetrievalInput::default(),
+            session_id,
+            actor,
+            allow_merge_if_similar,
+            granularity,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_memory_with_retrieval(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: DurableMemoryType,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+        allow_merge_if_similar: bool,
+        granularity: Option<TemporalGranularity>,
+    ) -> io::Result<DurableMemoryDocument> {
         let project_key = self.require_project_key(scope, project_key)?;
         let title = validate_memory_title(title)?;
         let content = content.trim();
@@ -811,7 +973,7 @@ impl MemoryStore {
         let mut related_ids: Vec<String> = Vec::new();
         if allow_merge_if_similar {
             match self
-                .find_similar_memory(scope, project_key, r#type, title, content, &tags)
+                .find_similar_memory(scope, project_key, r#type, title, content, &tags, retrieval)
                 .await?
             {
                 WriteSimilarity::Merge(existing) => {
@@ -843,13 +1005,19 @@ impl MemoryStore {
                         merged_tags.extend(tags.clone());
                         existing.frontmatter.tags =
                             normalize_tags(merged_tags.iter().map(String::as_str));
-                        existing.frontmatter.retrieval.keywords = extract_keywords(
+                        existing.frontmatter.retrieval.keywords = retrieval_keywords_preserving(
                             &existing.frontmatter.title,
                             &existing.body,
                             &existing.frontmatter.tags,
+                            &retrieval.keywords,
+                            &existing.frontmatter.retrieval.keywords,
                         );
-                        existing.frontmatter.retrieval.entities =
-                            detect_entities(&existing.frontmatter.title, &existing.body);
+                        existing.frontmatter.retrieval.entities = retrieval_entities_preserving(
+                            &existing.frontmatter.title,
+                            &existing.body,
+                            &retrieval.entities,
+                            &existing.frontmatter.retrieval.entities,
+                        );
                         self.write_document(&existing).await?;
                         self.append_audit(
                             scope,
@@ -928,9 +1096,8 @@ impl MemoryStore {
             },
             tags: tags.clone(),
             retrieval: DurableMemoryRetrieval {
-                keywords: extract_keywords(title, content, &tags),
-                entities: detect_entities(title, content),
-                embedding_ready: true,
+                keywords: retrieval_keywords(title, content, &tags, &retrieval.keywords),
+                entities: retrieval_entities(title, content, &retrieval.entities),
                 last_accessed_at: None,
             },
         };
@@ -1041,6 +1208,27 @@ impl MemoryStore {
         session_id: Option<&str>,
         actor: &str,
     ) -> io::Result<Option<MemorySplitResult>> {
+        let retrieval = vec![MemoryRetrievalInput::default(); pieces.len()];
+        self.split_memory_with_retrieval(
+            id,
+            preferred_project_key,
+            pieces,
+            &retrieval,
+            session_id,
+            actor,
+        )
+        .await
+    }
+
+    pub async fn split_memory_with_retrieval(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        pieces: &[MemorySplitPiece],
+        retrieval: &[MemoryRetrievalInput],
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemorySplitResult>> {
         let id = validate_memory_id(id)?;
         let Some(mut source) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
@@ -1049,6 +1237,12 @@ impl MemoryStore {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "split requires at least one piece",
+            ));
+        }
+        if retrieval.len() != pieces.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "split retrieval metadata must match the number of pieces",
             ));
         }
 
@@ -1087,7 +1281,7 @@ impl MemoryStore {
 
         // Pieces were fully validated above; this pass only persists them.
         let mut new_ids = Vec::with_capacity(pieces.len());
-        for piece in pieces {
+        for (piece, retrieval) in pieces.iter().zip(retrieval) {
             let title = validate_memory_title(&piece.title)?;
             let content = piece.content.trim();
             let r#type = piece.r#type.unwrap_or(source_type);
@@ -1128,9 +1322,8 @@ impl MemoryStore {
                 },
                 tags: tags.clone(),
                 retrieval: DurableMemoryRetrieval {
-                    keywords: extract_keywords(title, content, &tags),
-                    entities: detect_entities(title, content),
-                    embedding_ready: true,
+                    keywords: retrieval_keywords(title, content, &tags, &retrieval.keywords),
+                    entities: retrieval_entities(title, content, &retrieval.entities),
                     last_accessed_at: None,
                 },
             };
@@ -1199,9 +1392,37 @@ impl MemoryStore {
         tags: &[String],
         limit: usize,
     ) -> io::Result<Vec<MemoryDuplicateCandidate>> {
+        self.find_duplicate_candidates_with_retrieval(
+            scope,
+            project_key,
+            r#type,
+            title,
+            content,
+            tags,
+            &MemoryRetrievalInput::default(),
+            limit,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_duplicate_candidates_with_retrieval(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: Option<DurableMemoryType>,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        limit: usize,
+    ) -> io::Result<Vec<MemoryDuplicateCandidate>> {
         let project_key = self.require_project_key(scope, project_key)?;
         let candidate_keywords: HashSet<String> =
-            extract_keywords(title, content, tags).into_iter().collect();
+            retrieval_keywords(title, content, tags, &retrieval.keywords)
+                .into_iter()
+                .chain(retrieval_entities(title, content, &retrieval.entities))
+                .collect();
         if candidate_keywords.is_empty() {
             return Ok(Vec::new());
         }
@@ -1213,8 +1434,14 @@ impl MemoryStore {
                     && r#type.map_or(true, |wanted| doc.frontmatter.r#type == wanted)
             })
             .filter_map(|doc| {
-                let doc_keywords: HashSet<String> =
-                    doc.frontmatter.retrieval.keywords.iter().cloned().collect();
+                let doc_keywords: HashSet<String> = doc
+                    .frontmatter
+                    .retrieval
+                    .keywords
+                    .iter()
+                    .chain(doc.frontmatter.retrieval.entities.iter())
+                    .cloned()
+                    .collect();
                 let intersection = candidate_keywords.intersection(&doc_keywords).count();
                 if intersection == 0 {
                     return None;
@@ -1430,6 +1657,26 @@ impl MemoryStore {
         session_id: Option<&str>,
         actor: &str,
     ) -> io::Result<Option<MemoryConsolidateResult>> {
+        self.consolidate_memories_with_retrieval(
+            ids,
+            preferred_project_key,
+            merged,
+            &MemoryRetrievalInput::default(),
+            session_id,
+            actor,
+        )
+        .await
+    }
+
+    pub async fn consolidate_memories_with_retrieval(
+        &self,
+        ids: &[String],
+        preferred_project_key: Option<&str>,
+        merged: &MemorySplitPiece,
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemoryConsolidateResult>> {
         let ids = ids
             .iter()
             .map(|id| validate_memory_id(id))
@@ -1563,9 +1810,8 @@ impl MemoryStore {
             },
             tags: tags.clone(),
             retrieval: DurableMemoryRetrieval {
-                keywords: extract_keywords(title, content, &tags),
-                entities: detect_entities(title, content),
-                embedding_ready: true,
+                keywords: retrieval_keywords(title, content, &tags, &retrieval.keywords),
+                entities: retrieval_entities(title, content, &retrieval.entities),
                 last_accessed_at: None,
             },
         };
@@ -1826,6 +2072,31 @@ impl MemoryStore {
         actor: &str,
         source_memory_ids: &[String],
     ) -> io::Result<Option<MemoryMergeResult>> {
+        self.merge_memory_with_retrieval(
+            id,
+            preferred_project_key,
+            content,
+            tags,
+            &MemoryRetrievalInput::default(),
+            session_id,
+            actor,
+            source_memory_ids,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_memory_with_retrieval(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+        source_memory_ids: &[String],
+    ) -> io::Result<Option<MemoryMergeResult>> {
         let id = validate_memory_id(id)?;
         let source_ids = source_memory_ids
             .iter()
@@ -1917,9 +2188,19 @@ impl MemoryStore {
             id: None,
             actor: Some(actor.to_string()),
         };
-        doc.frontmatter.retrieval.keywords =
-            extract_keywords(&doc.frontmatter.title, &doc.body, &doc.frontmatter.tags);
-        doc.frontmatter.retrieval.entities = detect_entities(&doc.frontmatter.title, &doc.body);
+        doc.frontmatter.retrieval.keywords = retrieval_keywords_preserving(
+            &doc.frontmatter.title,
+            &doc.body,
+            &doc.frontmatter.tags,
+            &retrieval.keywords,
+            &doc.frontmatter.retrieval.keywords,
+        );
+        doc.frontmatter.retrieval.entities = retrieval_entities_preserving(
+            &doc.frontmatter.title,
+            &doc.body,
+            &retrieval.entities,
+            &doc.frontmatter.retrieval.entities,
+        );
         self.write_document(&doc).await?;
 
         let mut superseded_ids = Vec::new();
@@ -2312,6 +2593,7 @@ impl MemoryStore {
     /// old raw count-overlap gate: a common shared keyword no longer counts as much
     /// as a rare one, so unrelated memories are not force-merged and genuine dups
     /// (even reworded) are caught.
+    #[allow(clippy::too_many_arguments)]
     async fn find_similar_memory(
         &self,
         scope: MemoryScope,
@@ -2320,6 +2602,7 @@ impl MemoryStore {
         title: &str,
         content: &str,
         tags: &[String],
+        retrieval: &MemoryRetrievalInput,
     ) -> io::Result<WriteSimilarity> {
         let normalized_title = super::sanitize_component(title);
         let docs: Vec<DurableMemoryDocument> = self
@@ -2356,9 +2639,9 @@ impl MemoryStore {
         // and every term has df >= 1).
         let incoming_bag = lexical_bm25::field_weighted_bag(
             title,
-            &extract_keywords(title, content, tags),
+            &retrieval_keywords(title, content, tags, &retrieval.keywords),
             tags,
-            &detect_entities(title, content),
+            &retrieval_entities(title, content, &retrieval.entities),
             content,
         );
         let candidate_bags: Vec<std::collections::HashMap<String, f64>> = docs
@@ -2550,9 +2833,6 @@ impl MemoryStore {
                     created_at: doc.frontmatter.created_at.clone(),
                     summary: derive_summary(&doc.body, 240),
                     granularity: doc.frontmatter.granularity,
-                    // L1: populated at index-build time once a MemoryEmbedder backend
-                    // is wired; None today → recall stays pure BM25 (inert seam).
-                    embedding: None,
                 })
                 .collect(),
         };
@@ -5942,6 +6222,508 @@ mod tests {
             assert!(
                 sections.iter().any(|section| *section == expected),
                 "append {expected} was lost to a race (sections: {sections:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_metadata_roundtrips_and_recalls_when_absent_from_body() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let retrieval = MemoryRetrievalInput {
+            keywords: vec![
+                "  朱雀别名  ".to_string(),
+                "Release Phoenix".to_string(),
+                "RFD4821Q".to_string(),
+            ],
+            entities: vec!["ＡＰＩ 网关".to_string(), "Project Suzaku".to_string()],
+        };
+        let doc = store
+            .write_memory_with_retrieval(
+                MemoryScope::Project,
+                Some("proj-metadata"),
+                DurableMemoryType::Project,
+                "Canonical release decision",
+                "The selected rollout follows the approved canary sequence.",
+                &[" Auth 认证 ".to_string(), "发布/流程".to_string()],
+                &retrieval,
+                Some("session-1"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(doc.frontmatter.retrieval.keywords[0], "朱雀别名");
+        assert!(
+            doc.frontmatter
+                .retrieval
+                .entities
+                .contains(&"API 网关".to_string())
+        );
+        assert!(doc.frontmatter.tags.contains(&"auth-认证".to_string()));
+        assert!(doc.frontmatter.tags.contains(&"发布-流程".to_string()));
+
+        for query in [
+            "朱雀别名",
+            "ＡＰＩ 网关",
+            "API 网关",
+            "Auth 认证",
+            "RFD4821Q",
+        ] {
+            let result = store
+                .query_scope(
+                    MemoryScope::Project,
+                    Some("proj-metadata"),
+                    Some(query),
+                    None,
+                    None,
+                    None,
+                    &MemoryQueryOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.returned_count, 1, "metadata-only query {query}");
+            assert_eq!(result.items[0].id, doc.frontmatter.id);
+            assert!(!result.items[0].summary.contains(query));
+        }
+
+        let fetched = store
+            .get_memory(&doc.frontmatter.id, Some("proj-metadata"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.frontmatter.retrieval, doc.frontmatter.retrieval);
+    }
+
+    #[tokio::test]
+    async fn explicit_and_automatic_merge_preserve_existing_metadata_only_aliases() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+
+        for (title, automatic) in [
+            ("Explicit merge aliases", false),
+            ("Automatic merge aliases", true),
+        ] {
+            let prefix = if automatic { "auto" } else { "explicit" };
+            let old = MemoryRetrievalInput {
+                keywords: (0..32)
+                    .map(|index| format!("{prefix}-old-keyword-{index:02}"))
+                    .collect(),
+                entities: (0..16)
+                    .map(|index| format!("{prefix}-old-entity-{index:02}"))
+                    .collect(),
+            };
+            let original = store
+                .write_memory_with_retrieval(
+                    MemoryScope::Global,
+                    None,
+                    DurableMemoryType::Reference,
+                    title,
+                    "Canonical prose intentionally omits every model alias.",
+                    &[],
+                    &old,
+                    Some("session-1"),
+                    "main-model",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            let new = MemoryRetrievalInput {
+                keywords: (0..32)
+                    .map(|index| format!("{prefix}-new-keyword-{index:02}"))
+                    .collect(),
+                entities: (0..16)
+                    .map(|index| format!("{prefix}-new-entity-{index:02}"))
+                    .collect(),
+            };
+
+            let merged = if automatic {
+                store
+                    .write_memory_with_retrieval(
+                        MemoryScope::Global,
+                        None,
+                        DurableMemoryType::Reference,
+                        title,
+                        "A second confirmed section triggers exact-title auto merge.",
+                        &[],
+                        &new,
+                        Some("session-2"),
+                        "main-model",
+                        true,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                let result = store
+                    .merge_memory_with_retrieval(
+                        &original.frontmatter.id,
+                        None,
+                        "A second confirmed section uses explicit merge.",
+                        &[],
+                        &new,
+                        Some("session-2"),
+                        "main-model",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                store
+                    .get_memory(&result.merged_id, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(merged.frontmatter.id, original.frontmatter.id);
+            for expected in [
+                format!("{prefix}-old-keyword-31"),
+                format!("{prefix}-new-keyword-31"),
+            ] {
+                assert!(
+                    merged.frontmatter.retrieval.keywords.contains(&expected),
+                    "merge dropped {expected}"
+                );
+                let recalled = store
+                    .query_scope(
+                        MemoryScope::Global,
+                        None,
+                        Some(&expected),
+                        None,
+                        None,
+                        None,
+                        &MemoryQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    recalled
+                        .items
+                        .iter()
+                        .any(|item| item.id == original.frontmatter.id),
+                    "merge alias must remain index-recallable: {expected}"
+                );
+            }
+            for expected in [
+                format!("{prefix}-old-entity-15"),
+                format!("{prefix}-new-entity-15"),
+            ] {
+                assert!(
+                    merged.frontmatter.retrieval.entities.contains(&expected),
+                    "merge dropped {expected}"
+                );
+                let recalled = store
+                    .query_scope(
+                        MemoryScope::Global,
+                        None,
+                        Some(&expected),
+                        None,
+                        None,
+                        None,
+                        &MemoryQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    recalled
+                        .items
+                        .iter()
+                        .any(|item| item.id == original.frontmatter.id),
+                    "merge entity must remain index-recallable: {expected}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_empty_query_reads_only_the_index_and_hydrates_at_most_returned_k() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let project_key = Some("proj-index-only");
+        for index in 0..4 {
+            store
+                .write_memory_with_retrieval(
+                    MemoryScope::Project,
+                    project_key,
+                    DurableMemoryType::Project,
+                    &format!("Indexed candidate {index}"),
+                    &format!("Canonical body {index} must not be read by compact recall."),
+                    &[],
+                    &MemoryRetrievalInput {
+                        keywords: vec!["hot-index-term".to_string()],
+                        entities: Vec::new(),
+                    },
+                    Some("session-1"),
+                    "main-model",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let default_top = store
+            .query_scope(
+                MemoryScope::Project,
+                project_key,
+                Some("hot-index-term"),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_top.matched_count, 4);
+        assert_eq!(default_top.returned_count, DEFAULT_QUERY_LIMIT);
+        assert!(default_top.truncated);
+
+        let baseline = store
+            .query_scope(
+                MemoryScope::Project,
+                project_key,
+                Some("hot-index-term"),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(1),
+                    max_chars: Some(600),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .unwrap();
+        let top_id = baseline.items[0].id.clone();
+        let docs = store
+            .list_memory_documents(MemoryScope::Project, project_key)
+            .await
+            .unwrap();
+        let top_path = docs
+            .iter()
+            .find(|doc| doc.frontmatter.id == top_id)
+            .map(|doc| doc.path.clone())
+            .unwrap();
+        let top_bytes = fs::read(&top_path).await.unwrap();
+        for doc in &docs {
+            fs::write(&doc.path, b"not valid markdown").await.unwrap();
+        }
+
+        let compact = store
+            .query_scope(
+                MemoryScope::Project,
+                project_key,
+                Some("hot-index-term"),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(1),
+                    max_chars: Some(600),
+                    cursor: None,
+                    include_related: false,
+                },
+            )
+            .await
+            .expect("compact recall must not open any canonical topic body");
+        assert_eq!(compact.items[0].id, top_id);
+
+        fs::write(&top_path, top_bytes).await.unwrap();
+        let hydrated = store
+            .query_scope(
+                MemoryScope::Project,
+                project_key,
+                Some("hot-index-term"),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions {
+                    limit: Some(1),
+                    max_chars: Some(600),
+                    cursor: None,
+                    include_related: true,
+                },
+            )
+            .await
+            .expect("relation hydration must open only the returned K topic records");
+        assert_eq!(hydrated.items[0].id, top_id);
+    }
+
+    #[tokio::test]
+    async fn non_empty_query_requires_a_valid_rebuildable_index() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        for query in [None, Some("   ")] {
+            let management = store
+                .query_scope(
+                    MemoryScope::Global,
+                    None,
+                    query,
+                    None,
+                    None,
+                    None,
+                    &MemoryQueryOptions::default(),
+                )
+                .await
+                .expect("omitted/blank query keeps management listing semantics");
+            assert_eq!(management.matched_count, 0);
+        }
+        let long_blank = " ".repeat(MAX_MEMORY_QUERY_CHARS + 1);
+        let management = store
+            .query_scope(
+                MemoryScope::Global,
+                None,
+                Some(&long_blank),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions::default(),
+            )
+            .await
+            .expect("all-whitespace query keeps management listing semantics");
+        assert_eq!(management.matched_count, 0);
+        let oversized_query = "界".repeat(MAX_MEMORY_QUERY_CHARS + 1);
+        let oversized = store
+            .query_scope(
+                MemoryScope::Global,
+                None,
+                Some(&oversized_query),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(oversized.to_string().contains("exceeds 512 characters"));
+
+        let missing = store
+            .query_scope(
+                MemoryScope::Global,
+                None,
+                Some("needle"),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("run action=rebuild"));
+
+        store
+            .ensure_scope_dirs(MemoryScope::Global, None)
+            .await
+            .unwrap();
+        let lexical_path = store
+            .resolver()
+            .indexes_dir(MemoryScope::Global, None)
+            .join(LEXICAL_INDEX_FILE);
+        fs::write(lexical_path, b"{invalid json").await.unwrap();
+        let invalid = store
+            .query_scope(
+                MemoryScope::Global,
+                None,
+                Some("needle"),
+                None,
+                None,
+                None,
+                &MemoryQueryOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("run action=rebuild"));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual cold/warm indexed-query performance probe for issue #59"]
+    async fn benchmark_indexed_query_for_live_shaped_1k_and_10k_scopes() {
+        use std::time::Instant;
+
+        for count in [577_usize, 865, 1_000, 10_000] {
+            let dir = tempdir().unwrap();
+            let store = MemoryStore::new(dir.path());
+            let project_key = format!("bench-{count}");
+            store
+                .ensure_scope_dirs(MemoryScope::Project, Some(&project_key))
+                .await
+                .unwrap();
+            let index = LexicalIndex {
+                generated_at: now_rfc3339(),
+                items: (0..count)
+                    .map(|index| LexicalIndexItem {
+                        id: format!("bench_{index:05}"),
+                        title: format!("Live shaped memory {index}"),
+                        scope: MemoryScope::Project,
+                        project_key: Some(project_key.clone()),
+                        r#type: DurableMemoryType::Project,
+                        status: DurableMemoryStatus::Active,
+                        tags: vec!["benchmark".to_string()],
+                        keywords: if index % 7 == 0 {
+                            vec!["benchmark-needle".to_string()]
+                        } else {
+                            vec!["other-term".to_string()]
+                        },
+                        entities: Vec::new(),
+                        updated_at: "2026-09-01T00:00:00Z".to_string(),
+                        created_at: "2026-09-01T00:00:00Z".to_string(),
+                        summary: format!("Bounded compact summary for memory {index}."),
+                        granularity: None,
+                    })
+                    .collect(),
+            };
+            let index_path = store
+                .resolver()
+                .indexes_dir(MemoryScope::Project, Some(&project_key))
+                .join(LEXICAL_INDEX_FILE);
+            crate::atomic_fs::atomic_write(&index_path, &json_pretty_bytes(&index).unwrap())
+                .await
+                .unwrap();
+            let options = MemoryQueryOptions::default();
+
+            let cold_started = Instant::now();
+            let cold = store
+                .query_scope(
+                    MemoryScope::Project,
+                    Some(&project_key),
+                    Some("benchmark-needle"),
+                    None,
+                    None,
+                    None,
+                    &options,
+                )
+                .await
+                .unwrap();
+            let cold_micros = cold_started.elapsed().as_micros();
+            assert_eq!(cold.returned_count, 3);
+
+            let mut warm_micros = Vec::new();
+            for _ in 0..20 {
+                let started = Instant::now();
+                let result = store
+                    .query_scope(
+                        MemoryScope::Project,
+                        Some(&project_key),
+                        Some("benchmark-needle"),
+                        None,
+                        None,
+                        None,
+                        &options,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.returned_count, 3);
+                warm_micros.push(started.elapsed().as_micros());
+            }
+            warm_micros.sort_unstable();
+            let p50 = warm_micros[warm_micros.len() / 2];
+            let p95 = warm_micros[warm_micros.len() * 19 / 20];
+            eprintln!(
+                "indexed_query count={count} cold_us={cold_micros} warm_p50_us={p50} warm_p95_us={p95}"
             );
         }
     }

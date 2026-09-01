@@ -53,10 +53,17 @@ pub enum MemoryArgs {
         topic: Option<String>,
     },
     SessionListTopics,
+    /// Recall durable memory. A non-empty short keyword/entity query uses the
+    /// derived lexical index and returns compact ranked hits; omit or leave it
+    /// empty only for explicit management/filter listing.
     Query {
         #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 512),
+            description = "Short discriminative keywords, aliases, identifiers, or entities. Non-empty values use index-backed BM25/CJK recall; omitted/blank values preserve management listing semantics."
+        )]
         query: Option<String>,
         #[serde(default)]
         filters: Option<QueryFilters>,
@@ -70,6 +77,9 @@ pub enum MemoryArgs {
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
+    /// Fetch the selected memory after `query` returned its id. This is the
+    /// explicit full-body path and includes bounded retrieval keywords/entities/
+    /// tags plus body and retrieval-metadata truncation signals.
     Get {
         #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
         id: String,
@@ -83,16 +93,42 @@ pub enum MemoryArgs {
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
+    /// Write one confirmed, durable, non-secret atomic fact. Query first, then
+    /// provide concise model-selected retrieval hints; Jiandu deterministically
+    /// normalizes, bounds, deduplicates, and expands omitted metadata.
     Write {
         #[schemars(with = "DurableScopeSchema")]
         scope: String,
         #[serde(rename = "type")]
         #[schemars(with = "MemoryTypeSchema")]
         r#type: String,
+        #[schemars(description = "Concise searchable title for exactly one durable fact.")]
         title: String,
+        #[schemars(
+            description = "Complete atomic fact body; this is returned only by get, not compact query hits."
+        )]
         content: String,
         #[serde(default)]
+        #[schemars(
+            length(max = 32),
+            inner(length(min = 1, max = 64)),
+            description = "Optional CJK-safe categorical labels; at most 32, normalized and deduplicated."
+        )]
         tags: Vec<String>,
+        #[serde(default)]
+        #[schemars(
+            length(max = 32),
+            inner(length(min = 1, max = 96)),
+            description = "Up to 32 discriminative model-provided keywords or aliases, prioritized before deterministic fallback expansion."
+        )]
+        keywords: Vec<String>,
+        #[serde(default)]
+        #[schemars(
+            length(max = 16),
+            inner(length(min = 1, max = 96)),
+            description = "Up to 16 named identifiers or entities, including CJK and mixed-language values."
+        )]
+        entities: Vec<String>,
         #[serde(default)]
         #[schemars(
             length(max = 64),
@@ -111,7 +147,14 @@ pub enum MemoryArgs {
         id: String,
         content: String,
         #[serde(default)]
+        #[schemars(length(max = 32), inner(length(min = 1, max = 64)))]
         tags: Vec<String>,
+        #[serde(default)]
+        #[schemars(length(max = 32), inner(length(min = 1, max = 96)))]
+        keywords: Vec<String>,
+        #[serde(default)]
+        #[schemars(length(max = 16), inner(length(min = 1, max = 96)))]
+        entities: Vec<String>,
         #[serde(default)]
         #[schemars(
             length(max = 64),
@@ -151,7 +194,14 @@ pub enum MemoryArgs {
         #[schemars(with = "Option<MemoryTypeSchema>")]
         r#type: Option<String>,
         #[serde(default)]
+        #[schemars(length(max = 32), inner(length(min = 1, max = 64)))]
         tags: Vec<String>,
+        #[serde(default)]
+        #[schemars(length(max = 32), inner(length(min = 1, max = 96)))]
+        keywords: Vec<String>,
+        #[serde(default)]
+        #[schemars(length(max = 16), inner(length(min = 1, max = 96)))]
+        entities: Vec<String>,
         #[serde(default)]
         #[schemars(
             length(max = 64),
@@ -204,7 +254,14 @@ pub enum MemoryArgs {
         #[schemars(with = "Option<MemoryTypeSchema>")]
         r#type: Option<String>,
         #[serde(default)]
+        #[schemars(length(max = 32), inner(length(min = 1, max = 64)))]
         tags: Vec<String>,
+        #[serde(default)]
+        #[schemars(length(max = 32), inner(length(min = 1, max = 96)))]
+        keywords: Vec<String>,
+        #[serde(default)]
+        #[schemars(length(max = 16), inner(length(min = 1, max = 96)))]
+        entities: Vec<String>,
         #[serde(default)]
         #[schemars(
             length(max = 64),
@@ -302,12 +359,24 @@ impl MemoryArgs {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MemoryActionOptions {
     #[serde(default)]
+    #[schemars(
+        range(min = 1, max = 20),
+        description = "Maximum returned items. Query defaults to compact top 3 and never exceeds 20."
+    )]
     pub limit: Option<usize>,
     #[serde(default)]
+    #[schemars(
+        range(min = 1, max = 6000),
+        description = "Character budget for returned text fields."
+    )]
     pub max_chars: Option<usize>,
     #[serde(default)]
+    #[schemars(description = "Opaque cursor returned by a preceding query page.")]
     pub cursor: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "When true, query hydrates only the returned K records to include relation ids; false keeps recall index-only."
+    )]
     pub include_related: Option<bool>,
 }
 
@@ -338,7 +407,14 @@ pub struct SplitPiece {
     pub r#type: Option<String>,
     pub content: String,
     #[serde(default)]
+    #[schemars(length(max = 32), inner(length(min = 1, max = 64)))]
     pub tags: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 32), inner(length(min = 1, max = 96)))]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 16), inner(length(min = 1, max = 96)))]
+    pub entities: Vec<String>,
 }
 
 #[allow(dead_code)]
