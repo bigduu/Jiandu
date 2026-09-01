@@ -282,6 +282,32 @@ pub struct DurableMemoryDocument {
     pub path: PathBuf,
 }
 
+/// One host-generated, scope-local orientation snapshot derived from canonical
+/// durable memory. Dream is never a canonical memory record and is deliberately
+/// absent from lexical indexes and memory lifecycle operations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DreamSnapshot {
+    pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub generated_at: String,
+    pub source_generation: String,
+    pub content: String,
+}
+
+/// Current Dream orientation plus the canonical-memory generation against
+/// which freshness is evaluated. A missing snapshot is a normal cold state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DreamReadResult {
+    pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub current_generation: String,
+    pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<DreamSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableContentLocation {
     pub scope: MemoryScope,

@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -16,12 +19,12 @@ use super::recall::recall_candidates_from_lexical_index_with_status_policy;
 use super::{
     AuditLogEntry, CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT,
     GRAPH_INDEX_FILE, GraphIndex, GraphIndexItem, LEXICAL_INDEX_FILE, LexicalIndex,
-    LexicalIndexItem, MAX_MAX_CHARS, MAX_MEMORY_QUERY_CHARS, MAX_QUERY_LIMIT,
-    MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, MemoryContradictionResult,
-    MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPathResolver,
-    MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemorySplitPiece,
-    MemorySplitResult, PURGE_AUDIT_LOG, RECENT_INDEX_FILE, RECENT_VIEW_FILE, RecentIndex,
-    RecentIndexItem, STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, StaleCandidateItem,
+    LexicalIndexItem, MAX_DREAM_CONTENT_CHARS, MAX_MAX_CHARS, MAX_MEMORY_QUERY_CHARS,
+    MAX_QUERY_LIMIT, MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE, MERGE_AUDIT_LOG,
+    MemoryContradictionResult, MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult,
+    MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
+    MemorySplitPiece, MemorySplitResult, PURGE_AUDIT_LOG, RECENT_INDEX_FILE, RECENT_VIEW_FILE,
+    RecentIndex, RecentIndexItem, STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, StaleCandidateItem,
     StaleCandidatesIndex, TAXONOMY_INDEX_FILE, TaxonomyIndex, WRITE_AUDIT_LOG,
     build_memory_markdown_view, build_recent_markdown_view, build_stale_markdown_view,
     derive_summary, make_query_cursor, match_memory_query, normalize_tags, now_rfc3339,
@@ -35,9 +38,9 @@ use super::{
     MemoryConsolidateResult,
 };
 use super::{
-    CreatedBy, DurableMemoryDocument, DurableMemoryFrontmatter, DurableMemoryRelations,
-    DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus, DurableMemoryType,
-    MemoryRetrievalInput, MemoryScope, SessionState, TemporalGranularity,
+    CreatedBy, DreamReadResult, DreamSnapshot, DurableMemoryDocument, DurableMemoryFrontmatter,
+    DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus,
+    DurableMemoryType, MemoryRetrievalInput, MemoryScope, SessionState, TemporalGranularity,
 };
 
 /// Hard structural cap on a durable memory body (characters). Appends that would
@@ -127,6 +130,118 @@ fn json_pretty_bytes<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
             io::ErrorKind::InvalidData,
             format!("failed to serialize json: {error}"),
         )
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ScopeGeneration {
+    generation: String,
+    topic_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DreamSnapshotFrontmatter {
+    scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+    generated_at: String,
+    source_generation: String,
+}
+
+fn validate_source_generation(value: &str) -> io::Result<&str> {
+    let value = value.trim();
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source_generation must be a 64-character lowercase SHA-256 digest",
+        ));
+    }
+    Ok(value)
+}
+
+fn canonical_scope_generation(docs: &[DurableMemoryDocument]) -> io::Result<String> {
+    let mut canonical = docs
+        .iter()
+        .map(|doc| {
+            Ok((
+                doc.frontmatter.id.clone(),
+                render_markdown_document(&doc.frontmatter, &doc.body)?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    canonical.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut digest = Sha256::new();
+    digest.update(b"jiandu-canonical-scope-generation-v1\0");
+    for (id, rendered) in canonical {
+        digest.update(id.len().to_string().as_bytes());
+        digest.update([0]);
+        digest.update(id.as_bytes());
+        digest.update(rendered.len().to_string().as_bytes());
+        digest.update([0]);
+        digest.update(rendered.as_bytes());
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(hex)
+}
+
+fn render_dream_snapshot(snapshot: &DreamSnapshot) -> io::Result<String> {
+    let frontmatter = DreamSnapshotFrontmatter {
+        scope: snapshot.scope,
+        project_key: snapshot.project_key.clone(),
+        generated_at: snapshot.generated_at.clone(),
+        source_generation: snapshot.source_generation.clone(),
+    };
+    let yaml = serde_yaml::to_string(&frontmatter).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize Dream frontmatter: {error}"),
+        )
+    })?;
+    Ok(format!("---\n{}---\n\n{}\n", yaml, snapshot.content.trim()))
+}
+
+fn parse_dream_snapshot(raw: &str) -> io::Result<DreamSnapshot> {
+    let Some(rest) = raw.strip_prefix("---\n") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Dream snapshot is missing frontmatter start marker",
+        ));
+    };
+    let Some(end_idx) = rest.find("\n---\n") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Dream snapshot is missing frontmatter end marker",
+        ));
+    };
+    let frontmatter: DreamSnapshotFrontmatter =
+        serde_yaml::from_str(&rest[..end_idx]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse Dream frontmatter: {error}"),
+            )
+        })?;
+    validate_source_generation(&frontmatter.source_generation)?;
+    let content = rest[end_idx + "\n---\n".len()..].trim().to_string();
+    if content.is_empty() || content.chars().count() > MAX_DREAM_CONTENT_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Dream content must contain 1..={MAX_DREAM_CONTENT_CHARS} characters"),
+        ));
+    }
+    Ok(DreamSnapshot {
+        scope: frontmatter.scope,
+        project_key: frontmatter.project_key,
+        generated_at: frontmatter.generated_at,
+        source_generation: frontmatter.source_generation,
+        content,
     })
 }
 
@@ -2278,6 +2393,153 @@ impl MemoryStore {
         self.refresh_scope_artifacts(scope, project_key).await
     }
 
+    /// Read the deterministic identity of the current canonical durable-memory
+    /// set. The small marker is rebuilt from canonical documents together with
+    /// the normal indexes and views; callers should run `rebuild` if it is absent
+    /// after upgrading an existing store.
+    pub async fn current_scope_generation(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<String> {
+        if scope == MemoryScope::Session {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Dream supports durable scopes only",
+            ));
+        }
+        let project_key = self.require_project_key(scope, project_key)?;
+        let path = self.resolver.scope_generation_path(scope, project_key);
+        let raw = match fs::read_to_string(&path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.count_scope_memories(scope, project_key).await? == 0 {
+                    return canonical_scope_generation(&[]);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "canonical source generation is missing for scope={}; run action=rebuild for the same authorized scope",
+                        scope.as_str()
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let generation: ScopeGeneration = serde_json::from_str(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "canonical source generation is invalid for scope={}; run action=rebuild for the same authorized scope: {error}",
+                    scope.as_str()
+                ),
+            )
+        })?;
+        Ok(validate_source_generation(&generation.generation)?.to_string())
+    }
+
+    /// Read one scope-local host-generated Dream snapshot and compare its source
+    /// generation with the current canonical-memory generation marker.
+    pub async fn read_dream_snapshot(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<DreamReadResult> {
+        if scope == MemoryScope::Session {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Dream supports durable scopes only",
+            ));
+        }
+        let project_key = self.require_project_key(scope, project_key)?;
+        let current_generation = self.current_scope_generation(scope, project_key).await?;
+        let path = self.resolver.dream_path(scope, project_key);
+        if !path.exists() {
+            return Ok(DreamReadResult {
+                scope,
+                project_key: project_key.map(ToString::to_string),
+                current_generation,
+                stale: false,
+                snapshot: None,
+            });
+        }
+
+        let snapshot = parse_dream_snapshot(&fs::read_to_string(path).await?)?;
+        if snapshot.scope != scope
+            || snapshot.project_key.as_deref() != project_key
+            || (scope == MemoryScope::Global && snapshot.project_key.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Dream snapshot scope metadata does not match its authorized location",
+            ));
+        }
+        let stale = snapshot.source_generation != current_generation;
+        Ok(DreamReadResult {
+            scope,
+            project_key: project_key.map(ToString::to_string),
+            current_generation,
+            stale,
+            snapshot: Some(snapshot),
+        })
+    }
+
+    /// Atomically publish host-generated Dream prose only if canonical memory is
+    /// still at the generation the host observed before synthesis began.
+    pub async fn publish_dream_snapshot(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        source_generation: &str,
+        content: &str,
+    ) -> io::Result<DreamSnapshot> {
+        if scope == MemoryScope::Session {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Dream supports durable scopes only",
+            ));
+        }
+        let project_key = self.require_project_key(scope, project_key)?;
+        let source_generation = validate_source_generation(source_generation)?.to_string();
+        let content = content.trim();
+        let content_chars = content.chars().count();
+        if content_chars == 0 || content_chars > MAX_DREAM_CONTENT_CHARS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Dream content must contain 1..={MAX_DREAM_CONTENT_CHARS} characters (got {content_chars})"
+                ),
+            ));
+        }
+
+        let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
+        let docs = self.list_memory_documents(scope, project_key).await?;
+        let current_generation = canonical_scope_generation(&docs)?;
+        if source_generation != current_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "stale Dream source_generation; current canonical generation is {current_generation}; read current memory and synthesize again"
+                ),
+            ));
+        }
+
+        self.ensure_scope_dirs(scope, project_key).await?;
+        let snapshot = DreamSnapshot {
+            scope,
+            project_key: project_key.map(ToString::to_string),
+            generated_at: now_rfc3339(),
+            source_generation,
+            content: content.to_string(),
+        };
+        crate::atomic_fs::atomic_write(
+            &self.resolver.dream_path(scope, project_key),
+            render_dream_snapshot(&snapshot)?.as_bytes(),
+        )
+        .await?;
+        Ok(snapshot)
+    }
+
     pub async fn list_project_keys(&self) -> io::Result<Vec<String>> {
         if let Some(project_id) = self.resolver.project_id() {
             return Ok(vec![project_id.to_string()]);
@@ -2942,6 +3204,13 @@ impl MemoryStore {
         artifacts.push((
             state_dir.join("last_reindex.json"),
             json_pretty_bytes(&serde_json::json!({ "updated_at": now, "count": docs.len() }))?,
+        ));
+        artifacts.push((
+            self.resolver.scope_generation_path(scope, project_key),
+            json_pretty_bytes(&ScopeGeneration {
+                generation: canonical_scope_generation(&docs)?,
+                topic_count: docs.len(),
+            })?,
         ));
 
         crate::atomic_fs::atomic_write_batch(artifacts).await

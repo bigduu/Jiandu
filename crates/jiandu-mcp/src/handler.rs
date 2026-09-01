@@ -250,6 +250,66 @@ impl MemoryServer {
                     retrieval_metadata_truncated,
                 ))
             }
+            MemoryArgs::DreamRead { scope, project_key } => {
+                let scope = parse_durable_scope(&scope, "dream_read")?;
+                let access = self.resolve_access(project_key.as_deref(), scope)?;
+                let result = access
+                    .store
+                    .read_dream_snapshot(scope, access.project_key())
+                    .await
+                    .map_err(|error| execution("Failed to read Dream snapshot", error))?;
+                let (generated_at, source_generation, content) =
+                    result
+                        .snapshot
+                        .as_ref()
+                        .map_or((None, None, None), |snapshot| {
+                            (
+                                Some(snapshot.generated_at.as_str()),
+                                Some(snapshot.source_generation.as_str()),
+                                Some(snapshot.content.as_str()),
+                            )
+                        });
+                Ok(json!({
+                    "action": "dream_read",
+                    "found": result.snapshot.is_some(),
+                    "scope": result.scope,
+                    "project_key": result.project_key,
+                    "generated_at": generated_at,
+                    "source_generation": source_generation,
+                    "current_generation": result.current_generation,
+                    "stale": result.stale,
+                    "content": content,
+                }))
+            }
+            MemoryArgs::DreamPublish {
+                scope,
+                source_generation,
+                content,
+                project_key,
+            } => {
+                let scope = parse_durable_scope(&scope, "dream_publish")?;
+                let access = self.resolve_access(project_key.as_deref(), scope)?;
+                let snapshot = access
+                    .store
+                    .publish_dream_snapshot(
+                        scope,
+                        access.project_key(),
+                        &source_generation,
+                        &content,
+                    )
+                    .await
+                    .map_err(|error| execution("Failed to publish Dream snapshot", error))?;
+                Ok(json!({
+                    "action": "dream_publish",
+                    "published": true,
+                    "scope": snapshot.scope,
+                    "project_key": snapshot.project_key,
+                    "generated_at": snapshot.generated_at,
+                    "source_generation": snapshot.source_generation,
+                    "current_generation": snapshot.source_generation,
+                    "stale": false,
+                }))
+            }
             MemoryArgs::Write {
                 scope,
                 r#type,

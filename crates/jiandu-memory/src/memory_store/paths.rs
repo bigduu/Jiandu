@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ProjectId;
 
-use super::{types::MemoryScope, validate_memory_id};
+use super::{DREAM_VIEW_FILE, SCOPE_GENERATION_FILE, types::MemoryScope, validate_memory_id};
 
 pub const MEMORY_ROOT_DIR: &str = "memory";
 pub const MEMORY_VERSION_DIR: &str = "v1";
@@ -229,6 +229,15 @@ impl MemoryPathResolver {
                 .join(STATE_DIR),
             MemoryScope::Session => self.sessions_root(),
         }
+    }
+
+    pub fn dream_path(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
+        self.views_dir(scope, project_key).join(DREAM_VIEW_FILE)
+    }
+
+    pub fn scope_generation_path(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
+        self.state_dir(scope, project_key)
+            .join(SCOPE_GENERATION_FILE)
     }
 }
 
