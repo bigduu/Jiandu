@@ -55,6 +55,26 @@ Project memory use the same data directory and host-authorized `project-id`.
 Query before writing, keep durable items concise, and never edit Jiandu's data
 files directly.
 
+## Optional agent Skill
+
+The canonical [`jiandu-memory` Skill](skills/jiandu-memory/SKILL.md) teaches a
+host model the lowest-cost query/get/write, Dream, and deterministic maintenance
+workflows. It is optional: Jiandu's live MCP description, schema, and structured
+responses remain the correctness contract when the Skill is absent.
+
+Copy or symlink the canonical `skills/jiandu-memory/` directory into one native
+host location:
+
+| Host | Personal | Repository |
+| --- | --- | --- |
+| Codex | `$HOME/.agents/skills/jiandu-memory/` | `$REPO_ROOT/.agents/skills/jiandu-memory/` |
+| Claude Code | `~/.claude/skills/jiandu-memory/` | `$REPO_ROOT/.claude/skills/jiandu-memory/` |
+
+The host discovers and activates the Skill under its own permission model;
+Jiandu does not install or enable it. See the official
+[Codex Skill locations](https://developers.openai.com/codex/skills#where-codex-loads-local-skills)
+and [Claude Code Skill locations](https://code.claude.com/docs/en/slash-commands#where-skills-live).
+
 ## Dream orientation
 
 Dream is one compact host-generated orientation snapshot for Global memory and
