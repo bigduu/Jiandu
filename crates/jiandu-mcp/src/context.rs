@@ -75,6 +75,11 @@ impl MemoryExecutionContext {
         let Some(value) = metadata.get(MEMORY_CONTEXT_META_KEY) else {
             return Ok(self.clone());
         };
+        if !value.is_object() {
+            return Err(MemoryError::InvalidArguments(format!(
+                "host metadata {MEMORY_CONTEXT_META_KEY} must be an object"
+            )));
+        }
         let context: HostCallContext = serde_json::from_value(value.clone()).map_err(|error| {
             MemoryError::InvalidArguments(format!(
                 "invalid host metadata {MEMORY_CONTEXT_META_KEY}: {error}"
