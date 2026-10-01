@@ -2,12 +2,13 @@
 //!
 //! The wire contract is the current Bamboo `MemoryArgs` action enum. This crate
 //! maps it directly onto [`jiandu_memory::memory_store::MemoryStore`] and exposes
-//! only a local stdio transport.
+//! a local stdio transport and a read-only loopback browser console.
 
 mod args;
 mod context;
 mod handler;
 mod server;
+mod ui;
 
 pub use args::{
     MEMORY_ACTIONS, MemoryActionOptions, MemoryArgs, MemoryToolClass, QueryFilters, SplitPiece,
@@ -19,3 +20,4 @@ pub use server::{
     MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME, MemoryServer,
     memory_tool, serve_stdio,
 };
+pub use ui::serve_ui;

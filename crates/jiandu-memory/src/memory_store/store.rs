@@ -15,7 +15,7 @@ use super::access_log::{
 };
 use super::freshness;
 use super::lexical_bm25;
-use super::paths::{MEMORY_ROOT_DIR, MEMORY_VERSION_DIR, PROJECTS_DIR, SCOPES_DIR};
+use super::paths::{MEMORY_ROOT_DIR, MEMORY_VERSION_DIR, PROJECTS_DIR, SCOPES_DIR, SESSIONS_DIR};
 use super::recall::recall_candidates_from_lexical_index_with_status_policy;
 use super::{
     AuditLogEntry, CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT,
@@ -529,6 +529,50 @@ impl MemoryStore {
         self.list_current_session_topics(session_id).await
     }
 
+    /// Discover persisted Sessions for an explicitly launched local console.
+    /// This inventory does not change the Session identity granted by an MCP host.
+    pub async fn list_session_ids(&self) -> io::Result<Vec<String>> {
+        let mut root = self.resolver.data_dir();
+        for component in [MEMORY_ROOT_DIR, MEMORY_VERSION_DIR, SESSIONS_DIR] {
+            root.push(component);
+            if !Self::is_real_directory(&root).await? {
+                return Ok(Vec::new());
+            }
+        }
+        let mut ids = Vec::new();
+        let mut entries = fs::read_dir(root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let Ok(id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !validate_session_id(&id).is_ok_and(|canonical| canonical == id) {
+                continue;
+            }
+            let notes = self.resolver.session_note_dir(&id);
+            let state = self.resolver.session_state_path(&id);
+            let has_notes = match fs::symlink_metadata(notes).await {
+                Ok(metadata) if metadata.is_dir() => true,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error),
+            };
+            let has_state = match fs::symlink_metadata(state).await {
+                Ok(metadata) if metadata.is_file() => true,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error),
+            };
+            if has_notes || has_state {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     async fn list_current_session_topics(&self, session_id: &str) -> io::Result<Vec<String>> {
         validate_session_id(session_id)?;
         let dir = self.resolver.session_note_dir(session_id);
@@ -670,6 +714,57 @@ impl MemoryStore {
         filter_granularity: Option<&HashSet<TemporalGranularity>>,
         options: &MemoryQueryOptions,
     ) -> io::Result<MemoryQueryResult> {
+        self.query_scope_inner(
+            scope,
+            project_key,
+            query,
+            filter_types,
+            filter_statuses,
+            filter_granularity,
+            options,
+            true,
+        )
+        .await
+    }
+
+    /// Browse with identical retrieval semantics without adding an agent recall
+    /// signal to the access log. No canonical or derived bytes are written.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_scope_read_only(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        query: Option<&str>,
+        filter_types: Option<&HashSet<DurableMemoryType>>,
+        filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+        filter_granularity: Option<&HashSet<TemporalGranularity>>,
+        options: &MemoryQueryOptions,
+    ) -> io::Result<MemoryQueryResult> {
+        self.query_scope_inner(
+            scope,
+            project_key,
+            query,
+            filter_types,
+            filter_statuses,
+            filter_granularity,
+            options,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn query_scope_inner(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        query: Option<&str>,
+        filter_types: Option<&HashSet<DurableMemoryType>>,
+        filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+        filter_granularity: Option<&HashSet<TemporalGranularity>>,
+        options: &MemoryQueryOptions,
+        record_access: bool,
+    ) -> io::Result<MemoryQueryResult> {
         let project_key = self.require_project_key(scope, project_key)?;
         if query.map(str::trim).is_some_and(|value| {
             !value.is_empty() && value.chars().count() > MAX_MEMORY_QUERY_CHARS
@@ -793,7 +888,7 @@ impl MemoryStore {
             let next_cursor =
                 (remaining_count > 0).then(|| make_query_cursor(scope, offset + returned_count));
 
-            if !items.is_empty() {
+            if record_access && !items.is_empty() {
                 let accessed_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
                 self.record_memory_accesses(scope, project_key, &accessed_ids)
                     .await;
@@ -870,7 +965,7 @@ impl MemoryStore {
         // recall (the returned page), not every candidate that merely matched.
         // Best-effort — see `record_memory_accesses` — so a log failure here can
         // never turn a successful recall into an error.
-        if !items.is_empty() {
+        if record_access && !items.is_empty() {
             let accessed_ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
             self.record_memory_accesses(scope, project_key, &accessed_ids)
                 .await;
