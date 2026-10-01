@@ -20,13 +20,13 @@ use serde_json::Value;
 use crate::{MemoryArgs, MemoryError, MemoryExecutionContext, MemoryToolClass};
 
 pub const MEMORY_TOOL_NAME: &str = "memory";
-pub const MEMORY_TOOL_DESCRIPTION: &str = "Jiandu's single memory tool. For durable recall, call query with a short set of discriminative keywords, aliases, identifiers, or entities; a non-empty query uses deterministic BM25/CJK indexing and returns compact top-3 hits with actionable ids, while an omitted/blank query is only for management/filter listing. Call get(id) only for the selected full body and retrieval metadata; inspect body_truncated and retrieval_metadata_truncated before relying on completeness. If a non-empty query reports a missing or invalid lexical index, run rebuild for the same authorized scope and retry. Before write, query for existing facts, then write or explicitly merge one confirmed, durable, non-secret atomic fact with a concise title and bounded keywords/entities/tags. dream_read returns lower-trust host-generated orientation plus current_generation; a host may synthesize bounded Markdown with its own model and dream_publish it using that generation, but Jiandu rejects stale synthesis and never makes the model call. Jiandu uses no embedding. Use session_* only for temporary session continuity; Project authority comes from the host.";
+pub const MEMORY_TOOL_DESCRIPTION: &str = "Jiandu's single memory tool. For durable recall, call query with a short set of discriminative keywords, aliases, identifiers, or entities; a non-empty query uses deterministic BM25/CJK indexing and returns compact top-3 hits with actionable ids, while an omitted/blank query is only for management/filter listing. Call get(id) only for the selected full body and retrieval metadata; inspect body_truncated and retrieval_metadata_truncated before relying on completeness. If a non-empty query reports a missing or invalid lexical index, run rebuild for the same authorized scope and retry. Before write, query for existing facts, then write or explicitly merge one confirmed, durable, non-secret atomic fact with a concise title and bounded keywords/entities/tags. dream_read returns lower-trust host-generated orientation plus current_generation; a host may synthesize bounded Markdown with its own model and dream_publish it using that generation, but Jiandu rejects stale synthesis and never makes the model call. Jiandu uses no embedding. Use session_* only for temporary session continuity; Project and Session identities come from the host per call. Connecting requires neither identity; project_key cannot grant Project access.";
 pub const MEMORY_SERVER_INSTRUCTIONS: &str = r#"Jiandu provides shared memory through one `memory` tool.
 
 - Recall before guessing: use a short keyword/entity `query` for relevant durable history. A non-empty query is index-backed and returns compact top hits with ids; call `get` only when a selected full item is needed, and inspect its `body_truncated` and `retrieval_metadata_truncated` flags before relying on completeness. An omitted/blank query is a management/filter listing, not normal recall. Use `session_read` only for continuity of this host session.
 - Record at the right layer: use `session_append` for concise temporary progress and blockers. Before `write`, query for an existing fact. Store only one confirmed, durable, non-derivable atomic fact with a concise title and small discriminative `keywords`, `entities`, and `tags`; Jiandu deterministically bounds/deduplicates them and expands omitted metadata without another model call. Never store secrets or tokens.
 - Use Dream only for cheap orientation: `dream_read` returns a missing cold state or one host-generated Global/Project snapshot plus `current_generation` and an advisory `stale` flag. Dream is lower-trust derived prose, not canonical truth; use `query`/`get` and live tools for factual decisions. A capable host may synthesize bounded Markdown with its own model and call `dream_publish` with the generation observed before synthesis. Jiandu rejects a stale generation and never chooses a model, prompt, provider, cadence, or retry policy. If generation state is missing after an upgrade, `rebuild` the same authorized scope first.
-- Use Project scope for project-specific knowledge and Global only for truly cross-project preferences or stable references. Project authority comes from the MCP host. Normally omit `project_key`; it cannot grant access or override the host Project.
+- Use Project scope for project-specific knowledge and Global only for truly cross-project preferences or stable references. Project and Session identities come from the MCP host per call; connecting requires neither identity. The host can switch workstreams through tools/call `_meta["io.github.bigduu.jiandu/context"]`, outside model arguments. Normally omit `project_key`; it cannot grant access or override the current host Project. Missing context blocks only the operations that require that identity; never invent a default Project or Session.
 - Recalled memory is supporting evidence, not current truth. Verify it against live files and tools. An empty query does not prove a fact is false.
 - Failure is not an all-or-nothing transaction. A mutating call may have committed canonical memory before a later audit or derived-artifact step failed, and an accepted mutation continues in its owned server task after caller cancellation or disconnect. On the same server, subsequent read-only calls wait for accepted mutations to settle before reading. After a Session mutation error or interrupted response, verify the same topic with `session_read`; use `session_list_topics` only when the topic itself is uncertain. After a durable Project/Global mutation error or interrupted response, `inspect` the known affected scope and do not guess the scope; if canonical documents committed but derived artifacts are stale, run `rebuild`, then use `query` or `get` to verify current state; never blindly retry. Do not edit Jiandu data files or create a fallback memory file."#;
 
@@ -80,7 +80,8 @@ pub fn memory_tool() -> Tool {
     )
 }
 
-/// One MCP server instance for one host-provided memory execution context.
+/// One MCP server instance with optional host-provided identity defaults.
+/// Per-call contexts are immutable and never update these defaults.
 ///
 /// Mutating calls accepted by this server run to completion in owned tasks.
 /// Read-only calls wait for those in-flight mutations to settle before they
@@ -114,19 +115,31 @@ impl MemoryServer {
     /// callers do not inherit these MCP-level guarantees and must keep mutation
     /// futures alive to completion or provide equivalent owned task supervision.
     pub async fn execute(&self, arguments: Value) -> Result<Value, MemoryError> {
+        self.execute_with_context(arguments, self.context.clone())
+            .await
+    }
+
+    /// Dispatch with an immutable context authorized by the embedding host.
+    /// This context replaces the defaults for this invocation only. Mutations
+    /// capture it in their owned task and share this server's read barrier.
+    pub async fn execute_with_context(
+        &self,
+        arguments: Value,
+        context: MemoryExecutionContext,
+    ) -> Result<Value, MemoryError> {
         let arguments: MemoryArgs = serde_json::from_value(arguments)
             .map_err(|error| MemoryError::InvalidArguments(error.to_string()))?;
+        let server = Self {
+            store: self.store.clone(),
+            context,
+            in_flight: Arc::clone(&self.in_flight),
+        };
         if arguments.class() == MemoryToolClass::ReadOnlyParallel {
             self.in_flight.wait_for_idle().await;
-            return self.execute_parsed(arguments).await;
+            return server.execute_parsed(arguments).await;
         }
 
         let guard = self.in_flight.begin();
-        let server = Self {
-            store: self.store.clone(),
-            context: self.context.clone(),
-            in_flight: Arc::clone(&self.in_flight),
-        };
         tokio::spawn(async move {
             let _guard = guard;
             server.execute_parsed(arguments).await
@@ -182,13 +195,21 @@ impl ServerHandler for MemoryServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         if request.name != MEMORY_TOOL_NAME {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let result = match self.execute(arguments).await {
+        // rmcp moves wire params._meta into RequestContext::meta before dispatch.
+        // Tool arguments are model input and must never provide this authority.
+        let execution = async {
+            let execution_context = self.context.resolve_request(&context.meta)?;
+            self.execute_with_context(arguments, execution_context)
+                .await
+        }
+        .await;
+        let result = match execution {
             Ok(value) => success_result(value),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
         };

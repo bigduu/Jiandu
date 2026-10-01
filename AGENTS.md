@@ -47,8 +47,12 @@ Use the single `memory` tool; a host may namespace it as
 - Never edit Jiandu data files directly or create a repository memory file as a
   fallback; all reads and mutations go through `jiandu-memory` or the MCP tool.
 - Configure every agent that shares memory with the same Jiandu-owned
-  `--data-dir`. The host must still grant an explicit `project-id`; sharing a
-  root does not grant cross-Project access.
+  `--data-dir`; it is the only required connection argument. The host grants
+  Project and Session identity per call through
+  `_meta["io.github.bigduu.jiandu/context"]`, outside model arguments. The
+  optional `--project-id` and `--session-id` flags are defaults for dedicated
+  processes. Sharing a root does not grant cross-Project access, and model
+  arguments cannot supply host authority.
 
 ## Development Gates
 
