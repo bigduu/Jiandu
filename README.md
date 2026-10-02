@@ -18,7 +18,7 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 
 - **Session** is temporary continuity for one host-identified agent workstream.
 - **Project** is durable knowledge shared by agents working on the same project.
-  The MCP host grants access with a stable, opaque `project-id`.
+  The MCP host grants each call access with a stable, opaque `project_id`.
 - **Global** is durable knowledge that is genuinely useful across projects.
 
 ## Install and connect
@@ -35,9 +35,7 @@ Configure an MCP host to launch it:
     "jiandu": {
       "command": "jiandu",
       "args": [
-        "--data-dir", "/absolute/path/to/.jiandu",
-        "--session-id", "agent-session-1",
-        "--project-id", "project-1"
+        "--data-dir", "/absolute/path/to/.jiandu"
       ]
     }
   }
@@ -51,10 +49,45 @@ recall call still uses the same tool arguments:
 {"action":"query","scope":"project","query":"release decision"}
 ```
 
-Use a different `session-id` for each workstream. Agents that should share
-Project memory use the same data directory and host-authorized `project-id`.
-Query before writing, keep durable items concise, and never edit Jiandu's data
-files directly.
+Only `--data-dir` is required to connect. Global memory needs no Session or
+Project identity. One connection can serve multiple projects and workstreams:
+the host supplies identity separately for each `tools/call` request, outside
+model-generated tool arguments:
+
+```json
+{
+  "name": "memory",
+  "arguments": {"action":"query","scope":"project","query":"release decision"},
+  "_meta": {
+    "io.github.bigduu.jiandu/context": {
+      "project_id": "project-1",
+      "session_id": "agent-session-1"
+    }
+  }
+}
+```
+
+This is the `params` object of a `tools/call` request. The metadata key is a
+Jiandu extension that the host must explicitly support and populate; MCP does
+not automatically provide current Project or Session identity. Project actions
+require a host-authorized `project_id`; `session_*` actions require a host
+`session_id`. Either field can be omitted when the operation does not need it.
+`project_key` in tool arguments can only assert the current host Project and
+cannot grant access. Use a distinct Session id for each independent workstream.
+
+For hosts that dedicate one process to one workstream, `--session-id <ID>` and
+`--project-id <ID>` remain optional startup defaults. A per-call context replaces
+both defaults completely; `{}` explicitly clears them for that call. Context
+is never retained between calls, and malformed context is rejected instead of
+falling back to defaults. Clients without this metadata support can use Global
+memory or those fixed defaults.
+
+Rust hosts can construct `MemoryExecutionContext::default()` and use
+`MemoryServer::execute_with_context` to provide a trusted context per invocation.
+See the [per-call identity design](docs/design/mcp-call-context.md) for resolution,
+authority, and compatibility details. Agents sharing Project memory use the
+same data directory and Project identity. Query before writing, keep durable
+items concise, and never edit Jiandu's data files directly.
 
 ## Local console
 

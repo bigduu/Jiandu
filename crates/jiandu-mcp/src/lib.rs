@@ -14,7 +14,7 @@ pub use args::{
     MEMORY_ACTIONS, MemoryActionOptions, MemoryArgs, MemoryToolClass, QueryFilters, SplitPiece,
     WriteOptions,
 };
-pub use context::{MemoryError, MemoryExecutionContext};
+pub use context::{MEMORY_CONTEXT_META_KEY, MemoryError, MemoryExecutionContext};
 pub use jiandu_memory::ProjectId;
 pub use server::{
     MEMORY_SERVER_INSTRUCTIONS, MEMORY_TOOL_DESCRIPTION, MEMORY_TOOL_NAME, MemoryServer,
