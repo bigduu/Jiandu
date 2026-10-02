@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Jiandu · 本地记忆</title>
+  <link rel="stylesheet" href="/console.css">
+  <script src="/console.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到记忆内容</a>
+  <aside class="sidebar" aria-label="记忆范围">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">J</span><div><strong>Jiandu</strong><span>本地记忆控制台</span></div></div>
+    <span class="readonly"><i aria-hidden="true"></i>本地 · 只读</span>
+    <p class="nav-label">记忆范围</p>
+    <nav class="scope-nav" aria-label="选择记忆范围">
+      <button type="button" data-scope="global" class="scope-button active" aria-pressed="true"><span class="scope-icon" aria-hidden="true">G</span><span>Global<small>跨项目共享知识</small></span></button>
+      <button type="button" data-scope="project" class="scope-button" aria-pressed="false"><span class="scope-icon" aria-hidden="true">P</span><span>Project<small>项目专属记忆</small></span></button>
+      <button type="button" data-scope="session" class="scope-button" aria-pressed="false"><span class="scope-icon" aria-hidden="true">S</span><span>Session<small>会话笔记</small></span></button>
+    </nav>
+    <div id="project-picker" class="context-picker" hidden><label for="project-select">选择 Project</label><select id="project-select" disabled><option value="">目录载入中…</option></select></div>
+    <div id="session-picker" class="context-picker" hidden><label for="session-select">选择 Session</label><select id="session-select" disabled><option value="">目录载入中…</option></select></div>
+    <p class="scope-guide" id="scope-guide">所有项目共享的稳定事实、偏好与参考。</p>
+    <div class="sidebar-footer">
+      <button type="button" id="refresh-catalog" class="refresh-button"><span aria-hidden="true">↻</span> 刷新目录</button>
+      <p id="catalog-counts" class="muted">正在读取本地目录…</p>
+      <div class="data-location"><span>数据目录</span><code id="data-dir">—</code></div>
+    </div>
+  </aside>
+  <main id="main" tabindex="-1">
+    <header class="page-header">
+      <div><p class="eyebrow">JIANDU / <span id="scope-name">GLOBAL</span></p><h1 id="page-title">全局记忆</h1><p id="page-description" class="muted">跨项目共享的事实、偏好与参考。</p></div>
+      <span id="context-id" class="context-id">Global</span>
+    </header>
+    <p id="catalog-error" class="notice error" role="alert" hidden></p>
+    <form id="search-form" class="search-bar" role="search">
+      <div class="search-field"><label class="sr-only" for="query">搜索记忆</label><span aria-hidden="true">⌕</span><input id="query" type="search" placeholder="搜索关键词、标题或内容…" autocomplete="off" maxlength="512"></div>
+      <div id="status-filter" class="filter-field"><label for="status">状态</label><select id="status"><option value="">全部状态</option><option value="active">有效</option><option value="stale">待更新</option><option value="superseded">已替代</option><option value="contradicted">有冲突</option><option value="archived">已归档</option></select></div>
+      <button type="submit" class="primary-button">搜索</button>
+    </form>
+    <p id="query-hint" class="query-hint">留空搜索可浏览全部原始记忆；关键词搜索使用本地词法索引。</p>
+    <section id="health" class="health" aria-label="索引与 Dream 状态">
+      <div class="health-grid">
+        <div><span class="stat-label">本地索引</span><strong id="index-state">等待载入</strong><small id="index-time">—</small></div>
+        <div><span class="stat-label">记忆总数</span><strong id="memory-total">—</strong><small>当前记忆范围</small></div>
+        <div><span class="stat-label">Dream 快照</span><strong id="dream-state">等待载入</strong><small id="dream-time">仅用于方向提示</small></div>
+      </div>
+      <p id="status-note" class="notice" role="status" hidden></p>
+      <details id="dream-panel" hidden><summary>查看 Dream 内容<span>快照可能过期，请以记忆原文为准</span></summary><pre id="dream-content" class="plain-content dream-content"></pre></details>
+    </section>
+    <p id="session-info" class="session-info" hidden></p>
+    <div id="workspace" class="workspace">
+      <section class="list-panel" aria-labelledby="list-heading">
+        <div class="panel-heading"><h2 id="list-heading">记忆列表</h2><span id="result-count" class="muted" aria-live="polite">等待载入</span></div>
+        <div id="list" class="item-list" aria-busy="true"></div>
+        <div class="pagination"><button id="first-page" type="button" disabled>回到首页</button><span id="page-number">第 1 页</span><button id="next-page" type="button" disabled>下一页 <span aria-hidden="true">→</span></button></div>
+      </section>
+      <section id="detail" class="detail-panel" aria-label="记忆详情" aria-live="polite"></section>
+    </div>
+    <footer class="main-footer"><span>原始内容，清晰可见。</span><span>只读浏览不会记录访问或修改记忆。</span></footer>
+  </main>
+  <noscript>请启用 JavaScript 以读取本地 Jiandu 记忆。</noscript>
+</body>
+</html>

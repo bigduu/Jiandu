@@ -11,6 +11,13 @@ Keep MCP concerns out of the memory crate, and map MCP actions directly to
 provide a stable opaque `ProjectId`; prompt assembly and ranking policy belong
 to the consuming host.
 
+The `jiandu ui` command is a small, read-only loopback adapter in `jiandu-mcp`,
+with embedded browser assets and direct MemoryStore calls. It is a local human
+view of the selected data root, not an MCP transport or a source of agent
+authority. Use `query_scope_read_only` for browsing so it does not produce
+agent-access signals. Do not add a second store/index, frontend build runtime,
+HTTP mutation route, or Dream scheduler to the console.
+
 Jiandu owns one independent authoritative data root, normally `~/.jiandu`.
 Bamboo native memory and other agents' MCP processes use that same root after
 cutover; do not add a second Bamboo-owned durable store, dual-write path,

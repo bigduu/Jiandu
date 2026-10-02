@@ -12,6 +12,7 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 - `jiandu-memory` provides persistence, maintenance, and lexical/BM25/CJK recall.
 - `jiandu-mcp` exposes the store over stdio as one MCP tool named `memory`.
   Its `action` argument selects one of 19 memory operations.
+  The same binary also serves the local read-only browser console.
 
 ## Memory scopes
 
@@ -87,6 +88,32 @@ See the [per-call identity design](docs/design/mcp-call-context.md) for resoluti
 authority, and compatibility details. Agents sharing Project memory use the
 same data directory and Project identity. Query before writing, keep durable
 items concise, and never edit Jiandu's data files directly.
+
+## Local console
+
+```shell
+jiandu ui
+# Or select the same canonical root used by your agents:
+jiandu ui --data-dir /absolute/path/to/.jiandu --port 9123
+```
+
+Open the printed `http://127.0.0.1:<port>/` URL. The default root is `~/.jiandu`
+and port `0` asks the OS for an available port. No Session or Project identity
+is required. Press Ctrl-C to stop; the command serves only IPv4 loopback.
+
+Browse Global knowledge, switch first-class Projects, or select persisted
+Sessions. Search and page memories, filter their status, and read their full
+content, tags, timestamps and provenance. Durable scopes also show lexical-index
+availability and Dream snapshot freshness/content. Sessions show temporary
+notes and are not assigned to a Project by inference.
+
+The console uses the existing MemoryStore and bundled assets, without a
+separate frontend build or agent runtime. It does not write records, access
+signals, indexes, Session state or Dream snapshots. A missing/invalid index
+still permits blank-query browsing; rebuild it through the existing authorized
+memory tool when needed. This version has no edit, rebuild or Dream-generation
+controls, and lists only first-class Projects rather than legacy directories.
+See the [console design](docs/design/local-console.md).
 
 ## Optional agent Skill
 
