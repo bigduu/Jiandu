@@ -15,6 +15,7 @@ use super::access_log::{
 };
 use super::freshness;
 use super::lexical_bm25;
+use super::paths::{MEMORY_ROOT_DIR, MEMORY_VERSION_DIR, PROJECTS_DIR, SCOPES_DIR};
 use super::recall::recall_candidates_from_lexical_index_with_status_policy;
 use super::{
     AuditLogEntry, CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT,
@@ -2540,25 +2541,105 @@ impl MemoryStore {
         Ok(snapshot)
     }
 
-    pub async fn list_project_keys(&self) -> io::Result<Vec<String>> {
+    /// List validated first-class Projects with a real
+    /// `<data_dir>/projects/<id>/memory/v1` directory.
+    ///
+    /// A bound store reports only its caller-supplied Project id, even before
+    /// that Project has written memory. Inventory does not grant Project access.
+    pub async fn list_project_ids(&self) -> io::Result<Vec<crate::ProjectId>> {
         if let Some(project_id) = self.resolver.project_id() {
-            return Ok(vec![project_id.to_string()]);
+            return Ok(vec![project_id.clone()]);
         }
-        let root = self.resolver.scopes_root().join("projects");
-        if !root.exists() {
-            return Ok(Vec::new());
+        self.discover_project_ids(&[PROJECTS_DIR], &[MEMORY_ROOT_DIR, MEMORY_VERSION_DIR])
+            .await
+    }
+
+    /// List the sorted, deduplicated union of first-class Project ids and
+    /// validated legacy `memory/v1/scopes/projects/<id>` directories.
+    ///
+    /// Legacy directories are inventoried in place; this does not migrate them
+    /// or make them readable through a bound first-class Project view.
+    pub async fn list_project_keys(&self) -> io::Result<Vec<String>> {
+        let mut out = self
+            .list_project_ids()
+            .await?
+            .into_iter()
+            .map(crate::ProjectId::into_string)
+            .collect::<Vec<_>>();
+        if self.resolver.project_id().is_none() {
+            out.extend(
+                self.list_legacy_project_ids()
+                    .await?
+                    .into_iter()
+                    .map(crate::ProjectId::into_string),
+            );
         }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn list_legacy_project_ids(&self) -> io::Result<Vec<crate::ProjectId>> {
+        self.discover_project_ids(
+            &[
+                MEMORY_ROOT_DIR,
+                MEMORY_VERSION_DIR,
+                SCOPES_DIR,
+                PROJECTS_DIR,
+            ],
+            &[],
+        )
+        .await
+    }
+
+    async fn discover_project_ids(
+        &self,
+        ancestors: &[&str],
+        descendants: &[&str],
+    ) -> io::Result<Vec<crate::ProjectId>> {
+        let mut root = self.resolver.data_dir();
+        for component in ancestors {
+            root.push(component);
+            if !Self::is_real_directory(&root).await? {
+                return Ok(Vec::new());
+            }
+        }
+
         let mut out = Vec::new();
         let mut entries = fs::read_dir(root).await?;
         while let Some(entry) = entries.next_entry().await? {
-            if entry.path().is_dir()
-                && let Some(name) = entry.file_name().to_str()
-            {
-                out.push(name.to_string());
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(project_id) = crate::ProjectId::parse(name) else {
+                continue;
+            };
+            let mut path = entry.path();
+            let mut complete = true;
+            for component in descendants {
+                path.push(component);
+                if !Self::is_real_directory(&path).await? {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                out.push(project_id);
             }
         }
         out.sort();
         Ok(out)
+    }
+
+    async fn is_real_directory(path: &Path) -> io::Result<bool> {
+        match fs::symlink_metadata(path).await {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn list_memory_documents(
@@ -2627,11 +2708,24 @@ impl MemoryStore {
     /// Total durable-memory count across the global scope and every project scope
     /// (cheap; no parse). Used by the volume-triggered maintenance pass (L4) to
     /// detect library growth between time ticks.
+    ///
+    /// Unbound stores count both physical layouts, including separate topic
+    /// directories with the same Project id. Bound stores count only their
+    /// first-class Project and Global.
     pub async fn count_all_memories(&self) -> io::Result<usize> {
         let mut total = self.count_scope_memories(MemoryScope::Global, None).await?;
-        for key in self.list_project_keys().await.unwrap_or_default() {
+        for project_id in self.list_project_ids().await.unwrap_or_default() {
             total += self
-                .count_scope_memories(MemoryScope::Project, Some(&key))
+                .for_project(&project_id)
+                .count_scope_memories(MemoryScope::Project, Some(project_id.as_str()))
+                .await?;
+        }
+        if self.resolver.project_id().is_some() {
+            return Ok(total);
+        }
+        for project_id in self.list_legacy_project_ids().await.unwrap_or_default() {
+            total += self
+                .count_scope_memories(MemoryScope::Project, Some(project_id.as_str()))
                 .await?;
         }
         Ok(total)
