@@ -32,7 +32,7 @@ pub enum MemoryToolClass {
 
 /// Deserialization contract for the unified `memory` tool.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MemoryArgs {
     SessionRead {
         #[serde(default)]
@@ -54,7 +54,7 @@ pub enum MemoryArgs {
         #[serde(default)]
         topic: Option<String>,
     },
-    SessionListTopics,
+    SessionListTopics {},
     /// Recall durable memory. A non-empty short keyword/entity query uses the
     /// derived lexical index and returns compact ranked hits; omit or leave it
     /// empty only for explicit management/filter listing.
@@ -73,7 +73,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -89,7 +89,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -105,7 +105,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
     },
@@ -129,7 +129,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
     },
@@ -173,7 +173,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -199,7 +199,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -218,7 +218,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[schemars(length(min = 1))]
@@ -246,7 +246,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -259,7 +259,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -274,7 +274,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -306,7 +306,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
     },
@@ -323,7 +323,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
         #[serde(default)]
@@ -339,7 +339,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
     },
@@ -350,7 +350,7 @@ pub enum MemoryArgs {
         #[schemars(
             length(max = 64),
             regex(pattern = "^[A-Za-z0-9_-]+$"),
-            description = "Must match the host execution context Project id; it cannot grant Project access."
+            description = "Must match the current host-authorized Project id for this call; it cannot grant Project access."
         )]
         project_key: Option<String>,
     },
@@ -364,7 +364,7 @@ impl MemoryArgs {
             Self::SessionAppend { .. } => "session_append",
             Self::SessionReplace { .. } => "session_replace",
             Self::SessionClear { .. } => "session_clear",
-            Self::SessionListTopics => "session_list_topics",
+            Self::SessionListTopics {} => "session_list_topics",
             Self::Query { .. } => "query",
             Self::Get { .. } => "get",
             Self::DreamRead { .. } => "dream_read",
@@ -386,7 +386,7 @@ impl MemoryArgs {
     pub const fn class(&self) -> MemoryToolClass {
         match self {
             Self::SessionRead { .. }
-            | Self::SessionListTopics
+            | Self::SessionListTopics {}
             | Self::Query { .. }
             | Self::Get { .. }
             | Self::DreamRead { .. }

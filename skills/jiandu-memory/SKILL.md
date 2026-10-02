@@ -17,7 +17,10 @@ copy an action catalog into the prompt or invent host-specific fields.
 - Use Global only for stable facts or preferences that genuinely apply across
   projects.
 - Normally omit `project_key`. Project authority comes from the MCP host, and an
-  argument cannot grant or widen access.
+  argument cannot grant or widen access. The host can switch Project/Session
+  identities per invocation through Jiandu's request metadata extension,
+  outside tool arguments. If the needed context is missing, report it to the
+  host instead of inventing an id or moving Project knowledge to Global.
 - Do not use durable `query` as a Session lookup.
 
 ## Recall with the least work

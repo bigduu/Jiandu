@@ -11,7 +11,7 @@ enum AppCommand {
 
 struct ServeConfig {
     data_dir: PathBuf,
-    session_id: String,
+    session_id: Option<String>,
     project_id: Option<String>,
 }
 
@@ -24,7 +24,10 @@ struct ImportConfig {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match parse_args(env::args().skip(1))? {
         AppCommand::Serve(config) => {
-            let mut context = MemoryExecutionContext::new(config.session_id)?;
+            let mut context = MemoryExecutionContext::default();
+            if let Some(session_id) = config.session_id {
+                context = context.with_session_id(session_id)?;
+            }
             if let Some(project_id) = config.project_id {
                 context = context.with_project_id(project_id)?;
             }
@@ -88,7 +91,7 @@ fn parse_serve_args(arguments: impl IntoIterator<Item = String>) -> io::Result<S
 
     Ok(ServeConfig {
         data_dir: PathBuf::from(data_dir),
-        session_id: session_id.ok_or_else(|| invalid_input("--session-id is required"))?,
+        session_id,
         project_id,
     })
 }
@@ -136,7 +139,7 @@ fn required_path(value: Option<String>, flag: &str) -> io::Result<PathBuf> {
 
 fn print_help() {
     println!(
-        "Usage:\n  jiandu --data-dir <PATH> --session-id <ID> [--project-id <ID>]\n  jiandu import-bamboo --source-data-dir <BAMBOO_DATA_DIR> --data-dir <EMPTY_JIANDU_DATA_DIR>"
+        "Usage:\n  jiandu --data-dir <PATH> [--session-id <ID>] [--project-id <ID>]\n  jiandu import-bamboo --source-data-dir <BAMBOO_DATA_DIR> --data-dir <EMPTY_JIANDU_DATA_DIR>\n\nSession and Project ids are optional defaults. Hosts can supply per-call identities in tools/call _meta[\"io.github.bigduu.jiandu/context\"]."
     );
 }
 
@@ -149,7 +152,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_minimal_stdio_identity_flags() {
+    fn parses_optional_stdio_identity_defaults() {
         let command = parse_args([
             "--data-dir".to_string(),
             "/tmp/jiandu-data".to_string(),
@@ -163,7 +166,34 @@ mod tests {
             panic!("expected serve command")
         };
         assert_eq!(config.data_dir, PathBuf::from("/tmp/jiandu-data"));
-        assert_eq!(config.session_id, "session_1");
+        assert_eq!(config.session_id.as_deref(), Some("session_1"));
+        assert_eq!(config.project_id.as_deref(), Some("project_1"));
+    }
+
+    #[test]
+    fn starts_without_session_or_project_defaults() {
+        let command = parse_args(["--data-dir".to_string(), "/tmp/jiandu-data".to_string()])
+            .expect("data-dir is the only required serve flag");
+        let AppCommand::Serve(config) = command else {
+            panic!("expected serve command")
+        };
+        assert!(config.session_id.is_none());
+        assert!(config.project_id.is_none());
+    }
+
+    #[test]
+    fn project_default_does_not_require_a_session_default() {
+        let command = parse_args([
+            "--data-dir".to_string(),
+            "/tmp/jiandu-data".to_string(),
+            "--project-id".to_string(),
+            "project_1".to_string(),
+        ])
+        .expect("Project-only default");
+        let AppCommand::Serve(config) = command else {
+            panic!("expected serve command")
+        };
+        assert!(config.session_id.is_none());
         assert_eq!(config.project_id.as_deref(), Some("project_1"));
     }
 

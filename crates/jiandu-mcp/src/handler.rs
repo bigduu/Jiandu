@@ -56,7 +56,8 @@ impl MemoryServer {
     pub(crate) async fn execute_parsed(&self, arguments: MemoryArgs) -> Result<Value, MemoryError> {
         match arguments {
             MemoryArgs::SessionRead { topic, options } => {
-                let session_lock = session_memory_lock(self.context.session_id());
+                let session_id = self.context.require_session_id()?;
+                let session_lock = session_memory_lock(session_id);
                 let _guard = session_lock.lock().await;
                 let topic = session_topic(topic.as_deref());
                 let max_chars = options
@@ -65,7 +66,7 @@ impl MemoryServer {
                     .clamp(1, MAX_SESSION_NOTE_CHARS);
                 let content = self
                     .store
-                    .read_session_topic(self.context.session_id(), topic)
+                    .read_session_topic(session_id, topic)
                     .await
                     .map_err(|error| execution("Failed to read note", error))?;
                 let exists = content.is_some();
@@ -74,7 +75,7 @@ impl MemoryServer {
                 let (content, body_truncated) = truncate_chars(&body, max_chars);
                 Ok(json!({
                     "action": "session_read",
-                    "session_id": self.context.session_id(),
+                    "session_id": session_id,
                     "topic": topic,
                     "exists": exists,
                     "content": content,
@@ -84,13 +85,14 @@ impl MemoryServer {
                 }))
             }
             MemoryArgs::SessionAppend { topic, content } => {
-                let session_lock = session_memory_lock(self.context.session_id());
+                let session_id = self.context.require_session_id()?;
+                let session_lock = session_memory_lock(session_id);
                 let _guard = session_lock.lock().await;
                 let topic = session_topic(topic.as_deref());
                 let content = required_content(&content, "session_append")?;
                 let existing = self
                     .store
-                    .read_session_topic(self.context.session_id(), topic)
+                    .read_session_topic(session_id, topic)
                     .await
                     .map_err(|error| execution("Failed to read note", error))?;
                 let mut next = existing.unwrap_or_default();
@@ -106,12 +108,12 @@ impl MemoryServer {
                 }
                 let path = self
                     .store
-                    .write_session_topic(self.context.session_id(), topic, &next)
+                    .write_session_topic(session_id, topic, &next)
                     .await
                     .map_err(|error| execution("Failed to write note", error))?;
                 Ok(json!({
                     "action": "session_append",
-                    "session_id": self.context.session_id(),
+                    "session_id": session_id,
                     "topic": topic,
                     "path": path,
                     "length_chars": length_chars,
@@ -119,7 +121,8 @@ impl MemoryServer {
                 }))
             }
             MemoryArgs::SessionReplace { topic, content } => {
-                let session_lock = session_memory_lock(self.context.session_id());
+                let session_id = self.context.require_session_id()?;
+                let session_lock = session_memory_lock(session_id);
                 let _guard = session_lock.lock().await;
                 let topic = session_topic(topic.as_deref());
                 let content = required_content(&content, "session_replace")?;
@@ -131,12 +134,12 @@ impl MemoryServer {
                 }
                 let path = self
                     .store
-                    .write_session_topic(self.context.session_id(), topic, content)
+                    .write_session_topic(session_id, topic, content)
                     .await
                     .map_err(|error| execution("Failed to write note", error))?;
                 Ok(json!({
                     "action": "session_replace",
-                    "session_id": self.context.session_id(),
+                    "session_id": session_id,
                     "topic": topic,
                     "path": path,
                     "length_chars": length_chars,
@@ -144,32 +147,34 @@ impl MemoryServer {
                 }))
             }
             MemoryArgs::SessionClear { topic } => {
-                let session_lock = session_memory_lock(self.context.session_id());
+                let session_id = self.context.require_session_id()?;
+                let session_lock = session_memory_lock(session_id);
                 let _guard = session_lock.lock().await;
                 let topic = session_topic(topic.as_deref());
                 let deleted = self
                     .store
-                    .delete_session_topic(self.context.session_id(), topic)
+                    .delete_session_topic(session_id, topic)
                     .await
                     .map_err(|error| execution("Failed to delete note", error))?;
                 Ok(json!({
                     "action": "session_clear",
-                    "session_id": self.context.session_id(),
+                    "session_id": session_id,
                     "topic": topic,
                     "deleted": deleted,
                 }))
             }
-            MemoryArgs::SessionListTopics => {
-                let session_lock = session_memory_lock(self.context.session_id());
+            MemoryArgs::SessionListTopics {} => {
+                let session_id = self.context.require_session_id()?;
+                let session_lock = session_memory_lock(session_id);
                 let _guard = session_lock.lock().await;
                 let topics = self
                     .store
-                    .list_session_topics(self.context.session_id())
+                    .list_session_topics(session_id)
                     .await
                     .map_err(|error| execution("Failed to list topics", error))?;
                 Ok(json!({
                     "action": "session_list_topics",
-                    "session_id": self.context.session_id(),
+                    "session_id": session_id,
                     "count": topics.len(),
                     "topics": topics,
                 }))
@@ -334,7 +339,7 @@ impl MemoryServer {
                         &content,
                         &tags,
                         &MemoryRetrievalInput { keywords, entities },
-                        Some(self.context.session_id()),
+                        self.context.session_id(),
                         ACTOR,
                         options
                             .and_then(|value| value.allow_merge_if_similar)
@@ -379,7 +384,7 @@ impl MemoryServer {
                             access.project_key(),
                             &source_memory_ids,
                             reason.as_deref().or(Some(content.trim())),
-                            Some(self.context.session_id()),
+                            self.context.session_id(),
                             ACTOR,
                         )
                         .await
@@ -397,7 +402,7 @@ impl MemoryServer {
                             &content,
                             &tags,
                             &MemoryRetrievalInput { keywords, entities },
-                            Some(self.context.session_id()),
+                            self.context.session_id(),
                             ACTOR,
                             &source_memory_ids,
                         )
@@ -433,7 +438,7 @@ impl MemoryServer {
                         access.project_key(),
                         &pieces,
                         &retrieval,
-                        Some(self.context.session_id()),
+                        self.context.session_id(),
                         ACTOR,
                     )
                     .await
@@ -555,7 +560,7 @@ impl MemoryServer {
                         access.project_key(),
                         &merged,
                         &retrieval,
-                        Some(self.context.session_id()),
+                        self.context.session_id(),
                         ACTOR,
                     )
                     .await
@@ -664,7 +669,7 @@ impl MemoryServer {
         let project_id = self.context.resolve_project_id(requested)?;
         if scope == MemoryScope::Project && project_id.is_none() {
             return Err(MemoryError::InvalidArguments(
-                "project scope requires a project_id in the MCP execution context".to_string(),
+                "project scope requires a project_id in the host execution context; supply per-call Jiandu metadata or the optional --project-id default".to_string(),
             ));
         }
         let store = project_id
