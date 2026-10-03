@@ -42,7 +42,7 @@ try:
     except RuntimeError as error:
         if 'lexical index is missing' not in str(error):
             raise
-        print(str(error))
+        print(json.dumps({'expected_error': str(error)}, ensure_ascii=False))
         memory(action='rebuild', scope='project')
         memory(action='query', scope='project', query='demo release checklist')
     saved = memory(action='write', scope='project', type='reference',
@@ -50,9 +50,10 @@ try:
                    content='Synthetic demo project. Before each release, run the tests, review the changelog, and record the rollback command.',
                    tags=['demo', 'release'], keywords=['checklist', 'release'])
     hits = memory(action='query', scope='project', query='release checklist')
+    assert saved['memory']['id'] in {hit['id'] for hit in hits['data']['items']}, 'Recall did not return the saved demo memory'
     item = memory(action='get', id=saved['memory']['id'])
     assert 'rollback command' in json.dumps(item)
-    print('DEMO_DATA_DIR='+root)
+    print(json.dumps({'demo_data_dir': root}))
 finally:
     proc.terminate()
     proc.wait(timeout=5)

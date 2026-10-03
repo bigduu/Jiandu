@@ -22,7 +22,7 @@ From the Jiandu checkout, build the exact source and use a new temporary root:
 cargo build --locked -p jiandu-mcp
 JIANDU_BIN="${CARGO_TARGET_DIR:-target}/debug/jiandu" \
   python3 docs/demos/seed-memory-demo.py > /tmp/jiandu-demo-evidence.jsonl
-DEMO_ROOT=$(sed -n 's/^DEMO_DATA_DIR=//p' /tmp/jiandu-demo-evidence.jsonl)
+DEMO_ROOT=$(python3 -c 'import json,sys; print(next(row["demo_data_dir"] for row in map(json.loads, open(sys.argv[1])) if "demo_data_dir" in row))' /tmp/jiandu-demo-evidence.jsonl)
 "${CARGO_TARGET_DIR:-target}/debug/jiandu" ui --data-dir "$DEMO_ROOT" --port 9123
 ```
 
@@ -30,7 +30,9 @@ The seed script acts as a minimal MCP host and grants only its dedicated
 `readme-demo` Project through per-call `_meta`. It initializes MCP, queries the
 empty scope, follows the server's explicit missing-index instruction to rebuild,
 queries again, writes one reference, recalls it and retrieves its full body by
-ID. It asserts that the returned body contains the demo's rollback instruction.
+ID. It asserts that lexical recall includes the saved ID and that the returned
+body contains the demo's rollback instruction. Every stdout line is JSON,
+including the expected missing-index diagnostic and final demo-root record.
 All memory access uses MCP; no canonical data files are edited directly.
 
 In another terminal, with Playwright installed in an existing tool environment:
