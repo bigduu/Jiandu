@@ -93,11 +93,25 @@ recall call still uses the same tool arguments:
 
 For a first trial, use a new dedicated data directory and the example identities
 above. Ask the host to query Project memory, write one confirmed non-sensitive
-fact, then query it from a new connection with the same Project identity. For
-example, the `memory` tool accepts:
+fact, then query it from a new connection with the same Project identity. A fresh
+root has no lexical index: if the first query reports `lexical index is missing`,
+call `rebuild` for that same scope, then retry the query before writing. Rebuild
+only in response to that diagnostic. These are separate `memory` tool calls:
 
 ```json
 {"action":"query","scope":"project","query":"demo preview port"}
+```
+
+If that first call reports the missing-index diagnostic, run:
+
+```json
+{"action":"rebuild","scope":"project"}
+{"action":"query","scope":"project","query":"demo preview port"}
+```
+
+After the query succeeds:
+
+```json
 {"action":"write","scope":"project","type":"reference","title":"Demo preview port","content":"The fictional demo project uses port 4173 for its local preview."}
 {"action":"query","scope":"project","query":"demo preview port"}
 ```
