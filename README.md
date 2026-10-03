@@ -1,7 +1,40 @@
 # Jiandu
 
-Jiandu (简牍) is a small, filesystem-backed memory system for AI agents. It stores
-session notes and durable knowledge with deterministic lexical recall and MCP.
+![Jiandu brand illustration: bamboo slips beside a stream, representing records and shared memory.](docs/assets/jiandu-nature-hero.png)
+
+*Brand illustration, not a software screenshot. Bamboo slips represent records and shared memory.*
+
+**Give your agents a shared memory that survives a chat.** Jiandu (简牍) stores
+project decisions, reusable knowledge, and temporary session notes in one local
+filesystem store. Recall uses deterministic lexical search, including BM25/CJK;
+no embedding service or model provider is required.
+
+Use Project memory to carry confirmed decisions between agents, Session notes
+to resume a workstream, and Global memory for facts useful across projects.
+Bamboo can embed the memory crate; other runtimes connect through one MCP tool.
+Your host decides what to remember and how to place recalled facts in context.
+
+## Watch a memory lookup from source
+
+![Jiandu searches a demo project for a release checklist and opens the saved memory.](docs/demos/memory-console.gif)
+
+[Static image](docs/demos/memory-console.png) · [Reproduce the MCP write and browser lookup](docs/demos/reproduction.md)
+
+Real Linux Chromium capture of the **source-only read-only console**, which is
+not included in published `v0.2.0`. The clearly labelled demo memory was written
+through actual stdio MCP before recording. The browser searches and opens it;
+it does not write memory or run a model. No personal memory store was used.
+
+## Choose a version
+
+| Path | Available workflow |
+| --- | --- |
+| [Published v0.2.0](https://github.com/bigduu/Jiandu/releases/tag/v0.2.0) | Shared memory over stdio MCP, fixed per-process Project/Session defaults, Dream snapshots, and one-time Bamboo import. |
+| Current source | Also includes the read-only browser console and per-call host identity metadata described below. These additions are not in v0.2.0. |
+
+The source manifest still says `0.2.0`. Install that release for the published
+contract; build this checkout for the console and per-call context. Both require
+Rust 1.95 or newer to build. [Audit evidence](docs/readme-audit.md).
 
 Jiandu owns one authoritative data root, normally `~/.jiandu`. Bamboo native
 memory and every MCP client must use that same Jiandu-owned root after cutover;
@@ -24,7 +57,14 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 ## Install and connect
 
 ```shell
-cargo install jiandu-mcp --locked
+cargo install jiandu-mcp --version 0.2.0 --locked
+```
+
+For the source-only features, build this checkout instead:
+
+```shell
+cargo build --release --locked -p jiandu-mcp --bin jiandu
+# Use the absolute path to target/release/jiandu in your MCP configuration.
 ```
 
 Configure an MCP host to launch it:
@@ -35,7 +75,9 @@ Configure an MCP host to launch it:
     "jiandu": {
       "command": "jiandu",
       "args": [
-        "--data-dir", "/absolute/path/to/.jiandu"
+        "--data-dir", "/absolute/path/to/.jiandu",
+        "--project-id", "demo-project",
+        "--session-id", "demo-session"
       ]
     }
   }
@@ -48,6 +90,37 @@ recall call still uses the same tool arguments:
 ```json
 {"action":"query","scope":"project","query":"release decision"}
 ```
+
+For a first trial, use a new dedicated data directory and the example identities
+above. Ask the host to query Project memory, write one confirmed non-sensitive
+fact, then query it from a new connection with the same Project identity. A fresh
+root has no lexical index: if the first query reports `lexical index is missing`,
+call `rebuild` for that same scope, then retry the query before writing. Rebuild
+only in response to that diagnostic. These are separate `memory` tool calls:
+
+```json
+{"action":"query","scope":"project","query":"demo preview port"}
+```
+
+If that first call reports the missing-index diagnostic, run:
+
+```json
+{"action":"rebuild","scope":"project"}
+{"action":"query","scope":"project","query":"demo preview port"}
+```
+
+After the query succeeds:
+
+```json
+{"action":"write","scope":"project","type":"reference","title":"Demo preview port","content":"The fictional demo project uses port 4173 for its local preview."}
+{"action":"query","scope":"project","query":"demo preview port"}
+```
+
+These are separate tool calls with deliberately fictional demo data. Reuse the
+Project identity when sharing memory; choose a fresh Session identity for each
+independent workstream. The fixed flags work with v0.2.0 and current source.
+
+### Per-call identity (current source)
 
 Only `--data-dir` is required to connect. Global memory needs no Session or
 Project identity. One connection can serve multiple projects and workstreams:
@@ -89,7 +162,7 @@ authority, and compatibility details. Agents sharing Project memory use the
 same data directory and Project identity. Query before writing, keep durable
 items concise, and never edit Jiandu's data files directly.
 
-## Local console
+## Local console (current source)
 
 ```shell
 jiandu ui
