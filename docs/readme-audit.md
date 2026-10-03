@@ -39,3 +39,16 @@ availability in source is not presented as shipped in `cargo install` v0.2.0.
   product cleanup is outside this task.
 - Relative README file links and `git diff --check`: passed.
 - `cargo test --workspace --all-targets --all-features --locked`: passed.
+
+## Approved brand illustration
+
+The user-approved nature illustration is saved at `docs/assets/jiandu-nature-hero.png`.
+The original PNG was visually inspected and decoded, and its SHA-256 matched
+the approved image package. It is a brand illustration, not a software screenshot;
+the README alt text and visible caption say so. Existing source/release and
+recording limits still apply. The older artwork remains in repository history
+and any existing SVG asset is preserved.
+
+- Pixels: 1672 × 941 (RGB PNG)
+- Bytes: 2057987
+- SHA-256: `3f7d1f7712c07a7ff9f7f4adc061017097c4515fc0023425492f1e89962fc2e7`

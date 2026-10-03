@@ -1,5 +1,9 @@
 # Jiandu
 
+![Jiandu brand illustration: bamboo slips beside a stream, representing records and shared memory.](docs/assets/jiandu-nature-hero.png)
+
+*Brand illustration, not a software screenshot. Bamboo slips represent records and shared memory.*
+
 **Give your agents a shared memory that survives a chat.** Jiandu (简牍) stores
 project decisions, reusable knowledge, and temporary session notes in one local
 filesystem store. Recall uses deterministic lexical search, including BM25/CJK;
