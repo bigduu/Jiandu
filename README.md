@@ -32,8 +32,8 @@ it does not write memory or run a model. No personal memory store was used.
 | [Published v0.2.0](https://github.com/bigduu/Jiandu/releases/tag/v0.2.0) | Shared memory over stdio MCP, fixed per-process Project/Session defaults, Dream snapshots, and one-time Bamboo import. |
 | Current source | Also includes the read-only browser console and per-call host identity metadata described below. These additions are not in v0.2.0. |
 
-The source manifest still says `0.2.0`. Install that release for the published
-contract; build this checkout for the console and per-call context. Both require
+The source manifest now says `0.3.0` in preparation for the next release, which is
+not published yet. Install v0.2.0 for the published contract; build this checkout for the console and per-call context. Both require
 Rust 1.95 or newer to build. [Audit evidence](docs/readme-audit.md).
 
 Jiandu owns one authoritative data root, normally `~/.jiandu`. Bamboo native
