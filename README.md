@@ -56,16 +56,19 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 
 ## Install and connect
 
-```shell
-cargo install jiandu-mcp --version 0.2.0 --locked
-```
-
-For the source-only features, build this checkout instead:
+For the current source workflow, build this checkout:
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
-# Use the absolute path to target/release/jiandu in your MCP configuration.
 ```
+
+Use the absolute path to the resulting `target/release/jiandu` binary below.
+You do not need to fill in Project or Session IDs in this connection configuration.
+
+The older published release can still be installed with
+`cargo install jiandu-mcp --version 0.2.0 --locked`, but its CLI requires a
+`--session-id` startup value and does not support per-call identity metadata.
+The configuration below targets **current source**, not that older binary.
 
 Configure an MCP host to launch it:
 
@@ -73,54 +76,73 @@ Configure an MCP host to launch it:
 {
   "mcpServers": {
     "jiandu": {
-      "command": "jiandu",
+      "command": "/absolute/path/to/Jiandu/target/release/jiandu",
       "args": [
-        "--data-dir", "/absolute/path/to/.jiandu",
-        "--project-id", "demo-project",
-        "--session-id", "demo-session"
+        "--data-dir", "/absolute/path/to/.jiandu"
       ]
     }
   }
 }
 ```
 
-The host may namespace the tool as `mcp__jiandu__memory`. A typical Project
-recall call still uses the same tool arguments:
+The host may namespace the tool as `mcp__jiandu__memory`. For a first trial,
+use a new dedicated data directory and Global memory, which needs no identity
+context. Ask the host to query, write one confirmed non-sensitive cross-project
+fact, then query it from another connection to the same root. A fresh root has
+no lexical index: if the first query reports `lexical index is missing`, call
+`rebuild` for that same scope, then retry the query before writing. Rebuild only
+in response to that diagnostic. These are separate `memory` tool calls:
 
 ```json
-{"action":"query","scope":"project","query":"release decision"}
-```
-
-For a first trial, use a new dedicated data directory and the example identities
-above. Ask the host to query Project memory, write one confirmed non-sensitive
-fact, then query it from a new connection with the same Project identity. A fresh
-root has no lexical index: if the first query reports `lexical index is missing`,
-call `rebuild` for that same scope, then retry the query before writing. Rebuild
-only in response to that diagnostic. These are separate `memory` tool calls:
-
-```json
-{"action":"query","scope":"project","query":"demo preview port"}
+{"action":"query","scope":"global","query":"fictional user language preference"}
 ```
 
 If that first call reports the missing-index diagnostic, run:
 
 ```json
-{"action":"rebuild","scope":"project"}
-{"action":"query","scope":"project","query":"demo preview port"}
+{"action":"rebuild","scope":"global"}
+{"action":"query","scope":"global","query":"fictional user language preference"}
 ```
 
 After the query succeeds:
 
 ```json
-{"action":"write","scope":"project","type":"reference","title":"Demo preview port","content":"The fictional demo project uses port 4173 for its local preview."}
-{"action":"query","scope":"project","query":"demo preview port"}
+{"action":"write","scope":"global","type":"user","title":"Fictional user language preference","content":"This fictional demo user prefers replies in English across projects."}
+{"action":"query","scope":"global","query":"fictional user language preference"}
 ```
 
-These are separate tool calls with deliberately fictional demo data. Reuse the
-Project identity when sharing memory; choose a fresh Session identity for each
-independent workstream. The fixed flags work with v0.2.0 and current source.
+These calls use deliberately fictional demo data. In a host configured to supply
+Jiandu's Project/Session context, the ordinary tool calls also omit identity
+fields:
 
-### Per-call identity (current source)
+```json
+{"action":"query","scope":"project","query":"release decision"}
+{"action":"session_read"}
+```
+
+Project actions fail if Project context is missing; `session_*` actions fail if
+Session context is missing. They do not invent identities or silently fall back
+to Global. Ask the host integrator to supply the missing context; do not move
+project-specific facts into Global to bypass this boundary. A generic MCP host
+must explicitly implement the Jiandu metadata extension before these contextual
+calls work without dedicated-process defaults.
+
+### 中文用法（当前源码）
+
+构建当前源码后，MCP 连接配置只需指定生成的可执行文件和 `--data-dir`，
+普通用户无需填写 `project_id`、`session_id` 或 `project_key`。
+工具调用只填写 `action`、`scope`、`query` 等业务参数；上面的 Global 示例
+无需身份上下文即可试用。
+
+Project 和 Session 隔离并未取消。支持 Jiandu 扩展的宿主在每次调用时通过
+`_meta` 注入可信上下文；通用 MCP 宿主不会自动注入这项自定义元数据。
+缺少 Project 上下文时，Project 操作报错；缺少 Session 上下文时，
+`session_*` 操作报错。应由宿主集成方补齐上下文，不能编造身份或改写到
+Global 绕过授权。下节的启动身份参数仅是专用进程的可选默认值。
+已发布的旧版 v0.2.0 尚不支持逐调用上下文，启动时仍要求 `--session-id`；
+不要把当前源码示例直接用于该旧版二进制。
+
+### Host integration: per-call identity (current source)
 
 Only `--data-dir` is required to connect. Global memory needs no Session or
 Project identity. One connection can serve multiple projects and workstreams:
@@ -148,7 +170,9 @@ require a host-authorized `project_id`; `session_*` actions require a host
 `project_key` in tool arguments can only assert the current host Project and
 cannot grant access. Use a distinct Session id for each independent workstream.
 
-For hosts that dedicate one process to one workstream, `--session-id <ID>` and
+Host integrators may configure dedicated-process defaults when their client
+cannot supply this metadata. For a process dedicated to one workstream,
+`--session-id <ID>` and
 `--project-id <ID>` remain optional startup defaults. A per-call context replaces
 both defaults completely; `{}` explicitly clears them for that call. Context
 is never retained between calls, and malformed context is rejected instead of
