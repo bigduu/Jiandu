@@ -1,36 +1,105 @@
-# Jiandu
+# Jiandu 简牍
 
-![Jiandu brand illustration: bamboo slips beside a stream, representing records and shared memory.](docs/assets/jiandu-nature-hero.png)
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-*Brand illustration, not a software screenshot. Bamboo slips represent records and shared memory.*
+**One shared memory for all your coding agents.** Claude Code, Codex, Cursor
+and Claude Desktop can read and write the same local memory store, so a
+decision recorded in one tool can be recalled in the next. No vector database
+and no embedding API: recall is deterministic BM25 search with CJK support over
+local files.
 
-**Give your agents a shared memory that survives a chat.** Jiandu (简牍) stores
-project decisions, reusable knowledge, and temporary session notes in one local
-filesystem store. Recall uses deterministic lexical search, including BM25/CJK;
-no embedding service or model provider is required.
+[Releases](https://github.com/bigduu/Jiandu/releases/latest) · Part of [Bodhi](https://github.com/bigduu/Zenith) · [Bodhi desktop app](https://github.com/bigduu/Bodhi-AI/releases/latest) · [MIT](LICENSE)
 
-Use Project memory to carry confirmed decisions between agents, Session notes
-to resume a workstream, and Global memory for facts useful across projects.
-Bamboo can embed the memory crate; other runtimes connect through one MCP tool.
-Your host decides what to remember and how to place recalled facts in context.
+- **Three scopes:** Project (decisions shared by agents on one project),
+  Session (resume a workstream) and Global (facts useful across projects).
+- **One MCP tool, 19 actions:** query, get, write, merge, rebuild, Dream
+  orientation snapshots and more, behind a single `memory` tool.
+- **Your data stays in plain files:** one data directory you choose; Jiandu
+  never calls a model or a remote service.
+- **On `main`, for the next release:** `jiandu ui`, a read-only local console
+  for browsing what your agents remember, and per-call host identity. The
+  latest published release is **v0.2.0**; see [Choose a version](#choose-a-version).
 
-## Watch a memory lookup from source
-
-![Jiandu searches a demo project for a release checklist and opens the saved memory.](docs/demos/memory-console.gif)
+<p align="center"><img src="docs/demos/memory-console.gif" alt="Jiandu searches a demo project for a release checklist and opens the saved memory." width="720"></p>
 
 [Static image](docs/demos/memory-console.png) · [Reproduce the MCP write and browser lookup](docs/demos/reproduction.md)
 
-Real Linux Chromium capture of the **source-only read-only console**, which is
-not included in published `v0.2.0`. The clearly labelled demo memory was written
-through actual stdio MCP before recording. The browser searches and opens it;
-it does not write memory or run a model. No personal memory store was used.
+Real Linux Chromium capture of the read-only console from `main` (not in
+v0.2.0). The clearly labelled demo memory was written through actual stdio MCP
+before recording. The browser searches and opens it; it does not write memory or
+run a model. No personal memory store was used.
+
+## Install
+
+Published **v0.2.0** (both paths compile from source and need Rust 1.95 or
+newer; Homebrew installs Rust as a build dependency):
+
+```sh
+# Homebrew (compiles the v0.2.0 source tag)
+brew tap bigduu/tap
+brew install bigduu/tap/jiandu
+
+# or Cargo
+cargo install jiandu-mcp --version 0.2.0 --locked
+```
+
+The binary is called `jiandu`. Check it with `jiandu --help`. Installing does not
+start a service or configure any MCP client. Run `which jiandu` for the absolute
+path (Homebrew: usually `/opt/homebrew/bin/jiandu` on Apple Silicon,
+`/usr/local/bin/jiandu` on Intel Macs).
+
+## Connect your agents
+
+To share Project memory, start every client with the **same `--data-dir`** and
+the **same `--project-id`**. Give each client its own `--session-id`: v0.2.0
+requires it, and on `main` it is an optional default. IDs may contain letters,
+digits, `-` and `_`. Replace `/Users/you` with your home directory; JSON and
+TOML do not expand `~`.
+
+**Claude Code:**
+
+```sh
+claude mcp add --scope user jiandu -- /opt/homebrew/bin/jiandu \
+  --data-dir "$HOME/.jiandu" --project-id my-app --session-id claude-code
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.jiandu]
+command = "/opt/homebrew/bin/jiandu"
+args = ["--data-dir", "/Users/you/.jiandu", "--project-id", "my-app", "--session-id", "codex"]
+```
+
+**Cursor** (`~/.cursor/mcp.json`) / **Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "jiandu": {
+      "command": "/opt/homebrew/bin/jiandu",
+      "args": ["--data-dir", "/Users/you/.jiandu", "--project-id", "my-app", "--session-id", "cursor"]
+    }
+  }
+}
+```
+
+With generic MCP clients, one process serves one Project. Without `--project-id`, generic MCP clients can
+use only Global memory: Project actions fail on purpose rather than guessing.
+For several projects, add one server entry per project, or give each project its
+own `.cursor/mcp.json` / `claude mcp add --scope project` entry.
+
+Try: in one agent, *"Remember in project memory that we deploy on Fridays
+only."* Then, in another agent connected to the same project: *"When do we
+deploy?"* On a new data directory the first query reports a missing lexical
+index; the agent should run `rebuild` for that scope and query again.
 
 ## Choose a version
 
 | Path | Available workflow |
 | --- | --- |
 | [Published v0.2.0](https://github.com/bigduu/Jiandu/releases/tag/v0.2.0) | Shared memory over stdio MCP, fixed per-process Project/Session defaults, Dream snapshots, and one-time Bamboo import. |
-| Current source | Also includes the read-only browser console and per-call host identity metadata described below. These additions are not in v0.2.0. |
+| `main` (next release, build from source) | Also includes the read-only browser console and per-call host identity metadata described below. These additions are not in v0.2.0. |
 
 The source manifest now says `0.3.0` in preparation for the next release, which is
 not published yet. Install v0.2.0 for the published contract; build this checkout for the console and per-call context. Both require
@@ -54,23 +123,19 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
   The MCP host grants each call access with a stable, opaque `project_id`.
 - **Global** is durable knowledge that is genuinely useful across projects.
 
-## Install and connect
+## Build from source and generic configuration (`main`)
 
-For the current source workflow, build this checkout:
+For the console and per-call context on `main`, build this checkout:
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
 ```
 
-Use the absolute path to the resulting `target/release/jiandu` binary below.
-You do not need to fill in Project or Session IDs in this connection configuration.
-
-The older published release can still be installed with
-`cargo install jiandu-mcp --version 0.2.0 --locked`, but its CLI requires a
-`--session-id` startup value and does not support per-call identity metadata.
-The configuration below targets **current source**, not that older binary.
-
-Configure an MCP host to launch it:
+Use the absolute path to the resulting `target/release/jiandu` binary.
+A `main` build needs only `--data-dir`; `--project-id` and `--session-id` are
+optional defaults for clients that cannot send Jiandu context metadata (see
+[Host integration](#host-integration-per-call-identity-main)). This
+minimal configuration is enough for Global memory:
 
 ```json
 {
@@ -84,6 +149,10 @@ Configure an MCP host to launch it:
   }
 }
 ```
+
+The v0.2.0 binary rejects this minimal form because it requires
+`--session-id`; use the [Connect your agents](#connect-your-agents) snippets for
+v0.2.0.
 
 The host may namespace the tool as `mcp__jiandu__memory`. For a first trial,
 use a new dedicated data directory and Global memory, which needs no identity
@@ -127,22 +196,7 @@ project-specific facts into Global to bypass this boundary. A generic MCP host
 must explicitly implement the Jiandu metadata extension before these contextual
 calls work without dedicated-process defaults.
 
-### 中文用法（当前源码）
-
-构建当前源码后，MCP 连接配置只需指定生成的可执行文件和 `--data-dir`，
-普通用户无需填写 `project_id`、`session_id` 或 `project_key`。
-工具调用只填写 `action`、`scope`、`query` 等业务参数；上面的 Global 示例
-无需身份上下文即可试用。
-
-Project 和 Session 隔离并未取消。支持 Jiandu 扩展的宿主在每次调用时通过
-`_meta` 注入可信上下文；通用 MCP 宿主不会自动注入这项自定义元数据。
-缺少 Project 上下文时，Project 操作报错；缺少 Session 上下文时，
-`session_*` 操作报错。应由宿主集成方补齐上下文，不能编造身份或改写到
-Global 绕过授权。下节的启动身份参数仅是专用进程的可选默认值。
-已发布的旧版 v0.2.0 尚不支持逐调用上下文，启动时仍要求 `--session-id`；
-不要把当前源码示例直接用于该旧版二进制。
-
-### Host integration: per-call identity (current source)
+### Host integration: per-call identity (`main`)
 
 Only `--data-dir` is required to connect. Global memory needs no Session or
 Project identity. One connection can serve multiple projects and workstreams:
@@ -186,7 +240,7 @@ authority, and compatibility details. Agents sharing Project memory use the
 same data directory and Project identity. Query before writing, keep durable
 items concise, and never edit Jiandu's data files directly.
 
-## Local console (current source)
+## Local console (`main`)
 
 ```shell
 jiandu ui
