@@ -13,29 +13,31 @@
 - **一个 MCP 工具、19 种操作**：查询、读取、写入、合并、重建索引、Dream 概览快照等，都通过
   同一个 `memory` 工具完成。
 - **数据就是普通文件**：存放在你指定的一个数据目录里；简牍从不调用模型或远程服务。
-- **`main` 分支上、下一个版本才有的能力**：`jiandu ui`，一个只读的本地控制台，用来查看 agent
-  记住了什么；以及逐次调用的宿主身份。目前最新的已发布版本是 **v0.2.0**，见[选择版本](#选择版本)。
+- **本地控制台 + 逐次调用身份（v0.3.0）：** `jiandu ui` 可浏览 agent 记住了什么；宿主可在每次
+  MCP 调用中传入项目/会话身份。最新发布版：**v0.3.0** —
+  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0)。
 
 <p align="center"><img src="docs/demos/memory-console.gif" alt="简牍在演示项目中搜索发布清单并打开保存的记忆。" width="720"></p>
 
 [静态图片](docs/demos/memory-console.png) · [复现 MCP 写入和浏览器查询](docs/demos/reproduction.md)
 
-这是在 Linux Chromium 中真实录制的 `main` 分支只读控制台（v0.2.0 中没有）。录制前通过真实的
+这是在 Linux Chromium 中真实录制的只读控制台（**v0.3.0** 已包含）。录制前通过真实的
 stdio MCP 写入了一条明确标注的演示记忆。浏览器只是搜索并打开它，不写入记忆，也不运行模型。
 没有使用任何个人记忆数据。
 
 ## 安装
 
-已发布的 **v0.2.0**（两种方式都从源码编译，需要 Rust 1.95 或更新版本；Homebrew 会自动安装
+已发布的 **v0.3.0**（Homebrew 与源码构建需要 Rust 1.95 或更新版本；Homebrew 会自动安装
 Rust 作为构建依赖）：
 
 ```sh
-# Homebrew（编译 v0.2.0 源码 tag）
+# Homebrew（编译 v0.3.0 源码 tag）— 获取 v0.3.0 的推荐方式
 brew tap bigduu/tap
 brew install bigduu/tap/jiandu
 
-# 或者用 Cargo
-cargo install jiandu-mcp --version 0.2.0 --locked
+# crates.io 目前仍是 0.2.0（需维护者手动 cargo publish 0.3.0）。
+# 要用 v0.3.0 请用上面的 Homebrew，或从 v0.3.0 tag / 当前源码构建。
+# cargo install jiandu-mcp --version 0.2.0 --locked   # 仅 crates.io 的 0.2.0
 ```
 
 可执行文件名是 `jiandu`，可以用 `jiandu --help` 检查。安装不会启动任何服务，也不会配置任何 MCP
@@ -45,7 +47,7 @@ cargo install jiandu-mcp --version 0.2.0 --locked
 ## 接入你的 agent
 
 要共享项目记忆，每个客户端都要用**同一个 `--data-dir`** 和**同一个 `--project-id`** 启动。
-每个客户端各用一个自己的 `--session-id`：v0.2.0 必须提供，`main` 上它是可选的默认值。ID 只能
+每个客户端各用一个自己的 `--session-id`（从 v0.3.0 起为可选默认值；仍建议填写，以便会话记忆分开）。ID 只能
 包含字母、数字、`-` 和 `_`。把 `/Users/you` 换成你的用户目录；JSON 和 TOML 不会展开 `~`。
 
 **Claude Code：**
@@ -88,12 +90,11 @@ agent 里问*“我们什么时候发版？”*。全新的数据目录第一次
 
 | 途径 | 可用的功能 |
 | --- | --- |
-| [已发布的 v0.2.0](https://github.com/bigduu/Jiandu/releases/tag/v0.2.0) | 基于 stdio MCP 的共享记忆、每个进程固定的项目/会话默认值、Dream 快照，以及一次性的 Bamboo 导入。 |
-| `main`（下一个版本，需从源码构建） | 另外包含只读的浏览器控制台，以及下文介绍的逐次调用宿主身份元数据。这些新增功能不在 v0.2.0 中。 |
+| [已发布的 v0.3.0](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0)（Homebrew / 源码 tag） | 基于 stdio MCP 的共享记忆、Dream 快照、Bamboo 导入、只读浏览器控制台（`jiandu ui`），以及逐次调用宿主身份（`--session-id` / `--project-id` 为可选默认值）。 |
+| `main`（开发前沿） | v0.3.0 之后尚未发版的改动 — 需要从源码构建。 |
+| crates.io `0.2.0` | crates.io 上目前仍是此版本，没有控制台和逐次调用身份；等 0.3.0 publish 后才会更新。 |
 
-源码版本号已经改成 `0.3.0`，为下一个版本做准备，但还没有发布。想用已发布的接口约定就安装
-v0.2.0；想用控制台和逐次调用上下文就构建当前源码。两者都需要 Rust 1.95 或更新版本来构建。
-[审计记录](docs/readme-audit.md)。
+构建需要 Rust 1.95 或更新版本。[审计记录](docs/readme-audit.md)。
 
 简牍只认一个权威数据根目录，通常是 `~/.jiandu`。切换之后，Bamboo 原生记忆和所有 MCP 客户端都
 必须使用这个由简牍管理的同一个根目录；`~/.bamboo` 不能继续作为第二个权威的持久记忆存储。
@@ -111,17 +112,17 @@ v0.2.0；想用控制台和逐次调用上下文就构建当前源码。两者�
   `project_id` 授权每次调用。
 - **全局（Global）**：真正跨项目都有用的持久知识。
 
-## 从源码构建与通用配置（`main`）
+## 从源码构建与通用配置
 
-要使用 `main` 上的控制台和逐次调用上下文，请构建当前源码：
+构建当前源码（或 `v0.3.0` tag）：
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
 ```
 
-使用生成的 `target/release/jiandu` 的绝对路径。`main` 构建只需要 `--data-dir`；`--project-id`
+使用生成的 `target/release/jiandu` 的绝对路径。从 v0.3.0 起只需要 `--data-dir`；`--project-id`
 和 `--session-id` 是给无法发送简牍上下文元数据的客户端准备的可选默认值（见
-[宿主集成](#宿主集成逐次调用身份main)）。下面这个最小配置足以使用全局记忆：
+[宿主集成](#宿主集成逐次调用身份)）。下面这个最小配置足以使用全局记忆：
 
 ```json
 {
@@ -136,7 +137,7 @@ cargo build --release --locked -p jiandu-mcp --bin jiandu
 }
 ```
 
-v0.2.0 二进制不接受这种最小写法，因为它要求 `--session-id`；v0.2.0 请使用
+较旧的 **v0.2.0** 二进制（包括当前 crates.io）仍要求 `--session-id`；那些版本请使用
 [接入你的 agent](#接入你的-agent) 里的配置。
 
 宿主可能会把工具命名为 `mcp__jiandu__memory`。第一次试用时，请用一个新的专用数据目录和全局记忆，
@@ -176,7 +177,7 @@ v0.2.0 二进制不接受这种最小写法，因为它要求 `--session-id`；v
 移到全局记忆里。通用 MCP 宿主必须显式实现简牍的元数据扩展，这些依赖上下文的调用才能在没有专用
 进程默认值的情况下工作。
 
-### 宿主集成：逐次调用身份（`main`）
+### 宿主集成：逐次调用身份
 
 连接时只需要 `--data-dir`。全局记忆不需要会话或项目身份。一个连接可以服务多个项目和工作流：
 宿主在每个 `tools/call` 请求中单独提供身份，放在模型生成的工具参数之外：
@@ -209,7 +210,7 @@ Rust 宿主可以构造 `MemoryExecutionContext::default()`，并使用
 [逐次调用身份设计](docs/design/mcp-call-context.md)。共享项目记忆的 agent 使用同一个数据目录和
 同一个项目身份。先查询再写入，持久条目保持简洁，永远不要直接编辑简牍的数据文件。
 
-## 本地控制台（`main`）
+## 本地控制台
 
 ```shell
 jiandu ui
