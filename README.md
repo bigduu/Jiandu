@@ -16,31 +16,33 @@ local files.
   orientation snapshots and more, behind a single `memory` tool.
 - **Your data stays in plain files:** one data directory you choose; Jiandu
   never calls a model or a remote service.
-- **On `main`, for the next release:** `jiandu ui`, a read-only local console
-  for browsing what your agents remember, and per-call host identity. The
-  latest published release is **v0.2.0**; see [Choose a version](#choose-a-version).
+- **Local console + per-call identity (v0.3.0):** `jiandu ui` browses what your
+  agents remember; hosts can pass Project/Session identity per MCP call.
+  Latest release: **v0.3.0** —
+  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0).
 
 <p align="center"><img src="docs/demos/memory-console.gif" alt="Jiandu searches a demo project for a release checklist and opens the saved memory." width="720"></p>
 
 [Static image](docs/demos/memory-console.png) · [Reproduce the MCP write and browser lookup](docs/demos/reproduction.md)
 
-Real Linux Chromium capture of the read-only console from `main` (not in
-v0.2.0). The clearly labelled demo memory was written through actual stdio MCP
-before recording. The browser searches and opens it; it does not write memory or
-run a model. No personal memory store was used.
+Real Linux Chromium capture of the read-only console (ships in **v0.3.0**). The
+clearly labelled demo memory was written through actual stdio MCP before
+recording. The browser searches and opens it; it does not write memory or run a
+model. No personal memory store was used.
 
 ## Install
 
-Published **v0.2.0** (both paths compile from source and need Rust 1.95 or
-newer; Homebrew installs Rust as a build dependency):
+Published **v0.3.0** (Homebrew and source builds need Rust 1.95 or newer;
+Homebrew installs Rust as a build dependency):
 
 ```sh
-# Homebrew (compiles the v0.2.0 source tag)
+# Homebrew (compiles the v0.3.0 source tag) — recommended for v0.3.0
 brew tap bigduu/tap
 brew install bigduu/tap/jiandu
 
-# or Cargo
-cargo install jiandu-mcp --version 0.2.0 --locked
+# crates.io is still at 0.2.0 until `cargo publish` for 0.3.0; for v0.3.0 use
+# Homebrew above or build from the v0.3.0 tag / this checkout.
+# cargo install jiandu-mcp --version 0.2.0 --locked   # crates.io (0.2.0 only)
 ```
 
 The binary is called `jiandu`. Check it with `jiandu --help`. Installing does not
@@ -51,8 +53,8 @@ path (Homebrew: usually `/opt/homebrew/bin/jiandu` on Apple Silicon,
 ## Connect your agents
 
 To share Project memory, start every client with the **same `--data-dir`** and
-the **same `--project-id`**. Give each client its own `--session-id`: v0.2.0
-requires it, and on `main` it is an optional default. IDs may contain letters,
+the **same `--project-id`**. Give each client its own `--session-id` (optional
+default from v0.3.0; still recommended so Session memory stays separate). IDs may contain letters,
 digits, `-` and `_`. Replace `/Users/you` with your home directory; JSON and
 TOML do not expand `~`.
 
@@ -98,12 +100,11 @@ index; the agent should run `rebuild` for that scope and query again.
 
 | Path | Available workflow |
 | --- | --- |
-| [Published v0.2.0](https://github.com/bigduu/Jiandu/releases/tag/v0.2.0) | Shared memory over stdio MCP, fixed per-process Project/Session defaults, Dream snapshots, and one-time Bamboo import. |
-| `main` (next release, build from source) | Also includes the read-only browser console and per-call host identity metadata described below. These additions are not in v0.2.0. |
+| [Published v0.3.0](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0) (Homebrew / source tag) | Shared memory over stdio MCP, Dream snapshots, Bamboo import, read-only browser console (`jiandu ui`), and per-call host identity (`--session-id` / `--project-id` optional defaults). |
+| `main` (tip of development) | Whatever lands after v0.3.0 — build from source for unreleased work. |
+| crates.io `0.2.0` | Still the latest on crates.io until 0.3.0 is published there; lacks the console and per-call identity. |
 
-The source manifest now says `0.3.0` in preparation for the next release, which is
-not published yet. Install v0.2.0 for the published contract; build this checkout for the console and per-call context. Both require
-Rust 1.95 or newer to build. [Audit evidence](docs/readme-audit.md).
+Rust 1.95 or newer is required to build. [Audit evidence](docs/readme-audit.md).
 
 Jiandu owns one authoritative data root, normally `~/.jiandu`. Bamboo native
 memory and every MCP client must use that same Jiandu-owned root after cutover;
@@ -123,18 +124,18 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
   The MCP host grants each call access with a stable, opaque `project_id`.
 - **Global** is durable knowledge that is genuinely useful across projects.
 
-## Build from source and generic configuration (`main`)
+## Build from source and generic configuration
 
-For the console and per-call context on `main`, build this checkout:
+For a source build of the current checkout (or the `v0.3.0` tag):
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
 ```
 
 Use the absolute path to the resulting `target/release/jiandu` binary.
-A `main` build needs only `--data-dir`; `--project-id` and `--session-id` are
+From v0.3.0, only `--data-dir` is required; `--project-id` and `--session-id` are
 optional defaults for clients that cannot send Jiandu context metadata (see
-[Host integration](#host-integration-per-call-identity-main)). This
+[Host integration](#host-integration-per-call-identity)). This
 minimal configuration is enough for Global memory:
 
 ```json
@@ -150,9 +151,9 @@ minimal configuration is enough for Global memory:
 }
 ```
 
-The v0.2.0 binary rejects this minimal form because it requires
+Older **v0.2.0** binaries (including current crates.io) still require
 `--session-id`; use the [Connect your agents](#connect-your-agents) snippets for
-v0.2.0.
+those builds.
 
 The host may namespace the tool as `mcp__jiandu__memory`. For a first trial,
 use a new dedicated data directory and Global memory, which needs no identity
@@ -196,7 +197,7 @@ project-specific facts into Global to bypass this boundary. A generic MCP host
 must explicitly implement the Jiandu metadata extension before these contextual
 calls work without dedicated-process defaults.
 
-### Host integration: per-call identity (`main`)
+### Host integration: per-call identity
 
 Only `--data-dir` is required to connect. Global memory needs no Session or
 Project identity. One connection can serve multiple projects and workstreams:
@@ -240,7 +241,7 @@ authority, and compatibility details. Agents sharing Project memory use the
 same data directory and Project identity. Query before writing, keep durable
 items concise, and never edit Jiandu's data files directly.
 
-## Local console (`main`)
+## Local console
 
 ```shell
 jiandu ui
