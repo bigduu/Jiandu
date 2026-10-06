@@ -51,6 +51,11 @@ use super::{
 /// "blob". Purely deterministic — no model or embedding involved.
 const MAX_DURABLE_MEMORY_BODY_CHARS: usize = 4000;
 
+/// Bound persisted input coverage as well as each host extraction. Count stored
+/// IDs, including overlaps between ranges, because each occurrence costs space.
+/// The same budget also bounds session-only sources with unknown coverage.
+const MAX_DURABLE_MEMORY_SOURCE_ITEMS: usize = 256;
+
 /// Separator inserted between accreted sections of a durable memory body. The
 /// merge/append paths write it and the blob prefilter counts it, so both always
 /// agree on what an "accretion" is.
@@ -252,6 +257,29 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
     body.trim_end().chars().count()
         + MEMORY_SECTION_SEPARATOR.chars().count()
         + content.chars().count()
+}
+
+/// Exact retries add no coverage. If new coverage would exceed either budget,
+/// keep it in a linked new memory rather than silently dropping provenance.
+fn merged_source_coverage_fits(
+    existing: &[DurableMemorySource],
+    incoming: &[DurableMemorySource],
+) -> bool {
+    let mut source_count = 0usize;
+    let mut message_count = 0usize;
+    for source in existing
+        .iter()
+        .chain(incoming.iter().filter(|source| !existing.contains(source)))
+    {
+        source_count += 1;
+        message_count = message_count.saturating_add(source.message_range.len());
+        if source_count > MAX_DURABLE_MEMORY_SOURCE_ITEMS
+            || message_count > MAX_DURABLE_MEMORY_SOURCE_ITEMS
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Deterministic candidate id for one allocation attempt. Scope and opaque
@@ -1199,7 +1227,9 @@ impl MemoryStore {
         message_range: &[String],
     ) -> io::Result<DurableMemoryDocument> {
         let session_id = session_id.map(super::validate_session_id).transpose()?;
-        if message_range.len() > 256 || (!message_range.is_empty() && session_id.is_none()) {
+        if message_range.len() > MAX_DURABLE_MEMORY_SOURCE_ITEMS
+            || (!message_range.is_empty() && session_id.is_none())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "source range requires a host session and at most 256 message IDs",
@@ -1252,14 +1282,14 @@ impl MemoryStore {
             {
                 WriteSimilarity::Merge(existing) => {
                     let mut existing = *existing;
-                    // Structural guard: never grow a memory into a blob. If appending
-                    // would exceed the body cap, don't merge — fall through to a new
-                    // atomic memory and instead LINK it to the dup, rather than
-                    // silently orphaning it.
+                    // Bound body and accumulated coverage, including duplicate-body
+                    // writes. Overflow keeps the new content and its full coverage
+                    // in a linked atomic memory instead of truncating provenance.
                     let already_present = existing.body.contains(content);
-                    if already_present
+                    if (already_present
                         || projected_merged_body_chars(&existing.body, content)
-                            <= MAX_DURABLE_MEMORY_BODY_CHARS
+                            <= MAX_DURABLE_MEMORY_BODY_CHARS)
+                        && merged_source_coverage_fits(&existing.frontmatter.sources, &sources)
                     {
                         if !already_present {
                             // Newly appended content has no confirmation evidence.
@@ -1326,7 +1356,7 @@ impl MemoryStore {
                         self.refresh_scope_artifacts(scope, project_key).await?;
                         return Ok(existing);
                     }
-                    // Too big to merge without blobbing → link instead.
+                    // Body or coverage budget exhausted → preserve both and link instead.
                     related_ids = vec![existing.frontmatter.id.clone()];
                 }
                 WriteSimilarity::Relate(ids) => related_ids = ids,
@@ -6547,6 +6577,108 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn merged_source_coverage_bounds_unknown_sessions_and_deduplicates_retries() {
+        let sources: Vec<_> = (0..MAX_DURABLE_MEMORY_SOURCE_ITEMS)
+            .map(|index| DurableMemorySource {
+                kind: "session".to_string(),
+                id: format!("session-{index}"),
+                message_range: vec![],
+            })
+            .collect();
+        assert!(merged_source_coverage_fits(&sources, &[]));
+        assert!(merged_source_coverage_fits(&sources, &sources[..1]));
+        let extra = DurableMemorySource {
+            kind: "session".to_string(),
+            id: "another-session".to_string(),
+            message_range: vec![],
+        };
+        assert!(!merged_source_coverage_fits(
+            &sources,
+            std::slice::from_ref(&extra)
+        ));
+        let mut legacy = sources;
+        legacy.push(extra);
+        assert!(!merged_source_coverage_fits(&legacy, &[]));
+    }
+
+    #[tokio::test]
+    async fn auto_merge_bounds_overlapping_coverage_without_losing_provenance() {
+        for append_content in [false, true] {
+            let dir = tempdir().unwrap();
+            let store = MemoryStore::new(dir.path());
+            let write = |start: usize, content: &'static str| {
+                let store = &store;
+                async move {
+                    let range: Vec<_> = (start..start + MAX_DURABLE_MEMORY_SOURCE_ITEMS / 2)
+                        .map(|index| format!("message-{index}"))
+                        .collect();
+                    store
+                        .write_memory_with_retrieval_and_source_range(
+                            MemoryScope::Global,
+                            None,
+                            DurableMemoryType::Reference,
+                            "Synthetic source coverage",
+                            content,
+                            &[],
+                            &MemoryRetrievalInput::default(),
+                            Some("session-test"),
+                            "host",
+                            true,
+                            None,
+                            &range,
+                        )
+                        .await
+                        .unwrap()
+                }
+            };
+            let first = write(0, "A synthetic reference.").await;
+            let second = write(1, "A synthetic reference.").await;
+            assert_eq!(first.frontmatter.id, second.frontmatter.id);
+            assert_eq!(second.frontmatter.sources.len(), 2);
+            assert_eq!(
+                second
+                    .frontmatter
+                    .sources
+                    .iter()
+                    .map(|source| source.message_range.len())
+                    .sum::<usize>(),
+                MAX_DURABLE_MEMORY_SOURCE_ITEMS
+            );
+            let retry = write(1, "A synthetic reference.").await;
+            assert_eq!(retry.frontmatter.id, first.frontmatter.id);
+            assert_eq!(retry.frontmatter.sources, second.frontmatter.sources);
+            let content = if append_content {
+                "A synthetic reference with an additional detail."
+            } else {
+                "A synthetic reference."
+            };
+            let overflow = write(2, content).await;
+            assert_ne!(overflow.frontmatter.id, first.frontmatter.id);
+            assert_eq!(
+                overflow.frontmatter.relations.related,
+                vec![first.frontmatter.id.clone()]
+            );
+            assert_eq!(overflow.body, content);
+            assert_eq!(overflow.frontmatter.confidence, None);
+            assert_eq!(overflow.frontmatter.sources.len(), 1);
+            assert_eq!(
+                overflow.frontmatter.sources[0].message_range,
+                (2..2 + MAX_DURABLE_MEMORY_SOURCE_ITEMS / 2)
+                    .map(|index| format!("message-{index}"))
+                    .collect::<Vec<_>>()
+            );
+            let original = store
+                .get_memory(&first.frontmatter.id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.body, first.body);
+            assert_eq!(original.frontmatter.confidence, None);
+            assert_eq!(original.frontmatter.sources, second.frontmatter.sources);
+        }
     }
 
     #[tokio::test]
