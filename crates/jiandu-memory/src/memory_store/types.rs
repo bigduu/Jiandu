@@ -209,6 +209,8 @@ pub struct DurableMemorySource {
     pub kind: String,
     pub id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Ordered unique message IDs in the host-provided input, not an inclusive
+    /// interval or proof that the resulting claim is true. Empty means unknown.
     pub message_range: Vec<String>,
 }
 
@@ -260,6 +262,8 @@ pub struct DurableMemoryFrontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// None means unknown/unconfirmed. Legacy high/medium/low values remain
+    /// readable as historical ratings, never proof of host/user confirmation.
     pub confidence: Option<String>,
     pub created_at: String,
     pub updated_at: String,

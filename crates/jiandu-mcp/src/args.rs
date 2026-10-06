@@ -437,6 +437,7 @@ pub struct QueryFilters {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WriteOptions {
     #[serde(default)]
     pub allow_merge_if_similar: Option<bool>,
@@ -507,4 +508,31 @@ enum MergeModeSchema {
     Merge,
     SemanticMerge,
     Contradict,
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::MemoryArgs;
+    use serde_json::json;
+
+    #[test]
+    fn model_arguments_cannot_forge_confirmation_or_sources() {
+        let base = json!({"action":"write", "scope":"global", "type":"reference",
+            "title":"Synthetic fact", "content":"Synthetic content"});
+        for (key, value) in [
+            ("confidence", json!("confirmed")),
+            ("confirmed", json!(true)),
+            ("sources", json!([{"kind":"session", "id":"foreign"}])),
+            ("session_id", json!("foreign")),
+            ("message_range", json!(["foreign"])),
+        ] {
+            let mut forged = base.clone();
+            forged[key] = value;
+            assert!(serde_json::from_value::<MemoryArgs>(forged).is_err());
+        }
+        let mut forged = base.clone();
+        forged["options"] = json!({"allow_merge_if_similar":true, "confirmed":true});
+        assert!(serde_json::from_value::<MemoryArgs>(forged).is_err());
+        assert!(serde_json::from_value::<MemoryArgs>(base).is_ok());
+    }
 }

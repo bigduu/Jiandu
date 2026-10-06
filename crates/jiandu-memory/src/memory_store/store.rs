@@ -51,6 +51,11 @@ use super::{
 /// "blob". Purely deterministic — no model or embedding involved.
 const MAX_DURABLE_MEMORY_BODY_CHARS: usize = 4000;
 
+/// Bound persisted input coverage as well as each host extraction. Count stored
+/// IDs, including overlaps between ranges, because each occurrence costs space.
+/// The same budget also bounds session-only sources with unknown coverage.
+const MAX_DURABLE_MEMORY_SOURCE_ITEMS: usize = 256;
+
 /// Separator inserted between accreted sections of a durable memory body. The
 /// merge/append paths write it and the blob prefilter counts it, so both always
 /// agree on what an "accretion" is.
@@ -252,6 +257,29 @@ fn projected_merged_body_chars(body: &str, content: &str) -> usize {
     body.trim_end().chars().count()
         + MEMORY_SECTION_SEPARATOR.chars().count()
         + content.chars().count()
+}
+
+/// Exact retries add no coverage. If new coverage would exceed either budget,
+/// keep it in a linked new memory rather than silently dropping provenance.
+fn merged_source_coverage_fits(
+    existing: &[DurableMemorySource],
+    incoming: &[DurableMemorySource],
+) -> bool {
+    let mut source_count = 0usize;
+    let mut message_count = 0usize;
+    for source in existing
+        .iter()
+        .chain(incoming.iter().filter(|source| !existing.contains(source)))
+    {
+        source_count += 1;
+        message_count = message_count.saturating_add(source.message_range.len());
+        if source_count > MAX_DURABLE_MEMORY_SOURCE_ITEMS
+            || message_count > MAX_DURABLE_MEMORY_SOURCE_ITEMS
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Deterministic candidate id for one allocation attempt. Scope and opaque
@@ -1161,6 +1189,71 @@ impl MemoryStore {
         allow_merge_if_similar: bool,
         granularity: Option<TemporalGranularity>,
     ) -> io::Result<DurableMemoryDocument> {
+        self.write_memory_with_retrieval_and_source_range(
+            scope,
+            project_key,
+            r#type,
+            title,
+            content,
+            tags,
+            retrieval,
+            session_id,
+            actor,
+            allow_merge_if_similar,
+            granularity,
+            &[],
+        )
+        .await
+    }
+
+    /// Write with host-verified input coverage. IDs must belong to the host
+    /// session and to the actual extraction input; the host checks membership.
+    /// This range records input coverage, not confirmation or exact citations.
+    /// No confidence/confirmation parameter is accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_memory_with_retrieval_and_source_range(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: DurableMemoryType,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+        allow_merge_if_similar: bool,
+        granularity: Option<TemporalGranularity>,
+        message_range: &[String],
+    ) -> io::Result<DurableMemoryDocument> {
+        let session_id = session_id.map(super::validate_session_id).transpose()?;
+        if message_range.len() > MAX_DURABLE_MEMORY_SOURCE_ITEMS
+            || (!message_range.is_empty() && session_id.is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source range requires a host session and at most 256 message IDs",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for message_id in message_range {
+            let valid = super::validate_memory_id(message_id)?;
+            if valid != message_id || !seen.insert(message_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source message IDs must be canonical and unique",
+                ));
+            }
+        }
+        let sources = session_id
+            .map(|id| {
+                vec![DurableMemorySource {
+                    kind: "session".to_string(),
+                    id: id.to_string(),
+                    message_range: message_range.to_vec(),
+                }]
+            })
+            .unwrap_or_default();
         let project_key = self.require_project_key(scope, project_key)?;
         let title = validate_memory_title(title)?;
         let content = content.trim();
@@ -1189,22 +1282,29 @@ impl MemoryStore {
             {
                 WriteSimilarity::Merge(existing) => {
                     let mut existing = *existing;
-                    // Structural guard: never grow a memory into a blob. If appending
-                    // would exceed the body cap, don't merge — fall through to a new
-                    // atomic memory and instead LINK it to the dup, rather than
-                    // silently orphaning it.
+                    // Bound body and accumulated coverage, including duplicate-body
+                    // writes. Overflow keeps the new content and its full coverage
+                    // in a linked atomic memory instead of truncating provenance.
                     let already_present = existing.body.contains(content);
-                    if already_present
+                    if (already_present
                         || projected_merged_body_chars(&existing.body, content)
-                            <= MAX_DURABLE_MEMORY_BODY_CHARS
+                            <= MAX_DURABLE_MEMORY_BODY_CHARS)
+                        && merged_source_coverage_fits(&existing.frontmatter.sources, &sources)
                     {
                         if !already_present {
+                            // Newly appended content has no confirmation evidence.
+                            existing.frontmatter.confidence = None;
                             existing.body = format!(
                                 "{}{}{}",
                                 existing.body.trim_end(),
                                 MEMORY_SECTION_SEPARATOR,
                                 content
                             );
+                        }
+                        for source in &sources {
+                            if !existing.frontmatter.sources.contains(source) {
+                                existing.frontmatter.sources.push(source.clone());
+                            }
                         }
                         existing.frontmatter.updated_at = now_rfc3339();
                         existing.frontmatter.updated_by = CreatedBy {
@@ -1256,7 +1356,7 @@ impl MemoryStore {
                         self.refresh_scope_artifacts(scope, project_key).await?;
                         return Ok(existing);
                     }
-                    // Too big to merge without blobbing → link instead.
+                    // Body or coverage budget exhausted → preserve both and link instead.
                     related_ids = vec![existing.frontmatter.id.clone()];
                 }
                 WriteSimilarity::Relate(ids) => related_ids = ids,
@@ -1279,7 +1379,7 @@ impl MemoryStore {
             granularity,
             status: DurableMemoryStatus::Active,
             freshness: Some("high".to_string()),
-            confidence: Some("high".to_string()),
+            confidence: None,
             created_at: now.clone(),
             updated_at: now.clone(),
             created_by: CreatedBy {
@@ -1292,15 +1392,7 @@ impl MemoryStore {
                 id: None,
                 actor: Some(actor.to_string()),
             },
-            sources: session_id
-                .map(|value| {
-                    vec![DurableMemorySource {
-                        kind: "session".to_string(),
-                        id: value.to_string(),
-                        message_range: Vec::new(),
-                    }]
-                })
-                .unwrap_or_default(),
+            sources,
             relations: DurableMemoryRelations {
                 related: related_ids.clone(),
                 ..DurableMemoryRelations::default()
@@ -1486,7 +1578,6 @@ impl MemoryStore {
         source = fresh;
         let source_id = source.frontmatter.id.clone();
         let source_type = source.frontmatter.r#type;
-        let source_confidence = source.frontmatter.confidence.clone();
         let source_granularity = source.frontmatter.granularity;
         let source_sources = source.frontmatter.sources.clone();
 
@@ -1513,7 +1604,7 @@ impl MemoryStore {
                 granularity: source_granularity,
                 status: DurableMemoryStatus::Active,
                 freshness: Some("high".to_string()),
-                confidence: source_confidence.clone(),
+                confidence: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
                 created_by: CreatedBy {
@@ -2001,7 +2092,7 @@ impl MemoryStore {
             granularity,
             status: DurableMemoryStatus::Active,
             freshness: Some("high".to_string()),
-            confidence: sources[0].frontmatter.confidence.clone(),
+            confidence: None,
             created_at: now.clone(),
             updated_at: now.clone(),
             created_by: CreatedBy {
@@ -2359,6 +2450,7 @@ impl MemoryStore {
                     "merge would exceed the durable memory size cap; consolidate the memory into one coherent statement or create a separate memory instead of appending",
                 ));
             }
+            doc.frontmatter.confidence = None;
             doc.body = format!(
                 "{}{}{}",
                 doc.body.trim_end(),
@@ -2753,7 +2845,7 @@ impl MemoryStore {
             let mut entries = fs::read_dir(topic_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if !path.extension().is_some_and(|ext| ext == "md") {
+                if path.extension().is_none_or(|ext| ext != "md") {
                     continue;
                 }
                 let raw = fs::read_to_string(&path).await?;
@@ -6402,6 +6494,288 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(doc.frontmatter.granularity, None);
+    }
+
+    #[tokio::test]
+    async fn writes_are_unconfirmed_and_source_ranges_are_host_input_coverage() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let plain = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Default confidence",
+                "A synthetic reference.",
+                &[],
+                Some("session-test"),
+                "main-model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plain.frontmatter.confidence, None);
+        assert!(plain.frontmatter.sources[0].message_range.is_empty());
+        let ids = vec!["message-1".to_string(), "message-2".to_string()];
+        let sourced = store
+            .write_memory_with_retrieval_and_source_range(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Extracted reference",
+                "A synthetic extracted reference.",
+                &[],
+                &MemoryRetrievalInput::default(),
+                Some("session-test"),
+                "background-fast-model",
+                false,
+                None,
+                &ids,
+            )
+            .await
+            .unwrap();
+        let read = store
+            .get_memory(&sourced.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.frontmatter.confidence, None);
+        assert_eq!(read.frontmatter.sources[0].id, "session-test");
+        assert_eq!(read.frontmatter.sources[0].message_range, ids);
+        for (session, range) in [
+            (None, vec!["message-1".to_string()]),
+            (Some("session-test"), vec!["../foreign".to_string()]),
+            (Some("session-test"), vec!["message-1".to_string(); 2]),
+            (Some("session-test"), vec![" message-1".to_string()]),
+            (Some("session-test"), vec!["m".to_string(); 257]),
+        ] {
+            let error = store
+                .write_memory_with_retrieval_and_source_range(
+                    MemoryScope::Global,
+                    None,
+                    DurableMemoryType::Reference,
+                    "Invalid source",
+                    "Synthetic invalid source.",
+                    &[],
+                    &MemoryRetrievalInput::default(),
+                    session,
+                    "host",
+                    false,
+                    None,
+                    &range,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            store
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn merged_source_coverage_bounds_unknown_sessions_and_deduplicates_retries() {
+        let sources: Vec<_> = (0..MAX_DURABLE_MEMORY_SOURCE_ITEMS)
+            .map(|index| DurableMemorySource {
+                kind: "session".to_string(),
+                id: format!("session-{index}"),
+                message_range: vec![],
+            })
+            .collect();
+        assert!(merged_source_coverage_fits(&sources, &[]));
+        assert!(merged_source_coverage_fits(&sources, &sources[..1]));
+        let extra = DurableMemorySource {
+            kind: "session".to_string(),
+            id: "another-session".to_string(),
+            message_range: vec![],
+        };
+        assert!(!merged_source_coverage_fits(
+            &sources,
+            std::slice::from_ref(&extra)
+        ));
+        let mut legacy = sources;
+        legacy.push(extra);
+        assert!(!merged_source_coverage_fits(&legacy, &[]));
+    }
+
+    #[tokio::test]
+    async fn auto_merge_bounds_overlapping_coverage_without_losing_provenance() {
+        for append_content in [false, true] {
+            let dir = tempdir().unwrap();
+            let store = MemoryStore::new(dir.path());
+            let write = |start: usize, content: &'static str| {
+                let store = &store;
+                async move {
+                    let range: Vec<_> = (start..start + MAX_DURABLE_MEMORY_SOURCE_ITEMS / 2)
+                        .map(|index| format!("message-{index}"))
+                        .collect();
+                    store
+                        .write_memory_with_retrieval_and_source_range(
+                            MemoryScope::Global,
+                            None,
+                            DurableMemoryType::Reference,
+                            "Synthetic source coverage",
+                            content,
+                            &[],
+                            &MemoryRetrievalInput::default(),
+                            Some("session-test"),
+                            "host",
+                            true,
+                            None,
+                            &range,
+                        )
+                        .await
+                        .unwrap()
+                }
+            };
+            let first = write(0, "A synthetic reference.").await;
+            let second = write(1, "A synthetic reference.").await;
+            assert_eq!(first.frontmatter.id, second.frontmatter.id);
+            assert_eq!(second.frontmatter.sources.len(), 2);
+            assert_eq!(
+                second
+                    .frontmatter
+                    .sources
+                    .iter()
+                    .map(|source| source.message_range.len())
+                    .sum::<usize>(),
+                MAX_DURABLE_MEMORY_SOURCE_ITEMS
+            );
+            let retry = write(1, "A synthetic reference.").await;
+            assert_eq!(retry.frontmatter.id, first.frontmatter.id);
+            assert_eq!(retry.frontmatter.sources, second.frontmatter.sources);
+            let content = if append_content {
+                "A synthetic reference with an additional detail."
+            } else {
+                "A synthetic reference."
+            };
+            let overflow = write(2, content).await;
+            assert_ne!(overflow.frontmatter.id, first.frontmatter.id);
+            assert_eq!(
+                overflow.frontmatter.relations.related,
+                vec![first.frontmatter.id.clone()]
+            );
+            assert_eq!(overflow.body, content);
+            assert_eq!(overflow.frontmatter.confidence, None);
+            assert_eq!(overflow.frontmatter.sources.len(), 1);
+            assert_eq!(
+                overflow.frontmatter.sources[0].message_range,
+                (2..2 + MAX_DURABLE_MEMORY_SOURCE_ITEMS / 2)
+                    .map(|index| format!("message-{index}"))
+                    .collect::<Vec<_>>()
+            );
+            let original = store
+                .get_memory(&first.frontmatter.id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.body, first.body);
+            assert_eq!(original.frontmatter.confidence, None);
+            assert_eq!(original.frontmatter.sources, second.frontmatter.sources);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_ratings_remain_readable_but_are_not_inherited_by_rewrites() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let mut legacy = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Legacy reference",
+                "First synthetic fact.",
+                &[],
+                Some("legacy-session"),
+                "host",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        legacy.frontmatter.confidence = Some("high".to_string());
+        store.write_document(&legacy).await.unwrap();
+        let read = store
+            .get_memory(&legacy.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.frontmatter.confidence.as_deref(), Some("high"));
+        let mut json = serde_json::to_value(&read.frontmatter).unwrap();
+        json.as_object_mut().unwrap().remove("confidence");
+        json.as_object_mut().unwrap().remove("sources");
+        let old: DurableMemoryFrontmatter = serde_json::from_value(json).unwrap();
+        assert_eq!(old.confidence, None);
+        assert!(old.sources.is_empty());
+        let piece = MemorySplitPiece {
+            title: "Refined fact".to_string(),
+            r#type: None,
+            content: "Refined synthetic fact.".to_string(),
+            tags: vec![],
+        };
+        let split = store
+            .split_memory(
+                &legacy.frontmatter.id,
+                None,
+                std::slice::from_ref(&piece),
+                Some("rewrite-session"),
+                "model",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let refined = store
+            .get_memory(&split.new_ids[0], None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refined.frontmatter.confidence, None);
+        assert_eq!(refined.frontmatter.sources, legacy.frontmatter.sources);
+        let merged = store
+            .consolidate_memories(
+                &[legacy.frontmatter.id.clone(), refined.frontmatter.id],
+                None,
+                &piece,
+                Some("rewrite-session"),
+                "model",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let consolidated = store
+            .get_memory(&merged.new_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(consolidated.frontmatter.confidence, None);
+        // Explicit append cannot extend a legacy rating to newly generated text.
+        let appended = store
+            .merge_memory(
+                &legacy.frontmatter.id,
+                None,
+                "Additional synthetic fact.",
+                &[],
+                Some("rewrite-session"),
+                "model",
+                &[],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(appended.appended);
+        let updated = store
+            .get_memory(&legacy.frontmatter.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.frontmatter.confidence, None);
     }
 
     /// Backdate a memory's `updated_at` in place (test-only helper) by re-reading

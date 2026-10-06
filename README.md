@@ -365,3 +365,20 @@ cargo test --workspace --all-targets --all-features --locked
 ```
 
 Jiandu is licensed under the [MIT License](LICENSE).
+
+### Source coverage and confidence
+
+New durable writes omit `confidence` to mean unknown/unconfirmed. Model extraction,
+append, split, and consolidation do not establish confirmation; rewritten content
+cannot inherit a legacy rating. Existing `high`/`medium`/`low` values remain readable
+as historical ratings and retention hints, not evidence of user or host approval.
+No destructive migration or new schema version is needed.
+
+Native hosts may use `write_memory_with_retrieval_and_source_range` with a validated
+host Session ID and an ordered, unique list of message IDs actually supplied to the
+extraction. The store validates the bounded ID shape; the host must verify Session
+and input membership because Jiandu does not own the host transcript. The existing
+`sources[].message_range` records input coverage, not an inclusive interval, exact
+claim citations, or proof of truth. An empty range means the mapping is unknown.
+Model-facing MCP arguments cannot provide source identity, ranges, confidence, or
+confirmation. Host metadata retains the existing Session/Project authority rules.

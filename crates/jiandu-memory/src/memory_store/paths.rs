@@ -242,20 +242,20 @@ impl MemoryPathResolver {
 }
 
 fn infer_data_dir_from_root(root: &Path) -> PathBuf {
-    if !root
+    if root
         .file_name()
         .and_then(|value| value.to_str())
-        .is_some_and(|value| value == MEMORY_VERSION_DIR)
+        .is_none_or(|value| value != MEMORY_VERSION_DIR)
     {
         return root.to_path_buf();
     }
     let Some(memory_dir) = root.parent() else {
         return root.to_path_buf();
     };
-    if !memory_dir
+    if memory_dir
         .file_name()
         .and_then(|value| value.to_str())
-        .is_some_and(|value| value == MEMORY_ROOT_DIR)
+        .is_none_or(|value| value != MEMORY_ROOT_DIR)
     {
         return root.to_path_buf();
     }
