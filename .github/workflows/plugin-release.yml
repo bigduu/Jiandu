@@ -25,12 +25,10 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Require protected source for publication
-        env:
-          PUBLISH: ${{ inputs.publish }}
+      - name: Require merged main source for signing and publication
         run: |
-          if [[ "$PUBLISH" == true && "$GITHUB_REF" != refs/heads/main ]]; then
-            echo 'Publication requires merged main source.' >&2
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo 'Candidates and publication require merged main source.' >&2
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -130,6 +128,7 @@ jobs:
   bundle:
     needs: [validate, binaries]
     runs-on: ubuntu-22.04
+    environment: release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -146,6 +145,26 @@ jobs:
         run: |
           python3 scripts/package_plugin.py --version "$JIANDU_VERSION" assemble --artifacts target/plugin-artifacts --output target/plugin-release
           python3 scripts/package_plugin.py --version "$JIANDU_VERSION" verify --directory target/plugin-release
+      - name: Require the anchored publisher key and sign the exact candidate
+        env:
+          JIANDU_PLUGIN_SIGNING_KEY: ${{ secrets.JIANDU_PLUGIN_SIGNING_KEY }}
+          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, tempfile
+          from pathlib import Path
+          key = os.environ.get('JIANDU_PLUGIN_SIGNING_KEY', '')
+          if not key.strip():
+              raise SystemExit('Missing JIANDU_PLUGIN_SIGNING_KEY; candidate signing stopped.')
+          with tempfile.TemporaryDirectory(prefix='jiandu-publisher-') as temporary:
+              key_path = Path(temporary) / 'signing-key.pem'
+              descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(descriptor, 'w') as key_output:
+                  key_output.write(key)
+              subprocess.run(['python3', 'scripts/sign_plugin.py', '--directory', 'target/plugin-release',
+                              '--version', os.environ['JIANDU_VERSION'], '--key-file', str(key_path),
+                              '--public-key-file', 'plugin/signing-key.pub'], check=True)
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: jiandu-plugin-candidate-v${{ needs.validate.outputs.version }}
@@ -169,32 +188,13 @@ jobs:
         with:
           name: jiandu-plugin-candidate-v${{ needs.validate.outputs.version }}
           path: target/plugin-release
-      - name: Require the provisioned publisher key and sign the exact candidate
-        env:
-          JIANDU_PLUGIN_SIGNING_KEY: ${{ secrets.JIANDU_PLUGIN_SIGNING_KEY }}
-          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          python3 - <<'PY'
-          import os, subprocess, tempfile
-          from pathlib import Path
-          key = os.environ.get('JIANDU_PLUGIN_SIGNING_KEY', '')
-          if not key.strip():
-              raise SystemExit('Missing JIANDU_PLUGIN_SIGNING_KEY; publication stopped before tag creation.')
-          with tempfile.TemporaryDirectory(prefix='jiandu-publisher-') as temporary:
-              key_path = Path(temporary) / 'signing-key.pem'
-              descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-              with os.fdopen(descriptor, 'w') as key_output:
-                  key_output.write(key)
-              subprocess.run(['python3', 'scripts/sign_plugin.py', '--directory', 'target/plugin-release',
-                              '--version', os.environ['JIANDU_VERSION'], '--key-file', str(key_path)], check=True)
-          PY
       - name: Verify before creating an unused exact source tag and release
         env:
           GH_TOKEN: ${{ github.token }}
           JIANDU_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           python3 scripts/package_plugin.py --version "$JIANDU_VERSION" verify --directory target/plugin-release
-          python3 scripts/sign_plugin.py --version "$JIANDU_VERSION" --directory target/plugin-release
+          python3 scripts/sign_plugin.py --version "$JIANDU_VERSION" --directory target/plugin-release --public-key-file plugin/signing-key.pub
           python3 - <<'PY'
           import os, urllib.error, urllib.request
           url = os.environ['GITHUB_API_URL'] + '/repos/' + os.environ['GITHUB_REPOSITORY'] + '/releases/tags/v' + os.environ['JIANDU_VERSION']

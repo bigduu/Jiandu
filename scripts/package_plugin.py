@@ -145,6 +145,9 @@ def assemble(artifacts, output, version):
     guide = (ROOT / "docs/optional-plugin.md").read_text(encoding="utf-8").replace(
         "](design/mcp-call-context.md)",
         "](https://github.com/bigduu/Jiandu/blob/v{}/docs/design/mcp-call-context.md)".format(version),
+    ).replace(
+        "](../plugin/signing-key.pub)",
+        "](https://github.com/bigduu/Jiandu/blob/v{}/plugin/signing-key.pub)".format(version),
     ).encode("utf-8")
     bundle.write_bytes(tar_bytes([
         ("plugin.json", manifest_data, 0o644),
