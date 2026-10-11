@@ -1,0 +1,221 @@
+name: Jiandu optional plugin producer
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a new unused version after candidate review (main only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jiandu-plugin-producer-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require protected source for publication
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [[ "$PUBLISH" == true && "$GITHUB_REF" != refs/heads/main ]]; then
+            echo 'Publication requires merged main source.' >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read the unchanged workspace version
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from package_plugin import validate_version, workspace_version
+          version = workspace_version()
+          validate_version(version)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version + '\n')
+          PY
+      - name: Check formatting and locked workspace metadata
+        run: |
+          cargo fmt --all -- --check
+          cargo metadata --locked --all-features --format-version 1 > /dev/null
+      - name: Run strict Clippy and workspace tests
+        run: |
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-targets --all-features --locked
+      - name: Verify producer contracts
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+
+  binaries:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-14
+            target: universal-apple-darwin
+            binary: target/universal/jiandu
+          - platform: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/jiandu.exe
+          - platform: linux
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/jiandu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build macOS universal CLI
+        if: matrix.platform == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked -p jiandu-mcp --bin jiandu --target aarch64-apple-darwin
+          cargo build --release --locked -p jiandu-mcp --bin jiandu --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create target/aarch64-apple-darwin/release/jiandu target/x86_64-apple-darwin/release/jiandu -output target/universal/jiandu
+          lipo target/universal/jiandu -verify_arch arm64
+          lipo target/universal/jiandu -verify_arch x86_64
+          codesign --force --sign - target/universal/jiandu
+          codesign --verify --strict target/universal/jiandu
+      - name: Build Windows or Linux CLI
+        if: matrix.platform != 'macos'
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked -p jiandu-mcp --bin jiandu --target "$BUILD_TARGET"
+        shell: bash
+      - name: Smoke the actual CLI in a temporary store
+        env:
+          JIANDU_BINARY: ${{ matrix.binary }}
+          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: python scripts/smoke_plugin.py --binary "$JIANDU_BINARY" --version "$JIANDU_VERSION"
+      - name: Package the single root executable
+        env:
+          JIANDU_BINARY: ${{ matrix.binary }}
+          JIANDU_PLATFORM: ${{ matrix.platform }}
+          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: python scripts/package_plugin.py --version "$JIANDU_VERSION" pack --platform "$JIANDU_PLATFORM" --binary "$JIANDU_BINARY" --output target/plugin-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jiandu-binary-${{ matrix.platform }}
+          path: target/plugin-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+  bundle:
+    needs: [validate, binaries]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jiandu-binary-*
+          merge-multiple: true
+          path: target/plugin-artifacts
+      - name: Assemble and verify the exact candidate
+        env:
+          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python3 scripts/package_plugin.py --version "$JIANDU_VERSION" assemble --artifacts target/plugin-artifacts --output target/plugin-release
+          python3 scripts/package_plugin.py --version "$JIANDU_VERSION" verify --directory target/plugin-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jiandu-plugin-candidate-v${{ needs.validate.outputs.version }}
+          path: target/plugin-release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: inputs.publish && github.ref == 'refs/heads/main'
+    needs: [validate, bundle]
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: jiandu-plugin-candidate-v${{ needs.validate.outputs.version }}
+          path: target/plugin-release
+      - name: Require the provisioned publisher key and sign the exact candidate
+        env:
+          JIANDU_PLUGIN_SIGNING_KEY: ${{ secrets.JIANDU_PLUGIN_SIGNING_KEY }}
+          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, tempfile
+          from pathlib import Path
+          key = os.environ.get('JIANDU_PLUGIN_SIGNING_KEY', '')
+          if not key.strip():
+              raise SystemExit('Missing JIANDU_PLUGIN_SIGNING_KEY; publication stopped before tag creation.')
+          with tempfile.TemporaryDirectory(prefix='jiandu-publisher-') as temporary:
+              key_path = Path(temporary) / 'signing-key.pem'
+              descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(descriptor, 'w') as key_output:
+                  key_output.write(key)
+              subprocess.run(['python3', 'scripts/sign_plugin.py', '--directory', 'target/plugin-release',
+                              '--version', os.environ['JIANDU_VERSION'], '--key-file', str(key_path)], check=True)
+          PY
+      - name: Verify before creating an unused exact source tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JIANDU_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python3 scripts/package_plugin.py --version "$JIANDU_VERSION" verify --directory target/plugin-release
+          python3 scripts/sign_plugin.py --version "$JIANDU_VERSION" --directory target/plugin-release
+          python3 - <<'PY'
+          import os, urllib.error, urllib.request
+          url = os.environ['GITHUB_API_URL'] + '/repos/' + os.environ['GITHUB_REPOSITORY'] + '/releases/tags/v' + os.environ['JIANDU_VERSION']
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                                                        'Accept': 'application/vnd.github+json'})
+          try:
+              with urllib.request.urlopen(request, timeout=30):
+                  raise SystemExit('Version release already exists; choose an unused reviewed version.')
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          PY
+          if git ls-remote --exit-code --tags origin "refs/tags/v$JIANDU_VERSION" > target/existing-version-tag; then
+            echo 'Version tag already exists; choose an unused reviewed version.' >&2
+            exit 1
+          else
+            lookup_status=$?
+            if [[ "$lookup_status" != 2 ]]; then
+              exit "$lookup_status"
+            fi
+          fi
+          git -c user.name='Jiandu release' -c user.email='release@users.noreply.github.com' tag --annotate "v$JIANDU_VERSION" "$GITHUB_SHA" --message "Jiandu v$JIANDU_VERSION; source $GITHUB_SHA; run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT"
+          git push origin "refs/tags/v$JIANDU_VERSION"
+          gh release create "v$JIANDU_VERSION" --verify-tag --title "Jiandu v$JIANDU_VERSION" --generate-notes target/plugin-release/*
