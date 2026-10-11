@@ -14,7 +14,8 @@ import sign_plugin as signer
 
 
 class PluginPackageTests(unittest.TestCase):
-    version = "0.3.1"
+    version = "0.3.2"
+    test_public_key = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -24,6 +25,24 @@ class PluginPackageTests(unittest.TestCase):
         self.binary.write_bytes(b"fixture executable bytes\n")
         self.artifacts = self.root / "artifacts"
         self.output = self.root / "release"
+        self.public_key_file = self.root / "test-only-signing-key.pub"
+        self.public_key_file.write_text(self.test_public_key + "\n", encoding="ascii")
+
+    def fixture_key_file(self):
+        try:
+            version = signer.openssl("version")
+        except FileNotFoundError:
+            self.skipTest("OpenSSL 3 required for publisher signing test")
+        if not version.startswith(b"OpenSSL 3."):
+            self.skipTest("OpenSSL 3 required for publisher signing test")
+        # Public RFC 8032 section 7.1 TEST 2 seed, ONLY for temporary test data.
+        # Never use this well-known seed as a publisher credential.
+        seed = bytes.fromhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+        pkcs8 = bytes.fromhex("302e020100300506032b657004220420") + seed
+        key_file = self.root / "public-rfc8032-test-only.pem"
+        key_file.write_bytes(b"-----BEGIN PRIVATE KEY-----\n" + base64.b64encode(pkcs8) + b"\n-----END PRIVATE KEY-----\n")
+        key_file.chmod(0o600)
+        return key_file
 
     def candidate(self):
         for platform in producer.TARGETS:
@@ -52,10 +71,14 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(manifest["provides"], {})
         self.assertEqual(manifest["platforms"], ["macos", "windows", "linux"])
         for platform, artifact in manifest["artifacts"].items():
-            self.assertEqual(artifact["url"], producer.RELEASE_BASE + "/v0.3.1/" + producer.artifact_name(self.version, platform))
+            self.assertEqual(artifact["url"], producer.RELEASE_BASE + "/v" + self.version + "/" + producer.artifact_name(self.version, platform))
             self.assertEqual(artifact["sha256"], producer.sha256((self.artifacts / producer.artifact_name(self.version, platform)).read_bytes()))
         identity = json.loads((self.output / "catalog-entry.json").read_text())
         self.assertEqual(identity["sha256"], producer.sha256((self.output / producer.bundle_name(self.version)).read_bytes()))
+        with tarfile.open(self.output / producer.bundle_name(self.version), "r:gz") as bundle:
+            guide = bundle.extractfile("README.md").read().decode("utf-8")
+        self.assertIn("https://github.com/bigduu/Jiandu/blob/v" + self.version + "/plugin/signing-key.pub", guide)
+        self.assertNotIn("](../plugin/signing-key.pub)", guide)
         first = {path.name: path.read_bytes() for path in self.output.iterdir()}
         producer.assemble(self.artifacts, self.output, self.version)
         self.assertEqual(first, {path.name: path.read_bytes() for path in self.output.iterdir()})
@@ -184,29 +207,51 @@ class PluginPackageTests(unittest.TestCase):
             signer.verify_signature(message, signature, public_key)
 
     def test_fixture_candidate_signs_and_verifies_both_sidecars_end_to_end(self):
-        try:
-            version = signer.openssl("version")
-        except FileNotFoundError:
-            self.skipTest("OpenSSL 3 required for publisher signing test")
-        if not version.startswith(b"OpenSSL 3."):
-            self.skipTest("OpenSSL 3 required for publisher signing test")
+        key_file = self.fixture_key_file()
         self.candidate()
-        # Public RFC 8032 section 7.1 TEST 2 seed, ONLY for temporary test data.
-        # Never use this well-known seed as a publisher credential.
-        seed = bytes.fromhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
-        pkcs8 = bytes.fromhex("302e020100300506032b657004220420") + seed
-        key_file = self.root / "public-rfc8032-test-only.pem"
-        key_file.write_bytes(b"-----BEGIN PRIVATE KEY-----\n" + base64.b64encode(pkcs8) + b"\n-----END PRIVATE KEY-----\n")
-        key_file.chmod(0o600)
-        signer.sign(self.output, self.version, key_file)
-        signer.verify_signed(self.output, self.version)
+        signer.sign(self.output, self.version, key_file, self.public_key_file)
+        signer.verify_signed(self.output, self.version, self.public_key_file)
         producer.verify_release(self.output, self.version)
         self.assertEqual(json.loads((self.output / "publisher-key.json").read_text())["public_key"],
-                         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+                         self.test_public_key)
         for name in ["plugin.json", producer.bundle_name(self.version)]:
             self.assertEqual(len((self.output / (name + ".sig")).read_text().strip()), 128)
         self.assertFalse(any("PRIVATE KEY" in path.read_bytes().decode("utf-8", errors="ignore")
                              for path in self.output.iterdir()))
+
+    def test_wrong_signing_key_fails_before_changing_candidate_bytes(self):
+        key_file = self.fixture_key_file()
+        self.candidate()
+        before = {path.name: path.read_bytes() for path in self.output.iterdir()}
+        # A different valid Ed25519 public identity: RFC 8032 section 7.1 TEST 1.
+        self.public_key_file.write_text("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n")
+        with self.assertRaisesRegex(ValueError, "provisioned signing key does not match"):
+            signer.sign(self.output, self.version, key_file, self.public_key_file)
+        self.assertEqual(before, {path.name: path.read_bytes() for path in self.output.iterdir()})
+
+    def test_missing_or_malformed_anchor_fails_before_changing_candidate_bytes(self):
+        key_file = self.fixture_key_file()
+        self.candidate()
+        before = {path.name: path.read_bytes() for path in self.output.iterdir()}
+        self.public_key_file.unlink()
+        with self.assertRaises(FileNotFoundError):
+            signer.sign(self.output, self.version, key_file, self.public_key_file)
+        for value in ["", "0" * 63, "A" * 64, "not-a-public-key"]:
+            with self.subTest(value=value):
+                self.public_key_file.write_text(value)
+                with self.assertRaisesRegex(ValueError, "public anchor must be"):
+                    signer.sign(self.output, self.version, key_file, self.public_key_file)
+        self.assertEqual(before, {path.name: path.read_bytes() for path in self.output.iterdir()})
+
+    def test_verification_uses_independent_anchor_instead_of_candidate_key_record(self):
+        key_file = self.fixture_key_file()
+        self.candidate()
+        signer.sign(self.output, self.version, key_file, self.public_key_file)
+        # These signatures and publisher-key.json are mutually consistent, but
+        # must not authenticate themselves against a different reviewed anchor.
+        self.public_key_file.write_text("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n")
+        with self.assertRaisesRegex(ValueError, "publisher key does not match"):
+            signer.verify_signed(self.output, self.version, self.public_key_file)
 
     def test_signature_verifier_rejects_invalid_hex_shapes_before_openssl(self):
         signature = self.root / "bad-signature"

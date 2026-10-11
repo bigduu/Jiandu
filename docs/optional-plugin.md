@@ -10,8 +10,7 @@ This repository supplies the producer. Candidate artifacts are not a published
 release or an active plugin-center entry. A maintainer must publish a new,
 immutable version and accept the generated bundle URL/checksum in Bodhi's
 catalog before users can download that version from the plugin center.
-Candidates are unsigned and cannot pass Bamboo's default strict publisher
-trust policy. Production also requires a provisioned signing key, verified
+Workflow candidates and publication require a provisioned signing key, verified
 Ed25519 sidecars and separate acceptance of Jiandu's reviewed public key in the
 consumer. A bundle checksum alone does not satisfy that trust policy.
 
@@ -61,6 +60,10 @@ For a dedicated process whose host cannot send this metadata, the host can
 explicitly configure optional `--project-id` and `--session-id` defaults.
 Never ask the model to invent an identity or move Project facts to Global to
 bypass missing authority. See the [host context contract](design/mcp-call-context.md).
+Stdio MCP is the CLI's default mode: use `--data-dir` directly, without a `mcp`
+subcommand. The copyable baseline configuration grants no Project or Session
+identity. A host must derive the data root from its active native memory store,
+so an explicitly configured root is shared rather than guessed again.
 
 The installed CLI can also run a local read-only console:
 
@@ -70,8 +73,9 @@ The installed CLI can also run a local read-only console:
 
 ## Producer contract
 
-`plugin-release.yml` is manually dispatched. By default it uploads candidate
-workflow artifacts only. It builds the current Cargo workspace version without
+`plugin-release.yml` is manually dispatched from merged `main` only. By default
+it uploads signed candidate workflow artifacts without creating a release. It
+builds the current Cargo workspace version without
 changing crate manifests. The producer accepts only stable `X.Y.Z` versions;
 prerelease and build suffixes are rejected before packaging so an RC cannot be
 published through this stable release path or selected as Latest. It builds
@@ -105,11 +109,26 @@ must independently verify its origin/fingerprint and explicitly accept that
 key under label `jiandu-official`. Do not set `allow_unsigned` or `insecure`,
 generate a new production key as part of installation, or disable policy.
 
+The reviewed publisher anchor is [`plugin/signing-key.pub`](../plugin/signing-key.pub).
+It contains only the raw public key, never a private signing key. Its SHA-256
+fingerprint over the decoded 32 public bytes is
+`04f1787abfb51a5c02c45ce613fda5c3f75361029e2be01b536c96c0f5290a1c`.
+Both signing and standalone verification require that anchor. A provisioned
+key with a different public identity stops signing before any candidate bytes
+change; a self-consistent signature/public-key pair in a download cannot
+replace the reviewed identity. A rotation requires a separate public-anchor
+review and corresponding consumer trust update. Verify the public fingerprint
+without handling a private key:
+
+```shell
+python3 -c 'import hashlib,pathlib; print(hashlib.sha256(bytes.fromhex(pathlib.Path("plugin/signing-key.pub").read_text().strip())).hexdigest())'
+```
+
 Local packaging and validation, after compiling the binary:
 
 ```shell
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
-python3 scripts/smoke_plugin.py --binary target/release/jiandu --version 0.3.1
+python3 scripts/smoke_plugin.py --binary target/release/jiandu --version 0.3.2
 python3 scripts/package_plugin.py pack --platform macos \
   --binary /path/to/universal/jiandu --output target/plugin-artifacts
 # Repeat pack with the real Windows/Linux binaries produced by their runners.
@@ -128,12 +147,15 @@ that another platform's executable runs.
 Only dispatch with `publish=true` after the protected source PR and required
 checks have passed, candidate artifacts have been reviewed, and the maintainer
 has chosen an **unused version** through the normal source/version review.
-Publication is restricted to `main` and the `release` environment. It first
-requires the environment's `JIANDU_PLUGIN_SIGNING_KEY` secret (Ed25519 PEM),
-signs and verifies the assets with OpenSSL 3, and includes the sidecars/public
+Both candidate signing and publication are restricted to `main` and the
+`release` environment. The signing job requires the environment's
+`JIANDU_PLUGIN_SIGNING_KEY` secret (unencrypted Ed25519 PKCS#8 PEM), derives its
+public identity with OpenSSL 3 and requires an exact match with the committed
+public anchor. It signs and verifies the assets and includes the sidecars/public
 key in `SHA256SUMS`. The private key is used only in a temporary file; the
-producer never creates or publishes it. Configure the environment's approval
-rules and key outside this workflow. It then creates the new exact source tag
+producer never creates or publishes it. Configure the environment's branch and
+approval rules and key outside this workflow. Publication downloads that signed
+candidate and verifies it against the public anchor before creating the exact source tag
 after rejecting an existing remote release/tag (lookup errors also stop publication).
 The annotated tag records the exact source/run; a non-forced push prevents a
 concurrent publisher from replacing it. It then creates a release with the
@@ -143,3 +165,12 @@ If publication is interrupted after the tag is created, stop and inspect the
 remote tag/release before a maintainer repairs it; rerunning is deliberately
 refused. Publishing does not run `cargo publish`, update Homebrew, or activate
 Bodhi's catalog. Those are separate reviewed actions.
+
+Record the exact source SHA, workflow run and each platform job's archive hash
+and extracted executable hash when reviewing a candidate. Source-only CI and
+synthetic archive tests do not replace the three runtime smoke jobs. A new
+publication dispatch builds again; verify the final published inventory, both
+sidecars against the committed anchor, and the downloaded archive/executable
+hashes before accepting the generated catalog entry. Neither this binary
+release nor its version preparation claims that `jiandu-memory` or `jiandu-mcp`
+of the same version is published to crates.io.
