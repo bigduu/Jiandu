@@ -72,7 +72,10 @@ The installed CLI can also run a local read-only console:
 
 `plugin-release.yml` is manually dispatched. By default it uploads candidate
 workflow artifacts only. It builds the current Cargo workspace version without
-changing crate manifests: macOS arm64 + x86_64 combined by `lipo`, Windows
+changing crate manifests. The producer accepts only stable `X.Y.Z` versions;
+prerelease and build suffixes are rejected before packaging so an RC cannot be
+published through this stable release path or selected as Latest. It builds
+macOS arm64 + x86_64 combined by `lipo`, Windows
 x86_64 MSVC, and Linux x86_64 GNU on Ubuntu 22.04. Linux requires glibc 2.35+;
 Windows ARM and Linux ARM are outside this release matrix. macOS is built with
 an 11.0 deployment target. Each runner executes CLI help and a real stdio MCP

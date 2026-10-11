@@ -144,8 +144,9 @@ class PluginPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bundle manifest differs"):
             producer.verify_release(self.output, self.version)
 
-    def test_version_rejects_paths_and_moving_selectors(self):
-        for version in ["latest", "../0.3.1", "v0.3.1", "0.3", "0.3.1/asset", "0.3.1\n"]:
+    def test_version_rejects_paths_moving_selectors_and_nonstable_suffixes(self):
+        for version in ["latest", "../0.3.1", "v0.3.1", "0.3", "0.3.1/asset", "0.3.1\n",
+                        "0.4.0-rc.1", "0.4.0-beta", "0.4.0+build.1"]:
             with self.subTest(version=version), self.assertRaises(ValueError):
                 producer.validate_version(version)
 

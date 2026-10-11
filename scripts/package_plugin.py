@@ -31,8 +31,8 @@ def workspace_version():
 
 
 def validate_version(version):
-    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?", version):
-        raise ValueError("version must be a release semver, never latest or a path")
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+        raise ValueError("version must be stable X.Y.Z, without prerelease or build suffixes")
 
 
 def artifact_name(version, platform):
