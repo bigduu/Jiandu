@@ -44,6 +44,15 @@ brew install bigduu/tap/jiandu
 客户端。用 `which jiandu` 查看绝对路径（Homebrew 在 Apple Silicon 上通常是
 `/opt/homebrew/bin/jiandu`，Intel Mac 上通常是 `/usr/local/bin/jiandu`）。
 
+### Bodhi 可选插件连接器
+
+Bodhi 的内置记忆不依赖单独安装 Jiandu CLI。本源码还提供了[可选插件生产流程](docs/optional-plugin.md)，
+生成固定版本的 macOS 通用、Windows x86_64 和 Linux x86_64 下载包，供其他 MCP 客户端使用。
+安装只添加独立命令，不会在 Bamboo 中重复注册记忆服务。候选包必须经过单独的新版本发布与插件目录审核，
+才能在 Bodhi 中供用户下载；这次源码变更不代表新下载版本已经可用。卸载连接器会保留权威数据根目录
+`~/.jiandu`。外部客户端按 Bamboo 的实际数据目录和文档中的平台路径拼出可执行文件绝对路径，
+并由宿主提供项目和会话权限上下文；可复制路径的界面属于后续接入工作。
+
 ## 接入你的 agent
 
 要共享项目记忆，每个客户端都要用**同一个 `--data-dir`** 和**同一个 `--project-id`** 启动。

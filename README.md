@@ -50,6 +50,17 @@ start a service or configure any MCP client. Run `which jiandu` for the absolute
 path (Homebrew: usually `/opt/homebrew/bin/jiandu` on Apple Silicon,
 `/usr/local/bin/jiandu` on Intel Macs).
 
+### Optional Bodhi plugin connector
+
+Bodhi's built-in memory remains available without installing a separate Jiandu
+CLI. This checkout also contains an [optional plugin producer](docs/optional-plugin.md)
+for exact-version macOS universal, Windows x86_64 and Linux x86_64 downloads.
+It installs the CLI for external MCP clients without adding a duplicate memory
+server in Bamboo. Candidate bundles require a separately reviewed new release
+and catalog activation before they are available in Bodhi; no new downloadable
+version is implied by this source change. Uninstalling the connector preserves
+the canonical `~/.jiandu` data root.
+
 ## Connect your agents
 
 To share Project memory, start every client with the **same `--data-dir`** and
