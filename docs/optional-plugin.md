@@ -128,7 +128,7 @@ Local packaging and validation, after compiling the binary:
 
 ```shell
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
-python3 scripts/smoke_plugin.py --binary target/release/jiandu --version 0.3.2
+python3 scripts/smoke_plugin.py --binary target/release/jiandu --version 0.3.3
 python3 scripts/package_plugin.py pack --platform macos \
   --binary /path/to/universal/jiandu --output target/plugin-artifacts
 # Repeat pack with the real Windows/Linux binaries produced by their runners.
