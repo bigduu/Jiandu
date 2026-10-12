@@ -817,6 +817,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn yaml_backend_frontmatter_preserves_canonical_bytes_and_typed_values() {
+        let document = "\u{feff}---\n\
+id: mem_yaml_compat\n\
+title: '发布: #稳定'\n\
+type: project\n\
+scope: project\n\
+project_key: project-yaml\n\
+granularity: quarter\n\
+status: active\n\
+created_at: '2026-10-12T00:00:00Z'\n\
+updated_at: '2026-10-12T00:00:00Z'\n\
+created_by: &writer\n  kind: session\n  id: '001'\n\
+updated_by: *writer\n\
+sources:\n- kind: session\n  id: 'null'\n  message_range: ['001', 'on']\n\
+relations:\n  related: [mem_other]\n\
+tags: ['on', 'null', '001', '#tag', 中文]\n\
+retrieval:\n  keywords: ['yes', 'null', '2026-10-12']\n  entities: [发布]\n\
+---\n\
+保留正文: on / null / 001。\n";
+        let (frontmatter, body) = parse_markdown_document(document).unwrap();
+        assert_eq!(frontmatter.title, "发布: #稳定");
+        assert_eq!(frontmatter.created_by, frontmatter.updated_by);
+        assert_eq!(frontmatter.created_by.id.as_deref(), Some("001"));
+        assert_eq!(frontmatter.sources[0].id, "null");
+        assert_eq!(frontmatter.sources[0].message_range, ["001", "on"]);
+        assert_eq!(frontmatter.tags, ["on", "null", "001", "#tag", "中文"]);
+        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
+        let (reparsed, reparsed_body) = parse_markdown_document(&rendered).unwrap();
+        assert_eq!(reparsed, frontmatter);
+        assert_eq!(reparsed_body, body);
+        // Captured from the original serde_yaml 0.9.34 backend at source 0c7754d5.
+        assert_eq!(
+            rendered,
+            r#"---
+id: mem_yaml_compat
+title: '发布: #稳定'
+type: project
+scope: project
+project_key: project-yaml
+granularity: quarter
+status: active
+created_at: 2026-10-12T00:00:00Z
+updated_at: 2026-10-12T00:00:00Z
+created_by:
+  kind: session
+  id: '001'
+updated_by:
+  kind: session
+  id: '001'
+sources:
+- kind: session
+  id: 'null'
+  message_range:
+  - '001'
+  - on
+relations:
+  related:
+  - mem_other
+tags:
+- on
+- 'null'
+- '001'
+- '#tag'
+- 中文
+retrieval:
+  keywords:
+  - yes
+  - 'null'
+  - 2026-10-12
+  entities:
+  - 发布
+---
+
+保留正文: on / null / 001。
+"#
+        );
+    }
+
+    #[test]
+    fn yaml_backend_frontmatter_keeps_invalid_data_error_boundary() {
+        let document = "---\n\
+id: mem_yaml_invalid\n\
+title: Valid title\n\
+type: project\n\
+scope: global\n\
+status: active\n\
+created_at: '2026-10-12T00:00:00Z'\n\
+updated_at: '2026-10-12T00:00:00Z'\n\
+created_by: &writer\n  kind: session\n\
+updated_by: *writer\n\
+---\nBody.\n";
+        for malformed in [
+            document.replace("title: Valid title", "title: first\ntitle: duplicate"),
+            document.replace("title: Valid title", "title: [not, a, string]"),
+            document.replace("title: Valid title", "title: 'unterminated"),
+            document.replace("type: project", "type: !unknown project"),
+            document.replace("updated_by: *writer", "updated_by: *missing"),
+        ] {
+            let error: io::Error = parse_markdown_document(&malformed).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to parse memory frontmatter:")
+            );
+        }
+    }
+
+    #[test]
     fn normalize_tags_dedupes_and_sanitizes() {
         let tags = normalize_tags(["User Preference", "user-preference", "release/freeze"]);
         assert_eq!(tags, vec!["release-freeze", "user-preference"]);
