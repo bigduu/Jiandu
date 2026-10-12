@@ -3829,6 +3829,71 @@ mod tests {
     use crate::memory_store::DEFAULT_SESSION_TOPIC;
     use tempfile::tempdir;
 
+    #[test]
+    fn yaml_backend_preserves_scope_generation_and_dream_bytes() {
+        let document = "---\n\
+id: mem_yaml_generation\n\
+title: '发布: #稳定'\n\
+type: project\n\
+scope: project\n\
+project_key: project-yaml\n\
+status: active\n\
+created_at: '2026-10-12T00:00:00Z'\n\
+updated_at: '2026-10-12T00:00:00Z'\n\
+created_by:\n  kind: session\n\
+updated_by:\n  kind: memory_write\n\
+tags: ['null', '001', 中文]\n\
+---\n\
+保留正文: on / null / 001。\n";
+        let (frontmatter, body) = parse_markdown_document(document).unwrap();
+        let documents = [DurableMemoryDocument {
+            frontmatter,
+            body,
+            path: PathBuf::from("synthetic-memory.md"),
+        }];
+        let generation = canonical_scope_generation(&documents).unwrap();
+        let dream = DreamSnapshot {
+            scope: MemoryScope::Project,
+            project_key: Some("project-yaml".to_string()),
+            generated_at: "2026-10-12T00:00:00Z".to_string(),
+            source_generation: generation.clone(),
+            content: "# Dream\n\n保留正文: on / null / 001。".to_string(),
+        };
+        let rendered = render_dream_snapshot(&dream).unwrap();
+        assert_eq!(parse_dream_snapshot(&rendered).unwrap(), dream);
+        for malformed in [
+            rendered.replace("scope: project", "scope: project\nscope: global"),
+            rendered.replace("project_key: project-yaml", "project_key: [invalid]"),
+        ] {
+            let error: io::Error = parse_dream_snapshot(&malformed).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to parse Dream frontmatter:")
+            );
+        }
+        // Captured from the original serde_yaml 0.9.34 backend at source 0c7754d5.
+        assert_eq!(
+            generation,
+            "913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11db89"
+        );
+        assert_eq!(
+            rendered,
+            r#"---
+scope: project
+project_key: project-yaml
+generated_at: 2026-10-12T00:00:00Z
+source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11db89
+---
+
+# Dream
+
+保留正文: on / null / 001。
+"#
+        );
+    }
+
     #[tokio::test]
     async fn session_topics_roundtrip() {
         let dir = tempdir().unwrap();
