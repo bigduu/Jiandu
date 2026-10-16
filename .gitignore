@@ -13,6 +13,12 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Vendored by npm/install.js from the GitHub Release. Not part of the source package.
+npm/bin/jiandu
+npm/bin/jiandu.exe
+npm/bin/*.download
+npm/*.tgz
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

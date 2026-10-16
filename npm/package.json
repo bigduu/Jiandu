@@ -1,0 +1,48 @@
+{
+  "name": "@bigduu/jiandu",
+  "version": "0.3.3",
+  "description": "Shared local memory MCP server. Node launcher that downloads the matching prebuilt GitHub Release binary.",
+  "keywords": [
+    "mcp",
+    "memory",
+    "agents",
+    "bm25",
+    "stdio"
+  ],
+  "homepage": "https://github.com/bigduu/Jiandu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigduu/Jiandu.git",
+    "directory": "npm"
+  },
+  "license": "MIT",
+  "bin": {
+    "jiandu": "bin/jiandu.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node --test"
+  },
+  "files": [
+    "bin/jiandu.js",
+    "install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin",
+    "win32",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "mcpName": "io.github.bigduu/jiandu"
+}

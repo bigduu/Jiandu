@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.bigduu/jiandu",
+  "title": "Jiandu",
+  "description": "Local shared-memory MCP server for coding agents with deterministic BM25 recall.",
+  "repository": {
+    "url": "https://github.com/bigduu/Jiandu",
+    "source": "github",
+    "id": "1343886925"
+  },
+  "version": "0.3.3",
+  "websiteUrl": "https://github.com/bigduu/Jiandu#install",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@bigduu/jiandu",
+      "version": "0.3.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--data-dir",
+          "description": "Absolute path of the Jiandu data root. Clients that share memory must use the same path.",
+          "isRequired": true,
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}

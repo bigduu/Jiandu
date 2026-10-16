@@ -18,8 +18,8 @@ local files.
   never calls a model or a remote service.
 - **Local console + per-call identity (v0.3.0):** `jiandu ui` browses what your
   agents remember; hosts can pass Project/Session identity per MCP call.
-  Latest release: **v0.3.0** —
-  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0).
+  Latest release: **v0.3.3** —
+  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3).
 
 <p align="center"><img src="docs/demos/memory-console.gif" alt="Jiandu searches a demo project for a release checklist and opens the saved memory." width="720"></p>
 
@@ -32,23 +32,46 @@ model. No personal memory store was used.
 
 ## Install
 
-Published **v0.3.0** (Homebrew and source builds need Rust 1.95 or newer;
-Homebrew installs Rust as a build dependency):
+Published **v0.3.3**. npm downloads the matching prebuilt GitHub Release
+binary. Homebrew and `cargo install` build from source and need Rust 1.95 or
+newer (Homebrew installs Rust as a build dependency).
 
 ```sh
-# Homebrew (compiles the v0.3.0 source tag) — recommended for v0.3.0
+# npm — prebuilt binary (macOS universal, Windows x64, Linux x64)
+npx @bigduu/jiandu --help
+npm i -g @bigduu/jiandu
+
+# Homebrew — builds the published source tag
 brew tap bigduu/tap
 brew install bigduu/tap/jiandu
 
-# crates.io is still at 0.2.0 until `cargo publish` for 0.3.0; for v0.3.0 use
-# Homebrew above or build from the v0.3.0 tag / this checkout.
-# cargo install jiandu-mcp --version 0.2.0 --locked   # crates.io (0.2.0 only)
+# crates.io 0.3.3 — the installed binary is still named jiandu
+cargo install jiandu-mcp --version 0.3.3 --locked
 ```
+
+The MCP Registry name is `io.github.bigduu/jiandu`. `@bigduu/jiandu` checks the
+release `SHA256SUMS` before saving the binary. macOS Apple Silicon and Intel
+share `jiandu-v0.3.3-universal-apple-darwin.tar.gz`. Windows x64 and Linux x64
+(gnu) have their own archives. Windows ARM64 and Linux ARM64 are not in this
+release; the launcher exits with an error on those machines.
 
 The binary is called `jiandu`. Check it with `jiandu --help`. Installing does not
 start a service or configure any MCP client. Run `which jiandu` for the absolute
 path (Homebrew: usually `/opt/homebrew/bin/jiandu` on Apple Silicon,
-`/usr/local/bin/jiandu` on Intel Macs).
+`/usr/local/bin/jiandu` on Intel Macs). An MCP client that cannot answer an
+install prompt should call `npx` with `-y` and the same `--data-dir` every
+sharing client uses:
+
+```json
+{
+  "mcpServers": {
+    "jiandu": {
+      "command": "npx",
+      "args": ["-y", "@bigduu/jiandu", "--data-dir", "/Users/you/.jiandu", "--project-id", "my-app", "--session-id", "cursor"]
+    }
+  }
+}
+```
 
 ### Optional Bodhi plugin connector
 
@@ -67,7 +90,9 @@ To share Project memory, start every client with the **same `--data-dir`** and
 the **same `--project-id`**. Give each client its own `--session-id` (optional
 default from v0.3.0; still recommended so Session memory stays separate). IDs may contain letters,
 digits, `-` and `_`. Replace `/Users/you` with your home directory; JSON and
-TOML do not expand `~`.
+TOML do not expand `~`. The command below is the installed `jiandu` binary.
+With npm, use `npx` and put `-y` and `@bigduu/jiandu` ahead of the same flags
+(see [Install](#install)).
 
 **Claude Code:**
 
@@ -111,11 +136,11 @@ index; the agent should run `rebuild` for that scope and query again.
 
 | Path | Available workflow |
 | --- | --- |
-| [Published v0.3.0](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0) (Homebrew / source tag) | Shared memory over stdio MCP, Dream snapshots, Bamboo import, read-only browser console (`jiandu ui`), and per-call host identity (`--session-id` / `--project-id` optional defaults). |
-| `main` (tip of development) | Whatever lands after v0.3.0 — build from source for unreleased work. |
-| crates.io `0.2.0` | Still the latest on crates.io until 0.3.0 is published there; lacks the console and per-call identity. |
+| [Published v0.3.3](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3) (npm, Homebrew, or crates.io) | Shared memory over stdio MCP, Dream snapshots, Bamboo import, read-only browser console (`jiandu ui`), and per-call host identity (`--session-id` / `--project-id` optional defaults). |
+| `main` (tip of development) | Whatever lands after v0.3.3 — build from source for unreleased work. |
+| crates.io `jiandu-mcp` / `jiandu-memory` `0.3.3` | Current crates.io release. Install the server with `cargo install jiandu-mcp --version 0.3.3 --locked`. |
 
-Rust 1.95 or newer is required to build. [Audit evidence](docs/readme-audit.md).
+Rust 1.95 or newer is required to build. [2026-10-03 audit](docs/readme-audit.md).
 
 Jiandu owns one authoritative data root, normally `~/.jiandu`. Bamboo native
 memory and every MCP client must use that same Jiandu-owned root after cutover;
@@ -137,7 +162,7 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 
 ## Build from source and generic configuration
 
-For a source build of the current checkout (or the `v0.3.0` tag):
+For a source build of the current checkout (or the `v0.3.3` tag):
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
@@ -162,9 +187,9 @@ minimal configuration is enough for Global memory:
 }
 ```
 
-Older **v0.2.0** binaries (including current crates.io) still require
-`--session-id`; use the [Connect your agents](#connect-your-agents) snippets for
-those builds.
+Older **v0.2.0** binaries still require `--session-id`; crates.io `0.3.3` does
+not. Use the [Connect your agents](#connect-your-agents) snippets for those
+older builds.
 
 The host may namespace the tool as `mcp__jiandu__memory`. For a first trial,
 use a new dedicated data directory and Global memory, which needs no identity
