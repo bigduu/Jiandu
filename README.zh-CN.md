@@ -14,8 +14,8 @@
   同一个 `memory` 工具完成。
 - **数据就是普通文件**：存放在你指定的一个数据目录里；简牍从不调用模型或远程服务。
 - **本地控制台 + 逐次调用身份（v0.3.0）：** `jiandu ui` 可浏览 agent 记住了什么；宿主可在每次
-  MCP 调用中传入项目/会话身份。最新发布版：**v0.3.0** —
-  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0)。
+  MCP 调用中传入项目/会话身份。最新发布版：**v0.3.3** —
+  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3)。
 
 <p align="center"><img src="docs/demos/memory-console.gif" alt="简牍在演示项目中搜索发布清单并打开保存的记忆。" width="720"></p>
 
@@ -27,22 +27,42 @@ stdio MCP 写入了一条明确标注的演示记忆。浏览器只是搜索并�
 
 ## 安装
 
-已发布的 **v0.3.0**（Homebrew 与源码构建需要 Rust 1.95 或更新版本；Homebrew 会自动安装
-Rust 作为构建依赖）：
+已发布的 **v0.3.3**。npm 会下载 GitHub Release 里对应平台的预编译二进制。Homebrew 和
+`cargo install` 从源码构建，需要 Rust 1.95 或更新版本（Homebrew 会自动安装 Rust 作为构建依赖）。
 
 ```sh
-# Homebrew（编译 v0.3.0 源码 tag）— 获取 v0.3.0 的推荐方式
+# npm — 预编译二进制（macOS 通用、Windows x64、Linux x64）
+npx @bigduu/jiandu --help
+npm i -g @bigduu/jiandu
+
+# Homebrew — 编译已发布的源码 tag
 brew tap bigduu/tap
 brew install bigduu/tap/jiandu
 
-# crates.io 目前仍是 0.2.0（需维护者手动 cargo publish 0.3.0）。
-# 要用 v0.3.0 请用上面的 Homebrew，或从 v0.3.0 tag / 当前源码构建。
-# cargo install jiandu-mcp --version 0.2.0 --locked   # 仅 crates.io 的 0.2.0
+# crates.io 0.3.3 — 安装出的可执行文件名仍是 jiandu
+cargo install jiandu-mcp --version 0.3.3 --locked
 ```
+
+MCP Registry 名称是 `io.github.bigduu/jiandu`。`@bigduu/jiandu` 在写入二进制前会核对 Release 的
+`SHA256SUMS`。macOS Apple Silicon 和 Intel 共用 `jiandu-v0.3.3-universal-apple-darwin.tar.gz`。
+Windows x64 和 Linux x64（gnu）各有自己的压缩包。这个 Release 没有 Windows ARM64 和 Linux ARM64；
+在这些机器上启动器会直接报错退出。
 
 可执行文件名是 `jiandu`，可以用 `jiandu --help` 检查。安装不会启动任何服务，也不会配置任何 MCP
 客户端。用 `which jiandu` 查看绝对路径（Homebrew 在 Apple Silicon 上通常是
-`/opt/homebrew/bin/jiandu`，Intel Mac 上通常是 `/usr/local/bin/jiandu`）。
+`/opt/homebrew/bin/jiandu`，Intel Mac 上通常是 `/usr/local/bin/jiandu`）。如果 MCP 客户端不能
+回答安装提示，请给 `npx` 加上 `-y`，并让每个需要共享记忆的客户端使用同一个 `--data-dir`：
+
+```json
+{
+  "mcpServers": {
+    "jiandu": {
+      "command": "npx",
+      "args": ["-y", "@bigduu/jiandu", "--data-dir", "/Users/you/.jiandu", "--project-id", "my-app", "--session-id", "cursor"]
+    }
+  }
+}
+```
 
 ### Bodhi 可选插件连接器
 
@@ -58,6 +78,8 @@ Bodhi 的内置记忆不依赖单独安装 Jiandu CLI。本源码还提供了[�
 要共享项目记忆，每个客户端都要用**同一个 `--data-dir`** 和**同一个 `--project-id`** 启动。
 每个客户端各用一个自己的 `--session-id`（从 v0.3.0 起为可选默认值；仍建议填写，以便会话记忆分开）。ID 只能
 包含字母、数字、`-` 和 `_`。把 `/Users/you` 换成你的用户目录；JSON 和 TOML 不会展开 `~`。
+下面示例里的命令是已安装的 `jiandu` 可执行文件。如果用 npm，把命令换成 `npx`，并在同样的参数前加上
+`-y` 和 `@bigduu/jiandu`（见[安装](#安装)）。
 
 **Claude Code：**
 
@@ -99,11 +121,11 @@ agent 里问*“我们什么时候发版？”*。全新的数据目录第一次
 
 | 途径 | 可用的功能 |
 | --- | --- |
-| [已发布的 v0.3.0](https://github.com/bigduu/Jiandu/releases/tag/v0.3.0)（Homebrew / 源码 tag） | 基于 stdio MCP 的共享记忆、Dream 快照、Bamboo 导入、只读浏览器控制台（`jiandu ui`），以及逐次调用宿主身份（`--session-id` / `--project-id` 为可选默认值）。 |
-| `main`（开发前沿） | v0.3.0 之后尚未发版的改动 — 需要从源码构建。 |
-| crates.io `0.2.0` | crates.io 上目前仍是此版本，没有控制台和逐次调用身份；等 0.3.0 publish 后才会更新。 |
+| [已发布的 v0.3.3](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3)（npm、Homebrew 或 crates.io） | 基于 stdio MCP 的共享记忆、Dream 快照、Bamboo 导入、只读浏览器控制台（`jiandu ui`），以及逐次调用宿主身份（`--session-id` / `--project-id` 为可选默认值）。 |
+| `main`（开发前沿） | v0.3.3 之后尚未发版的改动 — 需要从源码构建。 |
+| crates.io `jiandu-mcp` / `jiandu-memory` `0.3.3` | crates.io 上的当前版本。用 `cargo install jiandu-mcp --version 0.3.3 --locked` 安装服务端。 |
 
-构建需要 Rust 1.95 或更新版本。[审计记录](docs/readme-audit.md)。
+构建需要 Rust 1.95 或更新版本。[2026-10-03 审计记录](docs/readme-audit.md)。
 
 简牍只认一个权威数据根目录，通常是 `~/.jiandu`。切换之后，Bamboo 原生记忆和所有 MCP 客户端都
 必须使用这个由简牍管理的同一个根目录；`~/.bamboo` 不能继续作为第二个权威的持久记忆存储。
@@ -123,7 +145,7 @@ agent 里问*“我们什么时候发版？”*。全新的数据目录第一次
 
 ## 从源码构建与通用配置
 
-构建当前源码（或 `v0.3.0` tag）：
+构建当前源码（或 `v0.3.3` tag）：
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
@@ -146,7 +168,7 @@ cargo build --release --locked -p jiandu-mcp --bin jiandu
 }
 ```
 
-较旧的 **v0.2.0** 二进制（包括当前 crates.io）仍要求 `--session-id`；那些版本请使用
+较旧的 **v0.2.0** 二进制仍要求 `--session-id`；crates.io 上的 `0.3.3` 不需要。那些旧版本请使用
 [接入你的 agent](#接入你的-agent) 里的配置。
 
 宿主可能会把工具命名为 `mcp__jiandu__memory`。第一次试用时，请用一个新的专用数据目录和全局记忆，

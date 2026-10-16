@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+// Thin launcher: exec the vendored Jiandu binary, passing stdio straight
+// through so the MCP stdio transport (the host talks JSON-RPC over our
+// stdin/stdout) is byte-for-byte transparent — this Node process just waits
+// for jiandu to exit.
+//
+// Self-healing: if postinstall didn't vendor the binary (e.g. installed with
+// --ignore-scripts), download it now before the first launch.
+
+"use strict";
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync, execFileSync } = require("child_process");
+const { releaseFor, unsupportedMessage, binaryPath } = require("../install.js");
+
+function die(msg) {
+  process.stderr.write(`[jiandu] ${msg}\n`);
+  process.exit(1);
+}
+
+const release = releaseFor(os.platform(), os.arch());
+if (!release) die(unsupportedMessage(os.platform(), os.arch()));
+
+const BIN = binaryPath(release.binaryName);
+
+if (!fs.existsSync(BIN)) {
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, "..", "install.js")], { stdio: "inherit" });
+  } catch {}
+  if (!fs.existsSync(BIN)) {
+    die(
+      "the Jiandu binary is missing and could not be downloaded — check your network or install manually from https://github.com/bigduu/Jiandu/releases",
+    );
+  }
+}
+
+const res = spawnSync(BIN, process.argv.slice(2), { stdio: "inherit" });
+if (res.error) die(`failed to launch jiandu: ${res.error.message}`);
+process.exit(res.status === null ? 1 : res.status);
