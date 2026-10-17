@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 mod access_log;
+mod bound_project;
 pub mod freshness;
 mod lexical_bm25;
 pub mod paths;
@@ -13,6 +14,7 @@ pub mod recall;
 pub mod store;
 pub mod types;
 
+pub use bound_project::{ProjectMemoryCandidates, ProjectMemoryRead, ProjectMemoryRef};
 pub use freshness::{
     FreshnessKind, memory_age_days, memory_age_label, memory_freshness_text,
     render_memory_freshness_note,
