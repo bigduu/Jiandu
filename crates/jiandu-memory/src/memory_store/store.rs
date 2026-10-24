@@ -3266,7 +3266,7 @@ impl MemoryStore {
         Ok(true)
     }
 
-    async fn get_memory_at_locator(
+    pub(super) async fn get_memory_at_locator(
         &self,
         scope: MemoryScope,
         project_key: Option<&str>,
