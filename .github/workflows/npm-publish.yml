@@ -1,0 +1,164 @@
+name: Publish npm package
+
+# Publish npm/ to the public npm registry for an existing release tag.
+# Run: Actions → Publish npm package → Run workflow, tag v0.3.3.
+#
+# The package is the Node launcher. It downloads that GitHub Release, and
+# this job does not build Rust. v0.3.3 was tagged before npm/ existed, so
+# dispatch this from the default branch: the pinned workflow commit is what
+# gets published, and only when its npm/package.json version is the tag.
+# A release whose tagged commit already contains that version publishes that
+# commit. The publish job is skipped when NPM_TOKEN is unset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish, e.g. v0.3.3
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Check NPM_TOKEN
+    runs-on: ubuntu-latest
+    outputs:
+      npm: ${{ steps.token.outputs.npm }}
+    steps:
+      - id: token
+        run: |
+          echo "npm=${{ secrets.NPM_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ secrets.NPM_TOKEN != '' }}" != "true" ]]; then
+            echo "NPM_TOKEN is unset. Publish is skipped."
+          fi
+
+  npm:
+    name: Publish @bigduu/jiandu
+    needs: gate
+    if: needs.gate.outputs.npm == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the release tag and pin this commit
+        id: pin
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="$RELEASE_TAG"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Tag must be an existing stable release like v0.3.3." >&2
+            exit 1
+          fi
+          version="${tag#v}"
+
+          if ! git fetch --depth=1 origin "+refs/tags/${tag}:refs/tags/${tag}"; then
+            echo "Tag ${tag} does not exist." >&2
+            exit 1
+          fi
+          release_commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          if [[ ! "$release_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Tag ${tag} did not resolve to a commit." >&2
+            exit 1
+          fi
+
+          source_commit="$(git rev-parse HEAD)"
+          if [[ "$source_commit" != "$WORKFLOW_SHA" ]]; then
+            echo "Checkout ${source_commit} is not the pinned workflow commit ${WORKFLOW_SHA}." >&2
+            exit 1
+          fi
+          if [[ ! -f npm/package.json ]]; then
+            echo "npm/package.json is not in ${source_commit}." >&2
+            exit 1
+          fi
+          package_version="$(python3 -c 'import json,sys; d=json.load(open("npm/package.json"));
+          name, version = d.get("name"), d.get("version")
+          if name != "@bigduu/jiandu" or not isinstance(version, str):
+              sys.exit("npm/package.json must name @bigduu/jiandu and set a version")
+          sys.stdout.write(version)')"
+          if [[ "$package_version" != "$version" ]]; then
+            echo "npm/package.json on ${source_commit} is ${package_version}, not ${version}." >&2
+            exit 1
+          fi
+          # The historical v0.3.3 tag predates npm/. Publishing that launcher
+          # from a later default-branch commit is allowed only when the
+          # package version matches the tag. Any other ref must be the tag.
+          if [[ "$source_commit" != "$release_commit" && "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "Tag ${tag} is ${release_commit}, but this workflow commit is ${source_commit}. Dispatch it from ${DEFAULT_BRANCH} only when that commit's package version is ${version}." >&2
+            exit 1
+          fi
+
+          if ! assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"; then
+            echo "GitHub Release ${tag} does not exist." >&2
+            exit 1
+          fi
+          for asset in \
+            SHA256SUMS \
+            "jiandu-v${version}-universal-apple-darwin.tar.gz" \
+            "jiandu-v${version}-x86_64-pc-windows-msvc.zip" \
+            "jiandu-v${version}-x86_64-unknown-linux-gnu.tar.gz"
+          do
+            if ! grep -qx "$asset" <<<"$assets"; then
+              echo "GitHub Release ${tag} is missing ${asset}, which the npm launcher downloads." >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "release_commit=${release_commit}"
+            echo "source_commit=${source_commit}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing @bigduu/jiandu@${version} from ${source_commit}; release ${tag} is ${release_commit}."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+
+      - name: Test the launcher
+        working-directory: npm
+        run: npm test
+
+      - name: Set package version to the tag
+        working-directory: npm
+        env:
+          VERSION: ${{ steps.pin.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Publish
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ steps.pin.outputs.tag }}
+          VERSION: ${{ steps.pin.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.pin.outputs.release_commit }}
+          SOURCE_COMMIT: ${{ steps.pin.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          current="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          if [[ "$current" != "$RELEASE_COMMIT" ]]; then
+            echo "Tag ${TAG} moved from ${RELEASE_COMMIT} to ${current}." >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          python3 -c 'import json,os,sys; d=json.load(open("package.json"));
+          if d.get("name") != "@bigduu/jiandu" or d.get("version") != os.environ["VERSION"]:
+              sys.exit("refusing to publish %s@%s" % (d.get("name"), d.get("version")))'
+          npm publish --access public
