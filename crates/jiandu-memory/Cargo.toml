@@ -1,7 +1,7 @@
 [package]
 name = "jiandu-memory"
 description = "Deterministic filesystem memory store with BM25/CJK recall"
-version.workspace = true
+version = "0.3.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

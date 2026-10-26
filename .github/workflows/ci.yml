@@ -39,6 +39,33 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests and schema drift checks
         run: cargo test --workspace --all-features --locked
+      - name: Verify the memory library package and record its immutable identity
+        run: |
+          cargo package --locked -p jiandu-memory
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, tarfile
+          meta = json.loads(subprocess.check_output([
+              'cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'
+          ]))
+          version = next(p['version'] for p in meta['packages'] if p['name'] == 'jiandu-memory')
+          archive = pathlib.Path(meta['target_directory']) / 'package' / f'jiandu-memory-{version}.crate'
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert source == os.environ['GITHUB_SHA']
+          assert not subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all'], text=True).strip()
+          with tarfile.open(archive, 'r:gz') as package:
+              vcs = json.load(package.extractfile(f'jiandu-memory-{version}/.cargo_vcs_info.json'))
+          assert vcs['git']['sha1'] == source and not vcs['git'].get('dirty', False)
+          assert vcs['path_in_vcs'] == 'crates/jiandu-memory'
+          print('JIANDU_PACKAGE_PROOF=' + json.dumps({
+              'source_sha': source,
+              'tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'version': version, 'archive_sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+              'size_bytes': archive.stat().st_size, 'vcs': vcs,
+              'cargo_lock_sha256': hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest(),
+              'cargo_version': subprocess.check_output(['cargo', '-V'], text=True).strip(),
+              'rustc_version': subprocess.check_output(['rustc', '-vV'], text=True).strip(),
+          }, sort_keys=True))
+          PY
       - name: Verify optional plugin packaging contracts
         run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
