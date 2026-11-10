@@ -1,6 +1,6 @@
 use std::fmt;
 
-use jiandu_memory::{ProjectId, memory_store::validate_session_id};
+use jiandu_memory::{ProjectId, SectionId, memory_store::validate_session_id};
 use rmcp::model::RequestMetaObject;
 use serde::Deserialize;
 
@@ -11,11 +11,13 @@ pub const MEMORY_CONTEXT_META_KEY: &str = "io.github.bigduu.jiandu/context";
 ///
 /// Identity stays outside the unified tool arguments: all five `session_*`
 /// actions require `session_id`, while durable project actions require a
-/// validated opaque `ProjectId`. Global actions need neither identity.
+/// validated opaque `ProjectId`. Section requires both a Project and a Section.
+/// Global actions need neither identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryExecutionContext {
     session_id: Option<String>,
     project_id: Option<ProjectId>,
+    section_id: Option<SectionId>,
 }
 
 #[derive(Deserialize)]
@@ -23,6 +25,7 @@ pub struct MemoryExecutionContext {
 struct HostCallContext {
     session_id: Option<String>,
     project_id: Option<String>,
+    section_id: Option<String>,
 }
 
 impl MemoryExecutionContext {
@@ -40,11 +43,28 @@ impl MemoryExecutionContext {
     }
 
     pub fn with_project_id(mut self, project_id: impl Into<String>) -> Result<Self, MemoryError> {
-        self.project_id = Some(ProjectId::parse(project_id).map_err(|error| {
+        let project_id = ProjectId::parse(project_id).map_err(|error| {
             MemoryError::InvalidArguments(format!(
                 "project_id must be a 1-64 character opaque identifier containing only ASCII alphanumeric, '-' or '_': {error}"
             ))
-        })?);
+        })?;
+        if self.project_id.as_ref() != Some(&project_id) {
+            self.section_id = None;
+        }
+        self.project_id = Some(project_id);
+        Ok(self)
+    }
+
+    pub fn with_section_id(mut self, section_id: impl Into<String>) -> Result<Self, MemoryError> {
+        if self.project_id.is_none() {
+            return Err(MemoryError::InvalidArguments(
+                "host section_id requires a project_id in the same context".to_string(),
+            ));
+        }
+        self.section_id = Some(
+            SectionId::parse(section_id)
+                .map_err(|error| MemoryError::InvalidArguments(error.to_string()))?,
+        );
         Ok(self)
     }
 
@@ -56,6 +76,11 @@ impl MemoryExecutionContext {
     #[must_use]
     pub fn project_id(&self) -> Option<&ProjectId> {
         self.project_id.as_ref()
+    }
+
+    #[must_use]
+    pub fn section_id(&self) -> Option<&SectionId> {
+        self.section_id.as_ref()
     }
 
     pub(crate) fn require_session_id(&self) -> Result<&str, MemoryError> {
@@ -91,6 +116,9 @@ impl MemoryExecutionContext {
         }
         if let Some(project_id) = context.project_id {
             resolved = resolved.with_project_id(project_id)?;
+        }
+        if let Some(section_id) = context.section_id {
+            resolved = resolved.with_section_id(section_id)?;
         }
         Ok(resolved)
     }
@@ -133,6 +161,7 @@ impl MemoryExecutionContext {
 pub enum MemoryError {
     InvalidArguments(String),
     Execution(String),
+    SectionContextUnavailable,
 }
 
 impl fmt::Display for MemoryError {
@@ -140,6 +169,9 @@ impl fmt::Display for MemoryError {
         match self {
             Self::InvalidArguments(message) => write!(formatter, "Invalid memory args: {message}"),
             Self::Execution(message) => formatter.write_str(message),
+            Self::SectionContextUnavailable => formatter.write_str(
+                "Section memory requires a host-authorized Project and Section. Continue using Project or Global for facts of those scopes. Keep Section-only context in Session notes when available.",
+            ),
         }
     }
 }

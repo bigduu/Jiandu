@@ -10,16 +10,15 @@ local files.
 
 [Releases](https://github.com/bigduu/Jiandu/releases/latest) · Part of [Bodhi](https://github.com/bigduu/Zenith) · [Bodhi desktop app](https://github.com/bigduu/Bodhi-AI/releases/latest) · [MIT](LICENSE)
 
-- **Three scopes:** Project (decisions shared by agents on one project),
-  Session (resume a workstream) and Global (facts useful across projects).
+- **Four scopes.** Session holds workstream continuity, Section holds shared
+  facts within one project section, Project holds project-wide decisions, and
+  Global holds knowledge useful across projects.
 - **One MCP tool, 19 actions:** query, get, write, merge, rebuild, Dream
   orientation snapshots and more, behind a single `memory` tool.
 - **Your data stays in plain files:** one data directory you choose; Jiandu
   never calls a model or a remote service.
-- **Local console + per-call identity (v0.3.0):** `jiandu ui` browses what your
-  agents remember; hosts can pass Project/Session identity per MCP call.
-  Latest release: **v0.3.3** —
-  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3).
+- **Local console and per-call identity.** `jiandu ui` browses memory, and
+  hosts can authorize Project, Section, and Session identity on each MCP call.
 
 <p align="center"><img src="docs/demos/memory-console.gif" alt="Jiandu searches a demo project for a release checklist and opens the saved memory." width="720"></p>
 
@@ -32,28 +31,21 @@ model. No personal memory store was used.
 
 ## Install
 
-Published **v0.3.3**. npm downloads the matching prebuilt GitHub Release
-binary. Homebrew and `cargo install` build from source and need Rust 1.95 or
-newer (Homebrew installs Rust as a build dependency).
+Download a prebuilt archive for macOS universal, Windows x64, or Linux x64.
+Verify its SHA-256 against the accompanying `SHA256SUMS` before extracting it.
+[GitHub releases](https://github.com/bigduu/Jiandu/releases/latest)
+
+`cargo install` builds with Rust 1.95 or newer. The Homebrew formula builds
+from its pinned source tag.
 
 ```sh
-# npm — prebuilt binary (macOS universal, Windows x64, Linux x64)
-npx @bigduu/jiandu --help
-npm i -g @bigduu/jiandu
-
-# Homebrew — builds the published source tag
+# Homebrew
 brew tap bigduu/tap
 brew install bigduu/tap/jiandu
 
-# crates.io 0.3.3 — the installed binary is still named jiandu
-cargo install jiandu-mcp --version 0.3.3 --locked
+# crates.io
+cargo install jiandu-mcp --locked
 ```
-
-The MCP Registry name is `io.github.bigduu/jiandu`. `@bigduu/jiandu` checks the
-release `SHA256SUMS` before saving the binary. macOS Apple Silicon and Intel
-share `jiandu-v0.3.3-universal-apple-darwin.tar.gz`. Windows x64 and Linux x64
-(gnu) have their own archives. Windows ARM64 and Linux ARM64 are not in this
-release; the launcher exits with an error on those machines.
 
 The binary is called `jiandu`. Check it with `jiandu --help`. Installing does not
 start a service or configure any MCP client. Run `which jiandu` for the absolute
@@ -136,9 +128,9 @@ index; the agent should run `rebuild` for that scope and query again.
 
 | Path | Available workflow |
 | --- | --- |
-| [Published v0.3.3](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3) (npm, Homebrew, or crates.io) | Shared memory over stdio MCP, Dream snapshots, Bamboo import, read-only browser console (`jiandu ui`), and per-call host identity (`--session-id` / `--project-id` optional defaults). |
-| `main` (tip of development) | Whatever lands after v0.3.3 — build from source for unreleased work. |
-| crates.io `jiandu-mcp` / `jiandu-memory` `0.3.3` | Current crates.io release. Install the server with `cargo install jiandu-mcp --version 0.3.3 --locked`. |
+| `0.4.0` | Section memory for a host-authorized Project and Section. |
+| `0.3.3` | Shared memory over stdio MCP, Dream snapshots, Bamboo import, read-only console, and per-call Project and Session identity. |
+| `main` | Build from source for changes after the latest release. |
 
 Rust 1.95 or newer is required to build. [2026-10-03 audit](docs/readme-audit.md).
 
@@ -156,13 +148,15 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 ## Memory scopes
 
 - **Session** is temporary continuity for one host-identified agent workstream.
-- **Project** is durable knowledge shared by agents working on the same project.
+- **Section** is durable knowledge shared within one authorized section of a
+  Project. It uses the stable Project and Section IDs.
+- **Project** is durable knowledge shared across the project.
   The MCP host grants each call access with a stable, opaque `project_id`.
 - **Global** is durable knowledge that is genuinely useful across projects.
 
 ## Build from source and generic configuration
 
-For a source build of the current checkout (or the `v0.3.3` tag):
+Build the current checkout from source.
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
@@ -243,23 +237,35 @@ model-generated tool arguments:
 ```json
 {
   "name": "memory",
-  "arguments": {"action":"query","scope":"project","query":"release decision"},
+  "arguments": {"action":"query","scope":"section","query":"release decision"},
   "_meta": {
     "io.github.bigduu.jiandu/context": {
       "project_id": "project-1",
+      "section_id": "section:2d567c47-a081-4a8d-9c9e-246bce470c9f",
       "session_id": "agent-session-1"
     }
   }
 }
 ```
 
-This is the `params` object of a `tools/call` request. The metadata key is a
-Jiandu extension that the host must explicitly support and populate; MCP does
-not automatically provide current Project or Session identity. Project actions
-require a host-authorized `project_id`; `session_*` actions require a host
-`session_id`. Either field can be omitted when the operation does not need it.
-`project_key` in tool arguments can only assert the current host Project and
-cannot grant access. Use a distinct Session id for each independent workstream.
+This is the `params` object of a `tools/call` request. The host supplies the
+authorized `project_id` for Project, both `project_id` and `section_id` for
+Section, and `session_id` for `session_*` actions. `project_key` in tool
+arguments can only assert the current host Project. Use a distinct Session ID
+for each independent workstream.
+
+Send `section_id` only when the connected `memory` tool schema advertises
+`section` and the host has resolved a stable Section in the authorized Project.
+The ID accepts 1–64 lowercase ASCII letters, digits, `-`, `_`, or `:`.
+Renaming a Section preserves its ID and memories. Moving a Session changes its
+authorized Section on subsequent calls, while prior memories stay with their
+original Section. Section records and their derived artifacts live under
+`memory/v1/scopes/sections` in the same Jiandu data directory.
+
+Clients without a Section can keep using the existing scopes. A request for
+Section with missing context receives `section_context_unavailable` and guidance
+to keep Section-only context in Session notes when available. Project and Global
+writes continue to require facts appropriate to their scope.
 
 Host integrators may configure dedicated-process defaults when their client
 cannot supply this metadata. For a process dedicated to one workstream,
@@ -325,9 +331,8 @@ and [Claude Code Skill locations](https://code.claude.com/docs/en/slash-commands
 
 ## Dream orientation
 
-Dream is one compact host-generated orientation snapshot for Global memory and
-each authorized Project. It is derived prose, not canonical truth, and never
-enters topic counts, lifecycle operations, or lexical recall.
+Dream is a compact host-generated orientation snapshot for the selected durable
+scope. It stays separate from topic counts, lifecycle operations, and lexical recall.
 
 First call `dream_read`. It returns a missing cold state or the current snapshot,
 plus the canonical-memory `current_generation` and an advisory `stale` flag. A

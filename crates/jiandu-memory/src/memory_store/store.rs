@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+use crate::SectionId;
+
 use super::access_log::{
     self, ACCESS_LOG_COMPACT_TRIGGER_BYTES, ACCESS_LOG_FILE, AccessLogEntry, AccessStats,
 };
@@ -150,6 +152,8 @@ struct DreamSnapshotFrontmatter {
     scope: MemoryScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    section_id: Option<SectionId>,
     generated_at: String,
     source_generation: String,
 }
@@ -169,7 +173,10 @@ fn validate_source_generation(value: &str) -> io::Result<&str> {
     Ok(value)
 }
 
-fn canonical_scope_generation(docs: &[DurableMemoryDocument]) -> io::Result<String> {
+fn canonical_scope_generation(
+    docs: &[DurableMemoryDocument],
+    section: Option<(&str, &SectionId)>,
+) -> io::Result<String> {
     let mut canonical = docs
         .iter()
         .map(|doc| {
@@ -183,6 +190,13 @@ fn canonical_scope_generation(docs: &[DurableMemoryDocument]) -> io::Result<Stri
 
     let mut digest = Sha256::new();
     digest.update(b"jiandu-canonical-scope-generation-v1\0");
+    if let Some((project_key, section_id)) = section {
+        digest.update(b"section\0");
+        digest.update(project_key.as_bytes());
+        digest.update([0]);
+        digest.update(section_id.as_str().as_bytes());
+        digest.update([0]);
+    }
     for (id, rendered) in canonical {
         digest.update(id.len().to_string().as_bytes());
         digest.update([0]);
@@ -202,6 +216,7 @@ fn render_dream_snapshot(snapshot: &DreamSnapshot) -> io::Result<String> {
     let frontmatter = DreamSnapshotFrontmatter {
         scope: snapshot.scope,
         project_key: snapshot.project_key.clone(),
+        section_id: snapshot.section_id.clone(),
         generated_at: snapshot.generated_at.clone(),
         source_generation: snapshot.source_generation.clone(),
     };
@@ -245,6 +260,7 @@ fn parse_dream_snapshot(raw: &str) -> io::Result<DreamSnapshot> {
     Ok(DreamSnapshot {
         scope: frontmatter.scope,
         project_key: frontmatter.project_key,
+        section_id: frontmatter.section_id,
         generated_at: frontmatter.generated_at,
         source_generation: frontmatter.source_generation,
         content,
@@ -289,6 +305,7 @@ fn merged_source_coverage_fits(
 fn memory_id_candidate(
     scope: MemoryScope,
     project_key: Option<&str>,
+    section_id: Option<&SectionId>,
     title: &str,
     timestamp: &str,
     counter: usize,
@@ -298,6 +315,9 @@ fn memory_id_candidate(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     scope.hash(&mut hasher);
     project_key.hash(&mut hasher);
+    if let Some(section_id) = section_id {
+        section_id.hash(&mut hasher);
+    }
     title.hash(&mut hasher);
     timestamp.hash(&mut hasher);
     counter.hash(&mut hasher);
@@ -375,7 +395,7 @@ struct ScopeWriteGuard {
     _local: OwnedMutexGuard<()>,
 }
 
-/// Filesystem-backed Session and durable Project/Global memory operations.
+/// Filesystem-backed Session and durable Section/Project/Global memory operations.
 ///
 /// Cancellation contract: direct mutator futures are not cancellation
 /// safe and must be driven to completion (or supervised in an equivalent owned
@@ -408,6 +428,20 @@ impl MemoryStore {
         Self {
             resolver: self.resolver.for_project(project_id),
         }
+    }
+
+    /// Bind the Section scope to a host-authorized Project and Section pair.
+    /// Project, Global, and Session paths remain independently scoped.
+    pub fn for_section(&self, project_id: &crate::ProjectId, section_id: &SectionId) -> Self {
+        Self {
+            resolver: self.resolver.for_section(project_id, section_id),
+        }
+    }
+
+    fn section_id_for(&self, scope: MemoryScope) -> Option<&SectionId> {
+        self.resolver
+            .section_id()
+            .filter(|_| scope == MemoryScope::Section)
     }
 
     /// Acquire the process-local mutex and cross-process advisory lock guarding
@@ -728,7 +762,22 @@ impl MemoryStore {
             .resolver
             .indexes_dir(scope, project_key)
             .join(LEXICAL_INDEX_FILE);
-        self.read_optional_json_file(path).await
+        let index: Option<LexicalIndex> = self.read_optional_json_file(path).await?;
+        if let Some(index) = &index {
+            let section_id = self.section_id_for(scope);
+            if index.items.iter().any(|item| {
+                item.section_id.as_ref() != section_id
+                    || (scope == MemoryScope::Section
+                        && (item.scope != scope || item.project_key.as_deref() != project_key))
+                    || (scope != MemoryScope::Section && item.scope == MemoryScope::Section)
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "lexical index does not match its authorized Section scope",
+                ));
+            }
+        }
+        Ok(index)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -824,16 +873,24 @@ impl MemoryStore {
                             scope.as_str()
                         ),
                     )
-                })?
-                .ok_or_else(|| {
-                    io::Error::new(
+                })?;
+            let index = match index {
+                Some(index) => index,
+                None if scope == MemoryScope::Section
+                    && self.count_scope_memories(scope, project_key).await? == 0 =>
+                {
+                    return Ok(MemoryQueryResult::default());
+                }
+                None => {
+                    return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
                             "lexical index is missing; run action=rebuild for scope={}",
                             scope.as_str()
                         ),
-                    )
-                })?;
+                    ));
+                }
+            };
             let filtered_index = LexicalIndex {
                 generated_at: index.generated_at,
                 items: index
@@ -909,6 +966,7 @@ impl MemoryStore {
                     relevance: candidate.score,
                     related_ids,
                     project_key: indexed.project_key.clone(),
+                    section_id: indexed.section_id.clone(),
                 });
             }
             let returned_count = items.len();
@@ -982,6 +1040,7 @@ impl MemoryStore {
                     Vec::new()
                 },
                 project_key: doc.frontmatter.project_key.clone(),
+                section_id: doc.frontmatter.section_id.clone(),
             })
             .collect::<Vec<_>>();
         let returned_count = items.len();
@@ -1118,9 +1177,8 @@ impl MemoryStore {
 
     /// Resolve one memory without crossing Project boundaries.
     ///
-    /// A preferred Project resolves Project first and then Global. Without a
-    /// preferred Project, lookup is Global-only; callers must never receive a
-    /// record from an unrelated Project through an implicit all-Project scan.
+    /// A preferred Project resolves the bound Section (when present), then
+    /// Project, then Global. Without a preferred Project, lookup is Global-only.
     pub async fn get_memory(
         &self,
         id: &str,
@@ -1129,6 +1187,13 @@ impl MemoryStore {
         let id = validate_memory_id(id)?;
 
         if let Some(project_key) = preferred_project_key {
+            if self.resolver.section_id().is_some()
+                && let Some(doc) = self
+                    .get_memory_at_locator(MemoryScope::Section, Some(project_key), id)
+                    .await?
+            {
+                return Ok(Some(doc));
+            }
             if let Some(doc) = self
                 .get_memory_at_locator(MemoryScope::Project, Some(project_key), id)
                 .await?
@@ -1367,7 +1432,7 @@ impl MemoryStore {
         let id = self.allocate_memory_id(scope, project_key, title).await?;
         let now = now_rfc3339();
         let project_key_owned = match scope {
-            MemoryScope::Project => Some(project_key.unwrap_or("unknown").to_string()),
+            MemoryScope::Project | MemoryScope::Section => project_key.map(ToString::to_string),
             _ => None,
         };
         let frontmatter = DurableMemoryFrontmatter {
@@ -1376,6 +1441,7 @@ impl MemoryStore {
             r#type,
             scope,
             project_key: project_key_owned,
+            section_id: self.section_id_for(scope).cloned(),
             granularity,
             status: DurableMemoryStatus::Active,
             freshness: Some("high".to_string()),
@@ -1443,9 +1509,35 @@ impl MemoryStore {
         reason: Option<&str>,
     ) -> io::Result<Option<DurableMemoryDocument>> {
         let id = validate_memory_id(id)?;
-        let Some(mut doc) = self.get_memory(id, preferred_project_key).await? else {
+        let Some(doc) = self.get_memory(id, preferred_project_key).await? else {
             return Ok(None);
         };
+        self.archive_resolved_memory(doc, mode, reason).await
+    }
+
+    /// Change the status of one record in the bound Section.
+    pub async fn archive_section_memory(
+        &self,
+        id: &str,
+        mode: DurableMemoryStatus,
+        reason: Option<&str>,
+    ) -> io::Result<Option<DurableMemoryDocument>> {
+        let Some(doc) = self
+            .get_memory_at_locator(MemoryScope::Section, None, id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.archive_resolved_memory(doc, mode, reason).await
+    }
+
+    async fn archive_resolved_memory(
+        &self,
+        mut doc: DurableMemoryDocument,
+        mode: DurableMemoryStatus,
+        reason: Option<&str>,
+    ) -> io::Result<Option<DurableMemoryDocument>> {
+        let id = doc.frontmatter.id.as_str();
         #[cfg(test)]
         pause_after_initial_resolution_for_test(id).await;
         let _guard = self
@@ -1592,7 +1684,7 @@ impl MemoryStore {
             let new_id = self.allocate_memory_id(scope, project_key, title).await?;
             let now = now_rfc3339();
             let project_key_field = match scope {
-                MemoryScope::Project => Some(project_key.unwrap_or("unknown").to_string()),
+                MemoryScope::Project | MemoryScope::Section => project_key.map(ToString::to_string),
                 _ => None,
             };
             let frontmatter = DurableMemoryFrontmatter {
@@ -1601,6 +1693,7 @@ impl MemoryStore {
                 r#type,
                 scope,
                 project_key: project_key_field,
+                section_id: self.section_id_for(scope).cloned(),
                 granularity: source_granularity,
                 status: DurableMemoryStatus::Active,
                 freshness: Some("high".to_string()),
@@ -2062,7 +2155,7 @@ impl MemoryStore {
         let new_id = self.allocate_memory_id(scope, project_key, title).await?;
         let now = now_rfc3339();
         let project_key_field = match scope {
-            MemoryScope::Project => Some(project_key.unwrap_or("unknown").to_string()),
+            MemoryScope::Project | MemoryScope::Section => project_key.map(ToString::to_string),
             _ => None,
         };
         // Union the provenance of every source so the consolidated memory keeps the
@@ -2089,6 +2182,7 @@ impl MemoryStore {
             r#type,
             scope,
             project_key: project_key_field,
+            section_id: self.section_id_for(scope).cloned(),
             granularity,
             status: DurableMemoryStatus::Active,
             freshness: Some("high".to_string()),
@@ -2602,7 +2696,10 @@ impl MemoryStore {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if self.count_scope_memories(scope, project_key).await? == 0 {
-                    return canonical_scope_generation(&[]);
+                    return canonical_scope_generation(
+                        &[],
+                        project_key.zip(self.section_id_for(scope)),
+                    );
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -2655,7 +2752,7 @@ impl MemoryStore {
         let snapshot = parse_dream_snapshot(&fs::read_to_string(path).await?)?;
         if snapshot.scope != scope
             || snapshot.project_key.as_deref() != project_key
-            || (scope == MemoryScope::Global && snapshot.project_key.is_some())
+            || snapshot.section_id.as_ref() != self.section_id_for(scope)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2702,7 +2799,8 @@ impl MemoryStore {
 
         let _guard = self.acquire_scope_write_guard(scope, project_key).await?;
         let docs = self.list_memory_documents(scope, project_key).await?;
-        let current_generation = canonical_scope_generation(&docs)?;
+        let current_generation =
+            canonical_scope_generation(&docs, project_key.zip(self.section_id_for(scope)))?;
         if source_generation != current_generation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2716,6 +2814,7 @@ impl MemoryStore {
         let snapshot = DreamSnapshot {
             scope,
             project_key: project_key.map(ToString::to_string),
+            section_id: self.section_id_for(scope).cloned(),
             generated_at: now_rfc3339(),
             source_generation,
             content: content.to_string(),
@@ -2850,6 +2949,19 @@ impl MemoryStore {
                 }
                 let raw = fs::read_to_string(&path).await?;
                 let (mut frontmatter, body) = parse_markdown_document(&raw)?;
+                if frontmatter.section_id.as_ref() != self.section_id_for(scope)
+                    || (scope == MemoryScope::Section
+                        && (frontmatter.scope != scope
+                            || frontmatter.project_key.as_deref() != project_key
+                            || path.file_stem().and_then(|id| id.to_str())
+                                != Some(frontmatter.id.as_str())))
+                    || (scope != MemoryScope::Section && frontmatter.scope == MemoryScope::Section)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "memory frontmatter does not match its authorized Section scope",
+                    ));
+                }
                 if !seen.insert(frontmatter.id.clone()) {
                     continue;
                 }
@@ -3275,7 +3387,7 @@ impl MemoryStore {
         let id = validate_memory_id(id)?;
         let project_key = self.require_project_key(scope, project_key)?;
         let expected_project_key = match scope {
-            MemoryScope::Project => project_key,
+            MemoryScope::Project | MemoryScope::Section => project_key,
             MemoryScope::Global | MemoryScope::Session => None,
         };
         for root in self.resolver.scope_read_roots(scope, project_key) {
@@ -3288,11 +3400,12 @@ impl MemoryStore {
             if frontmatter.id != id
                 || frontmatter.scope != scope
                 || frontmatter.project_key.as_deref() != expected_project_key
+                || frontmatter.section_id.as_ref() != self.section_id_for(scope)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "memory '{}' frontmatter id/scope/project does not match its canonical locator",
+                        "memory '{}' frontmatter id/scope/project/section does not match its canonical locator",
                         frontmatter.id
                     ),
                 ));
@@ -3325,7 +3438,14 @@ impl MemoryStore {
     ) -> io::Result<String> {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
         for counter in 0..1000 {
-            let id = memory_id_candidate(scope, project_key, title, &timestamp, counter);
+            let id = memory_id_candidate(
+                scope,
+                project_key,
+                self.section_id_for(scope),
+                title,
+                &timestamp,
+                counter,
+            );
             let path = self.resolver.topic_path(scope, project_key, &id)?;
             if !path.exists() {
                 return Ok(id);
@@ -3367,6 +3487,7 @@ impl MemoryStore {
                     title: doc.frontmatter.title.clone(),
                     scope: doc.frontmatter.scope,
                     project_key: doc.frontmatter.project_key.clone(),
+                    section_id: doc.frontmatter.section_id.clone(),
                     r#type: doc.frontmatter.r#type,
                     status: doc.frontmatter.status,
                     tags: doc.frontmatter.tags.clone(),
@@ -3489,7 +3610,10 @@ impl MemoryStore {
         artifacts.push((
             self.resolver.scope_generation_path(scope, project_key),
             json_pretty_bytes(&ScopeGeneration {
-                generation: canonical_scope_generation(&docs)?,
+                generation: canonical_scope_generation(
+                    &docs,
+                    project_key.zip(self.section_id_for(scope)),
+                )?,
                 topic_count: docs.len(),
             })?,
         ));
@@ -3555,12 +3679,31 @@ impl MemoryStore {
     }
 
     fn require_project_key<'a>(
-        &self,
+        &'a self,
         scope: MemoryScope,
         project_key: Option<&'a str>,
     ) -> io::Result<Option<&'a str>> {
         match scope {
             MemoryScope::Global => Ok(None),
+            MemoryScope::Section => {
+                let project = self
+                    .resolver
+                    .project_id()
+                    .filter(|_| self.resolver.section_id().is_some())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "section scope requires a store bound to a Project and Section",
+                        )
+                    })?;
+                if project_key.is_some_and(|requested| requested != project.as_str()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Section-scoped memory store received a different Project id",
+                    ));
+                }
+                Ok(Some(project.as_str()))
+            }
             MemoryScope::Project => project_key
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -3851,10 +3994,11 @@ tags: ['null', '001', 中文]\n\
             body,
             path: PathBuf::from("synthetic-memory.md"),
         }];
-        let generation = canonical_scope_generation(&documents).unwrap();
+        let generation = canonical_scope_generation(&documents, None).unwrap();
         let dream = DreamSnapshot {
             scope: MemoryScope::Project,
             project_key: Some("project-yaml".to_string()),
+            section_id: None,
             generated_at: "2026-10-12T00:00:00Z".to_string(),
             source_generation: generation.clone(),
             content: "# Dream\n\n保留正文: on / null / 001。".to_string(),
@@ -5369,14 +5513,40 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
     }
 
     #[test]
-    fn same_second_same_title_ids_differ_across_global_and_projects() {
+    fn same_second_same_title_ids_differ_across_durable_scopes() {
         let timestamp = "20260830_123456";
         let title = "Same title in three canonical scopes";
-        let global = memory_id_candidate(MemoryScope::Global, None, title, timestamp, 0);
-        let project_a =
-            memory_id_candidate(MemoryScope::Project, Some("project_a"), title, timestamp, 0);
-        let project_b =
-            memory_id_candidate(MemoryScope::Project, Some("project_b"), title, timestamp, 0);
+        let global = memory_id_candidate(MemoryScope::Global, None, None, title, timestamp, 0);
+        let project_a = memory_id_candidate(
+            MemoryScope::Project,
+            Some("project_a"),
+            None,
+            title,
+            timestamp,
+            0,
+        );
+        let project_b = memory_id_candidate(
+            MemoryScope::Project,
+            Some("project_b"),
+            None,
+            title,
+            timestamp,
+            0,
+        );
+        let section_a = SectionId::parse("section-a").unwrap();
+        let section_b = SectionId::parse("section-b").unwrap();
+        let section_id = |section| {
+            memory_id_candidate(
+                MemoryScope::Section,
+                Some("project_a"),
+                Some(section),
+                title,
+                timestamp,
+                0,
+            )
+        };
+        assert_ne!(section_id(&section_a), section_id(&section_b));
+        assert_ne!(project_a, section_id(&section_a));
 
         assert_ne!(global, project_a);
         assert_ne!(global, project_b);
@@ -7557,6 +7727,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
                         title: format!("Live shaped memory {index}"),
                         scope: MemoryScope::Project,
                         project_key: Some(project_key.clone()),
+                        section_id: None,
                         r#type: DurableMemoryType::Project,
                         status: DurableMemoryStatus::Active,
                         tags: vec!["benchmark".to_string()],

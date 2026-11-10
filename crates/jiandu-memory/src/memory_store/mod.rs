@@ -528,6 +528,8 @@ pub struct LexicalIndexItem {
     pub title: String,
     pub scope: MemoryScope,
     pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<crate::SectionId>,
     pub r#type: DurableMemoryType,
     pub status: DurableMemoryStatus,
     pub tags: Vec<String>,
@@ -732,6 +734,7 @@ pub fn build_memory_markdown_view(
             "# Jiandu Memory Index (Project: {})",
             project_key.unwrap_or("unknown")
         ),
+        MemoryScope::Section => "# Jiandu Memory Index (Section)".to_string(),
         MemoryScope::Session => "# Jiandu Memory Index (Session)".to_string(),
     };
     let mut out = String::new();

@@ -95,8 +95,8 @@ pub enum MemoryArgs {
         #[serde(default)]
         options: Option<MemoryActionOptions>,
     },
-    /// Read lower-trust host-generated orientation for Global or the
-    /// host-authorized Project. A missing snapshot is a normal cold state; use
+    /// Read lower-trust host-generated orientation for Global or an authorized
+    /// Project or Section. A missing snapshot is a normal cold state; use
     /// query/get and live tools for factual decisions.
     DreamRead {
         #[schemars(with = "DurableScopeSchema")]
@@ -467,6 +467,7 @@ pub struct SplitPiece {
 enum DurableScopeSchema {
     Project,
     Global,
+    Section,
 }
 
 #[allow(dead_code)]

@@ -1,7 +1,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::ProjectId;
+use sha2::{Digest, Sha256};
+
+use crate::{ProjectId, SectionId};
 
 use super::{DREAM_VIEW_FILE, SCOPE_GENERATION_FILE, types::MemoryScope, validate_memory_id};
 
@@ -11,6 +13,7 @@ pub const SESSIONS_DIR: &str = "sessions";
 pub const SCOPES_DIR: &str = "scopes";
 pub const GLOBAL_DIR: &str = "global";
 pub const PROJECTS_DIR: &str = "projects";
+const SECTIONS_DIR: &str = "sections";
 pub const NOTE_DIR: &str = "note";
 pub const STATE_DIR: &str = "state";
 pub const INDEXES_DIR: &str = "indexes";
@@ -24,6 +27,7 @@ pub struct MemoryPathResolver {
     data_dir: PathBuf,
     root: PathBuf,
     project_id: Option<ProjectId>,
+    section: Option<(SectionId, PathBuf)>,
 }
 
 /// Explicit first-class Project memory layout.
@@ -61,6 +65,7 @@ impl MemoryPathResolver {
             data_dir,
             root,
             project_id: None,
+            section: None,
         }
     }
 
@@ -71,6 +76,7 @@ impl MemoryPathResolver {
             data_dir,
             root,
             project_id: None,
+            section: None,
         }
     }
 
@@ -82,11 +88,36 @@ impl MemoryPathResolver {
             data_dir: self.data_dir.clone(),
             root: self.root.clone(),
             project_id: Some(project_id.clone()),
+            section: None,
         }
+    }
+
+    pub fn for_section(&self, project_id: &ProjectId, section_id: &SectionId) -> Self {
+        let mut resolver = self.for_project(project_id);
+        // Project IDs are case-sensitive. A stable digest preserves that
+        // distinction on case-insensitive filesystems and avoids device names.
+        let project_dir = format!("{:x}", Sha256::digest(project_id.as_str()));
+        // Escape ':' for Windows paths. '%' is excluded from a valid Section ID.
+        let section_dir = format!("section-{}", section_id.as_str().replace(':', "%3a"));
+        let root = self
+            .scopes_root()
+            .join(SECTIONS_DIR)
+            .join(project_dir)
+            .join(section_dir);
+        resolver.section = Some((section_id.clone(), root));
+        resolver
     }
 
     pub fn project_id(&self) -> Option<&ProjectId> {
         self.project_id.as_ref()
+    }
+
+    pub fn section_id(&self) -> Option<&SectionId> {
+        self.section.as_ref().map(|(id, _)| id)
+    }
+
+    pub fn section_root(&self) -> Option<&Path> {
+        self.section.as_ref().map(|(_, root)| root.as_path())
     }
 
     pub fn project_read_roots(&self, project_key: &str) -> Vec<PathBuf> {
@@ -149,11 +180,16 @@ impl MemoryPathResolver {
         self.scopes_root().join(PROJECTS_DIR).join(project_key)
     }
 
+    /// Section paths require a resolver bound with [`Self::for_section`].
     pub fn scope_root(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
         match scope {
             MemoryScope::Global => self.global_root(),
             MemoryScope::Project => self.project_root(project_key.unwrap_or("unknown")),
             MemoryScope::Session => self.sessions_root(),
+            MemoryScope::Section => self
+                .section_root()
+                .expect("unbound Section resolver")
+                .to_path_buf(),
         }
     }
 
@@ -170,13 +206,7 @@ impl MemoryPathResolver {
     }
 
     pub fn topic_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
-        match scope {
-            MemoryScope::Global => self.global_root().join(TOPICS_DIR),
-            MemoryScope::Project => self
-                .project_root(project_key.unwrap_or("unknown"))
-                .join(TOPICS_DIR),
-            MemoryScope::Session => self.sessions_root(),
-        }
+        self.scope_dir(scope, project_key, TOPICS_DIR)
     }
 
     pub fn topic_path(
@@ -186,48 +216,39 @@ impl MemoryPathResolver {
         memory_id: &str,
     ) -> io::Result<PathBuf> {
         let memory_id = validate_memory_id(memory_id)?;
+        if scope == MemoryScope::Section && self.section_id().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unbound Section resolver",
+            ));
+        }
         Ok(self
             .topic_dir(scope, project_key)
             .join(format!("{}.md", memory_id)))
     }
 
     pub fn indexes_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
-        match scope {
-            MemoryScope::Global => self.global_root().join(INDEXES_DIR),
-            MemoryScope::Project => self
-                .project_root(project_key.unwrap_or("unknown"))
-                .join(INDEXES_DIR),
-            MemoryScope::Session => self.sessions_root(),
-        }
+        self.scope_dir(scope, project_key, INDEXES_DIR)
     }
 
     pub fn views_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
-        match scope {
-            MemoryScope::Global => self.global_root().join(VIEWS_DIR),
-            MemoryScope::Project => self
-                .project_root(project_key.unwrap_or("unknown"))
-                .join(VIEWS_DIR),
-            MemoryScope::Session => self.sessions_root(),
-        }
+        self.scope_dir(scope, project_key, VIEWS_DIR)
     }
 
     pub fn logs_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
-        match scope {
-            MemoryScope::Global => self.global_root().join(LOGS_DIR),
-            MemoryScope::Project => self
-                .project_root(project_key.unwrap_or("unknown"))
-                .join(LOGS_DIR),
-            MemoryScope::Session => self.sessions_root(),
-        }
+        self.scope_dir(scope, project_key, LOGS_DIR)
     }
 
     pub fn state_dir(&self, scope: MemoryScope, project_key: Option<&str>) -> PathBuf {
-        match scope {
-            MemoryScope::Global => self.global_root().join(STATE_DIR),
-            MemoryScope::Project => self
-                .project_root(project_key.unwrap_or("unknown"))
-                .join(STATE_DIR),
-            MemoryScope::Session => self.sessions_root(),
+        self.scope_dir(scope, project_key, STATE_DIR)
+    }
+
+    fn scope_dir(&self, scope: MemoryScope, project_key: Option<&str>, name: &str) -> PathBuf {
+        let root = self.scope_root(scope, project_key);
+        if scope == MemoryScope::Session {
+            root
+        } else {
+            root.join(name)
         }
     }
 

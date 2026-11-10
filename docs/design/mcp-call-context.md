@@ -87,8 +87,23 @@ back to the server, so one call cannot grant authority to a later call.
 | --- | --- | --- |
 | Global durable actions | None | Operate normally; Session provenance is optional |
 | Project durable actions | Host-authorized `project_id` | Reject only this operation |
+| Section durable actions | Host-authorized `project_id` and `section_id` | Return `section_context_unavailable` with scope guidance |
 | `session_*` actions | Host-provided `session_id` | Reject only this operation |
-| Id-based durable actions | Optional current Project plus Global | Search only the current authorized Project and Global |
+| Durable actions that infer scope from an ID | Optional current Section and Project plus Global | Search the authorized Section, Project, and Global in that order |
+
+The Section extension uses the same per-call metadata. Hosts send a stable
+`section_id` only after verifying that the connected tool schema advertises
+`section`. A host supplies the Section from its own authoritative Project
+assignment. Section names and model-generated arguments carry no authority.
+When a session's assignment changes, the host supplies the new Section on the
+next call. Accepted calls retain the context captured at dispatch.
+
+Jiandu uses the pair of Project and Section IDs for a separate scope within
+the same data root. Existing clients can omit `section_id` and keep their
+current Global, Project, and Session behavior. The tool description and
+portable Skill explain the available scopes. An explicit Section request
+without context gets a targeted error, while normal calls complete without
+extra notices. Keep Section-only facts in Session notes when available.
 
 The existing `project_key` argument remains an assertion against the current
 host context. It cannot select or grant an unauthorized Project. Model-supplied

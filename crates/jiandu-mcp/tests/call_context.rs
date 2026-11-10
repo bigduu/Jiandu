@@ -416,3 +416,196 @@ fn model_arguments_cannot_supply_host_identity_and_unrelated_metadata_is_ignored
     );
     success(client.receive(id));
 }
+
+#[test]
+fn section_context_switches_without_moving_or_sharing_memory() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut client = StdioClient::start(directory.path(), &[]);
+    let project = json!({"project_id":"project-a","session_id":"root"});
+    let a = json!({"project_id":"project-a","section_id":"section:alpha","session_id":"root"});
+    let b = json!({"project_id":"project-a","section_id":"section:beta","session_id":"root"});
+    let other_project = json!({"project_id":"Project-A","section_id":"section:alpha"});
+    let query = json!({"action":"query","scope":"section","query":"sharedneedle"});
+    let empty = success(client.call(query.clone(), Some(a.clone())));
+    assert_eq!(empty["data"]["items"], json!([]));
+    assert!(!directory.path().join("memory").exists());
+
+    let broad = success(client.call(
+        write("project", "Project fact", "sharedneedle"),
+        Some(project.clone()),
+    ));
+    let a_write = client.submit_memory(
+        write("section", "Section fact", "sharedneedle"),
+        Some(host_metadata(a.clone())),
+    );
+    let b_write = client.submit_memory(
+        write("section", "Section fact", "sharedneedle"),
+        Some(host_metadata(b.clone())),
+    );
+    let a_write = success(client.receive(a_write));
+    let b_write = success(client.receive(b_write));
+    let other_write = success(client.call(
+        write("section", "Section fact", "sharedneedle"),
+        Some(other_project.clone()),
+    ));
+    let a_id = &a_write["memory"]["id"];
+    assert_eq!(a_write["memory"]["section_id"], "section:alpha");
+    assert_ne!(*a_id, b_write["memory"]["id"]);
+    assert_ne!(*a_id, other_write["memory"]["id"]);
+
+    for (context, written) in [
+        (a.clone(), &a_write),
+        (b.clone(), &b_write),
+        (other_project.clone(), &other_write),
+    ] {
+        let recalled = success(client.call(query.clone(), Some(context.clone())));
+        assert_eq!(recalled["data"]["returned_count"], 1);
+        let hit = &recalled["data"]["items"][0];
+        assert_eq!(hit["id"], written["memory"]["id"]);
+        assert_eq!(hit["scope"], "section");
+        assert_eq!(hit["project_key"], context["project_id"]);
+        assert_eq!(hit["section_id"], context["section_id"]);
+    }
+    let recalled = success(client.call(
+        json!({"action":"query","scope":"project","query":"sharedneedle"}),
+        Some(a.clone()),
+    ));
+    assert_eq!(recalled["data"]["returned_count"], 1);
+    assert_eq!(recalled["data"]["items"][0]["id"], broad["memory"]["id"]);
+
+    for context in [Some(b), Some(other_project), Some(project), None] {
+        error(
+            client.call(json!({"action":"get","id":a_id}), context),
+            "memory not found",
+        );
+    }
+    drop(client);
+    let mut restarted = StdioClient::start(directory.path(), &[]);
+    let fetched = success(restarted.call(json!({"action":"get","id":a_id}), Some(a)));
+    assert_eq!(
+        fetched["memory"]["frontmatter"]["section_id"],
+        "section:alpha"
+    );
+    assert_eq!(fetched["memory"]["body"], "sharedneedle");
+}
+
+#[test]
+fn section_hint_is_nonblocking_for_existing_stdio_clients() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut client = StdioClient::start(
+        directory.path(),
+        &["--project-id", "project-a", "--session-id", "root"],
+    );
+    let tools = client.submit("tools/list", json!({}));
+    let tools = client.receive(tools);
+    assert!(
+        tools["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Section memory is optional")
+    );
+
+    let unavailable = client.call(write("section", "Fact", "sectiononly"), None);
+    assert_eq!(
+        unavailable["structuredContent"]["code"],
+        "section_context_unavailable"
+    );
+    error(unavailable, "Keep Section-only context in Session notes");
+    assert!(!directory.path().join("memory").exists());
+    error(
+        client.call(
+            json!({"action":"inspect","scope":"section","section_id":"section:forged"}),
+            None,
+        ),
+        "unknown field",
+    );
+    error(
+        client.call(
+            json!({"action":"inspect","scope":"section"}),
+            Some(json!({"section_id":"section:alpha"})),
+        ),
+        "requires a project_id in the same context",
+    );
+    error(
+        client.call(
+            json!({"action":"inspect","scope":"section"}),
+            Some(json!({"project_id":"project-a","section_id":"../escape"})),
+        ),
+        "section_id must contain",
+    );
+
+    success(client.call(write("global", "Global fact", "globalneedle"), None));
+    let project = success(client.call(write("project", "Project fact", "projectneedle"), None));
+    assert!(project["memory"].get("section_id").is_none());
+    let recalled = success(client.call(
+        json!({"action":"query","scope":"project","query":"projectneedle"}),
+        None,
+    ));
+    assert_eq!(recalled["warnings"], json!([]));
+    assert_eq!(recalled["data"]["items"][0]["id"], project["memory"]["id"]);
+    success(client.call(
+        json!({"action":"session_append","content":"still works"}),
+        None,
+    ));
+    let notes = success(client.call(json!({"action":"session_read"}), None));
+    assert_eq!(notes["content"], "still works");
+}
+
+#[test]
+fn section_mutations_and_dream_generation_stay_in_the_authorized_scope() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut client = StdioClient::start(directory.path(), &[]);
+    let a = json!({"project_id":"project-a","section_id":"section:alpha"});
+    let b = json!({"project_id":"project-a","section_id":"section:beta"});
+    let cold = success(client.call(
+        json!({"action":"dream_read","scope":"section"}),
+        Some(a.clone()),
+    ));
+    let publish = json!({
+        "action":"dream_publish","scope":"section",
+        "source_generation":cold["current_generation"],"content":"Orientation for A."
+    });
+    error(
+        client.call(publish.clone(), Some(b.clone())),
+        "stale Dream source_generation",
+    );
+    success(client.call(publish, Some(a.clone())));
+
+    let global = success(client.call(write("global", "Global fact", "globalneedle"), None));
+    let section = success(client.call(
+        write("section", "Section fact", "sectionneedle"),
+        Some(a.clone()),
+    ));
+    let section_id = &section["memory"]["id"];
+    error(
+        client.call(
+            json!({"action":"purge","scope":"project","id":section_id}),
+            Some(a.clone()),
+        ),
+        "memory not found",
+    );
+    error(
+        client.call(
+            json!({"action":"purge","scope":"section","id":global["memory"]["id"]}),
+            Some(a.clone()),
+        ),
+        "memory not found",
+    );
+    let merge = json!({"action":"merge","id":section_id,"content":"Confirmed update"});
+    error(client.call(merge.clone(), Some(b)), "memory not found");
+    success(client.call(merge, Some(a.clone())));
+    success(client.call(
+        json!({"action":"purge","scope":"section","id":section_id}),
+        Some(a.clone()),
+    ));
+    let fetched = success(client.call(json!({"action":"get","id":section_id}), Some(a)));
+    assert_eq!(fetched["memory"]["frontmatter"]["status"], "archived");
+    assert!(
+        fetched["memory"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Confirmed update")
+    );
+    let fetched = success(client.call(json!({"action":"get","id":global["memory"]["id"]}), None));
+    assert_eq!(fetched["memory"]["frontmatter"]["status"], "active");
+}

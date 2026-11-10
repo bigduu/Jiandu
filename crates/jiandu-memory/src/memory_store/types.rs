@@ -3,12 +3,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::SectionId;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
     Session,
     Project,
     Global,
+    Section,
 }
 
 impl MemoryScope {
@@ -17,6 +20,7 @@ impl MemoryScope {
             Self::Session => "session",
             Self::Project => "project",
             Self::Global => "global",
+            Self::Section => "section",
         }
     }
 }
@@ -254,6 +258,8 @@ pub struct DurableMemoryFrontmatter {
     pub scope: MemoryScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<SectionId>,
     /// Optional temporal granularity (day/week/month/quarter/year). Orthogonal to
     /// `scope`; omitted values deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +300,8 @@ pub struct DreamSnapshot {
     pub scope: MemoryScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<SectionId>,
     pub generated_at: String,
     pub source_generation: String,
     pub content: String,
@@ -371,6 +379,8 @@ pub struct MemoryQueryItem {
     pub related_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<SectionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -379,7 +389,7 @@ pub struct MemoryQueryCursor {
     pub offset: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MemoryQueryResult {
     pub items: Vec<MemoryQueryItem>,
     pub returned_count: usize,

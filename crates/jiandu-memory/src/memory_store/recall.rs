@@ -244,6 +244,7 @@ mod tests {
             title: title.to_string(),
             scope: MemoryScope::Project,
             project_key: Some("proj-1".to_string()),
+            section_id: None,
             r#type: DurableMemoryType::Project,
             status,
             tags: Vec::new(),
