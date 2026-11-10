@@ -67,7 +67,7 @@ jobs:
       matrix:
         include:
           - platform: macos
-            runner: macos-14
+            runner: macos-15
             target: universal-apple-darwin
             binary: target/universal/jiandu
           - platform: windows
