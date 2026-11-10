@@ -8,14 +8,12 @@
 
 [下载](https://github.com/bigduu/Jiandu/releases/latest) · [Bodhi](https://github.com/bigduu/Zenith) 组件之一 · [Bodhi 桌面版](https://github.com/bigduu/Bodhi-AI/releases/latest) · [MIT 开源](LICENSE)
 
-- **三层记忆**：项目（同一项目里多个 agent 共享的决定）、会话（接着上次的活继续干）、全局
-  （跨项目都有用的事实）。
+- **四个记忆范围。** 会话保留工作进度，分区保存项目内同一分区共享的事实，项目保存项目级决定，
+  全局保存跨项目适用的知识。
 - **一个 MCP 工具、19 种操作**：查询、读取、写入、合并、重建索引、Dream 概览快照等，都通过
   同一个 `memory` 工具完成。
 - **数据就是普通文件**：存放在你指定的一个数据目录里；简牍从不调用模型或远程服务。
-- **本地控制台 + 逐次调用身份（v0.3.0）：** `jiandu ui` 可浏览 agent 记住了什么；宿主可在每次
-  MCP 调用中传入项目/会话身份。最新发布版：**v0.3.3** —
-  [Releases](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3)。
+- **本地控制台和逐次调用身份。** `jiandu ui` 可浏览记忆，宿主可在每次 MCP 调用时授权项目、分区和会话身份。
 
 <p align="center"><img src="docs/demos/memory-console.gif" alt="简牍在演示项目中搜索发布清单并打开保存的记忆。" width="720"></p>
 
@@ -27,26 +25,19 @@ stdio MCP 写入了一条明确标注的演示记忆。浏览器只是搜索并�
 
 ## 安装
 
-已发布的 **v0.3.3**。npm 会下载 GitHub Release 里对应平台的预编译二进制。Homebrew 和
-`cargo install` 从源码构建，需要 Rust 1.95 或更新版本（Homebrew 会自动安装 Rust 作为构建依赖）。
+可以下载 macOS 通用版、Windows x64 或 Linux x64 的预编译压缩包。解压前用发布附带的 `SHA256SUMS`
+核对 SHA-256。 [GitHub Releases](https://github.com/bigduu/Jiandu/releases/latest)
+
+`cargo install` 从源码构建，需要 Rust 1.95 或更新版本。Homebrew 公式使用自己锁定的源码标签。
 
 ```sh
-# npm — 预编译二进制（macOS 通用、Windows x64、Linux x64）
-npx @bigduu/jiandu --help
-npm i -g @bigduu/jiandu
-
-# Homebrew — 编译已发布的源码 tag
+# Homebrew
 brew tap bigduu/tap
 brew install bigduu/tap/jiandu
 
-# crates.io 0.3.3 — 安装出的可执行文件名仍是 jiandu
-cargo install jiandu-mcp --version 0.3.3 --locked
+# crates.io
+cargo install jiandu-mcp --locked
 ```
-
-MCP Registry 名称是 `io.github.bigduu/jiandu`。`@bigduu/jiandu` 在写入二进制前会核对 Release 的
-`SHA256SUMS`。macOS Apple Silicon 和 Intel 共用 `jiandu-v0.3.3-universal-apple-darwin.tar.gz`。
-Windows x64 和 Linux x64（gnu）各有自己的压缩包。这个 Release 没有 Windows ARM64 和 Linux ARM64；
-在这些机器上启动器会直接报错退出。
 
 可执行文件名是 `jiandu`，可以用 `jiandu --help` 检查。安装不会启动任何服务，也不会配置任何 MCP
 客户端。用 `which jiandu` 查看绝对路径（Homebrew 在 Apple Silicon 上通常是
@@ -121,9 +112,9 @@ agent 里问*“我们什么时候发版？”*。全新的数据目录第一次
 
 | 途径 | 可用的功能 |
 | --- | --- |
-| [已发布的 v0.3.3](https://github.com/bigduu/Jiandu/releases/tag/v0.3.3)（npm、Homebrew 或 crates.io） | 基于 stdio MCP 的共享记忆、Dream 快照、Bamboo 导入、只读浏览器控制台（`jiandu ui`），以及逐次调用宿主身份（`--session-id` / `--project-id` 为可选默认值）。 |
-| `main`（开发前沿） | v0.3.3 之后尚未发版的改动 — 需要从源码构建。 |
-| crates.io `jiandu-mcp` / `jiandu-memory` `0.3.3` | crates.io 上的当前版本。用 `cargo install jiandu-mcp --version 0.3.3 --locked` 安装服务端。 |
+| `0.4.0` | 由宿主授权项目和分区后可使用分区记忆。 |
+| `0.3.3` | stdio MCP 共享记忆、Dream 快照、Bamboo 导入、只读控制台和逐次调用的项目及会话身份。 |
+| `main` | 最新发布之后的改动可从源码构建。 |
 
 构建需要 Rust 1.95 或更新版本。[2026-10-03 审计记录](docs/readme-audit.md)。
 
@@ -139,13 +130,14 @@ agent 里问*“我们什么时候发版？”*。全新的数据目录第一次
 ## 记忆范围
 
 - **会话（Session）**：某个由宿主标识的 agent 工作流的临时上下文。
+- **分区（Section）**用于同一项目分区内共享的持久知识，由稳定的项目 ID 和分区 ID 共同标识。
 - **项目（Project）**：同一项目里多个 agent 共享的持久知识。MCP 宿主用一个稳定、不透明的
   `project_id` 授权每次调用。
 - **全局（Global）**：真正跨项目都有用的持久知识。
 
 ## 从源码构建与通用配置
 
-构建当前源码（或 `v0.3.3` tag）：
+从当前源码构建。
 
 ```shell
 cargo build --release --locked -p jiandu-mcp --bin jiandu
@@ -216,20 +208,28 @@ cargo build --release --locked -p jiandu-mcp --bin jiandu
 ```json
 {
   "name": "memory",
-  "arguments": {"action":"query","scope":"project","query":"release decision"},
+  "arguments": {"action":"query","scope":"section","query":"release decision"},
   "_meta": {
     "io.github.bigduu.jiandu/context": {
       "project_id": "project-1",
+      "section_id": "section:2d567c47-a081-4a8d-9c9e-246bce470c9f",
       "session_id": "agent-session-1"
     }
   }
 }
 ```
 
-这是 `tools/call` 请求的 `params` 对象。这个元数据键是简牍的扩展，宿主必须显式支持并填写；MCP
-本身不会自动提供当前的项目或会话身份。项目操作需要宿主授权的 `project_id`；`session_*` 操作
-需要宿主提供的 `session_id`。操作不需要时可以省略对应字段。工具参数里的 `project_key` 只能声明
-当前宿主的项目，不能授予访问权限。每个独立的工作流请使用不同的会话 ID。
+这是 `tools/call` 请求的 `params` 对象。项目操作由宿主提供已授权的 `project_id`，分区操作还需要
+同一项目下已授权的 `section_id`，`session_*` 操作需要 `session_id`。工具参数里的 `project_key`
+只用于校验当前项目。每个独立的工作流请使用不同的会话 ID。
+
+宿主确认当前 `memory` 工具的 schema 包含 `section`，并解析出已授权项目下稳定的分区 ID 后，才发送
+`section_id`。ID 允许 1–64 个小写 ASCII 字母、数字及 `-`、`_`、`:`。分区改名时沿用同一个 ID
+和记忆。会话移组后，后续调用按新的分区授权，已有记忆留在原分区。分区的条目和索引存放在同一个
+简牍数据目录的 `memory/v1/scopes/sections` 下。
+
+没有分区的客户端可以照常使用已有范围。显式访问分区时如果缺少授权上下文，工具返回
+`section_context_unavailable`，并提示在可用的会话笔记中保留分区专属内容。项目和全局写入各自适用范围内的事实。
 
 如果客户端无法提供这些元数据，宿主集成方可以配置专用进程的默认值。对于只服务一个工作流的进程，
 `--session-id <ID>` 和 `--project-id <ID>` 仍然是可选的启动默认值。逐次调用的上下文会完全替换
@@ -280,7 +280,7 @@ schema 和结构化响应仍然是正确性的约定。
 
 ## Dream 概览
 
-Dream 是宿主为全局记忆和每个已授权项目生成的一份简短概览快照。它是派生出的文字，不是权威事实，
+Dream 是宿主为所选持久范围生成的一份简短概览快照。它是派生出的文字，不是权威事实，
 从不计入主题数量、生命周期操作或词法检索。
 
 先调用 `dream_read`。它返回缺失的冷启动状态或当前快照，以及权威记忆的 `current_generation` 和

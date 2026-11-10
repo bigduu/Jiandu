@@ -360,6 +360,7 @@ mod tests {
             title: title.to_string(),
             scope: MemoryScope::Global,
             project_key: None,
+            section_id: None,
             r#type: DurableMemoryType::Reference,
             status,
             tags: Vec::new(),

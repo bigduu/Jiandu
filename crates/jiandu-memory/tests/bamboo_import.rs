@@ -26,6 +26,7 @@ fn fixture_frontmatter(
         },
         scope,
         project_key: project_id.map(ToString::to_string),
+        section_id: None,
         granularity: Some(TemporalGranularity::Month),
         status: if ordinal.is_multiple_of(7) {
             DurableMemoryStatus::Stale
@@ -80,7 +81,9 @@ fn topic_path(
             .join(project_id.expect("Project topic requires id").as_str())
             .join("memory/v1/topics")
             .join(format!("{id}.md")),
-        MemoryScope::Session => panic!("Session topics are not Bamboo import fixtures"),
+        MemoryScope::Session | MemoryScope::Section => {
+            panic!("Bamboo import fixtures require Project or Global topics")
+        }
     }
 }
 

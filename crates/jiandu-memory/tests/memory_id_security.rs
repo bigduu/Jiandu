@@ -22,6 +22,7 @@ fn fixture_frontmatter(
         r#type: DurableMemoryType::Project,
         scope,
         project_key: project_key.map(ToString::to_string),
+        section_id: None,
         granularity: None,
         status: DurableMemoryStatus::Active,
         freshness: Some("high".to_string()),

@@ -348,7 +348,7 @@ impl MemoryServer {
                     )
                     .await
                     .map_err(|error| execution("Failed to write memory", error))?;
-                Ok(json!({
+                let mut result = json!({
                     "action": "write",
                     "memory": {
                         "id": doc.frontmatter.id,
@@ -359,7 +359,11 @@ impl MemoryServer {
                         "project_key": doc.frontmatter.project_key,
                         "path": doc.path,
                     }
-                }))
+                });
+                if let Some(section_id) = doc.frontmatter.section_id {
+                    result["memory"]["section_id"] = json!(section_id);
+                }
+                Ok(result)
             }
             MemoryArgs::Merge {
                 id,
@@ -593,12 +597,29 @@ impl MemoryServer {
                     .filter(|value| !value.is_empty())
                 {
                     let id = validate_memory_id(id)?;
-                    let access = self.resolve_id_access(project_key.as_deref(), id)?;
-                    let Some(doc) = access
-                        .store
-                        .archive_memory(id, access.project_key(), mode, reason.as_deref())
-                        .await
-                        .map_err(|error| execution("Failed to purge memory", error))?
+                    let archived = if scope
+                        .as_deref()
+                        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("section"))
+                    {
+                        let access =
+                            self.resolve_access(project_key.as_deref(), MemoryScope::Section)?;
+                        access
+                            .store
+                            .archive_section_memory(id, mode, reason.as_deref())
+                            .await
+                    } else {
+                        let access = if scope.is_some() {
+                            self.resolve_access(project_key.as_deref(), MemoryScope::Global)?
+                        } else {
+                            self.resolve_id_access(project_key.as_deref(), id)?
+                        };
+                        access
+                            .store
+                            .archive_memory(id, access.project_key(), mode, reason.as_deref())
+                            .await
+                    };
+                    let Some(doc) =
+                        archived.map_err(|error| execution("Failed to purge memory", error))?
                     else {
                         return Err(memory_not_found(id));
                     };
@@ -666,15 +687,23 @@ impl MemoryServer {
         requested: Option<&str>,
         scope: MemoryScope,
     ) -> Result<ResolvedMemoryAccess, MemoryError> {
+        let section_id = self.context.section_id();
+        if scope == MemoryScope::Section && section_id.is_none() {
+            return Err(MemoryError::SectionContextUnavailable);
+        }
         let project_id = self.context.resolve_project_id(requested)?;
         if scope == MemoryScope::Project && project_id.is_none() {
             return Err(MemoryError::InvalidArguments(
                 "project scope requires a project_id in the host execution context; supply per-call Jiandu metadata or the optional --project-id default".to_string(),
             ));
         }
-        let store = project_id
-            .as_ref()
-            .map_or_else(|| self.store.clone(), |id| self.store.for_project(id));
+        let store = match (scope, project_id.as_ref(), section_id) {
+            (MemoryScope::Section, Some(project_id), Some(section_id)) => {
+                self.store.for_section(project_id, section_id)
+            }
+            (_, Some(project_id), _) => self.store.for_project(project_id),
+            (_, None, _) => self.store.clone(),
+        };
         Ok(ResolvedMemoryAccess { store, project_id })
     }
 
@@ -684,7 +713,12 @@ impl MemoryServer {
         id: &str,
     ) -> Result<ResolvedMemoryAccess, MemoryError> {
         validate_memory_id(id)?;
-        self.resolve_access(requested, MemoryScope::Global)
+        let scope = if self.context.section_id().is_some() {
+            MemoryScope::Section
+        } else {
+            MemoryScope::Global
+        };
+        self.resolve_access(requested, scope)
     }
 }
 
@@ -721,8 +755,9 @@ fn parse_scope(scope: &str) -> Result<MemoryScope, MemoryError> {
         "session" => Ok(MemoryScope::Session),
         "project" => Ok(MemoryScope::Project),
         "global" => Ok(MemoryScope::Global),
+        "section" => Ok(MemoryScope::Section),
         other => Err(MemoryError::InvalidArguments(format!(
-            "invalid scope '{other}'; expected one of: session, project, global"
+            "invalid scope '{other}'; expected one of: session, section, project, global"
         ))),
     }
 }

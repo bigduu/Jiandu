@@ -8,8 +8,9 @@ deterministic, and independent of any agent runtime.
 The workspace contains only `crates/jiandu-memory` and `crates/jiandu-mcp`.
 Keep MCP concerns out of the memory crate, and map MCP actions directly to
 `MemoryStore` without adding a generic backend or service framework. Callers
-provide a stable opaque `ProjectId`; prompt assembly and ranking policy belong
-to the consuming host.
+provide a stable opaque `ProjectId` and, for Section memory, a stable `SectionId`
+within that Project. The consuming host owns authorization, prompt assembly,
+and ranking policy.
 
 The `jiandu ui` command is a small, read-only loopback adapter in `jiandu-mcp`,
 with embedded browser assets and direct MemoryStore calls. It is a local human
@@ -41,9 +42,11 @@ Use the single `memory` tool; a host may namespace it as
 - Recall before guessing. Use `query` for relevant prior knowledge and `get`
   when the full returned item is needed; verify recalled facts against current
   repository and tool state.
-- Use Session for workstream continuity, Project for project-specific durable
-  facts, and Global only for stable cross-project knowledge. Project authority
-  comes from the MCP host.
+- Use Session for workstream continuity, Section for durable facts shared in
+  one Section, Project for facts shared across the Project, and Global for
+  stable cross-project knowledge. Section requires host authorization for the
+  Project and Section on the call. When Section is unavailable, continue using
+  the available scopes and keep Section-only context in Session notes.
 - Query before `write`. Store only confirmed, durable, non-secret facts that
   will help a future session, as concise atomic items with searchable titles.
 - Use `dream_read` only for low-cost orientation. A missing snapshot is a normal
@@ -55,7 +58,7 @@ Use the single `memory` tool; a host may namespace it as
   fallback; all reads and mutations go through `jiandu-memory` or the MCP tool.
 - Configure every agent that shares memory with the same Jiandu-owned
   `--data-dir`; it is the only required connection argument. The host grants
-  Project and Session identity per call through
+  Project, Section, and Session identity per call through
   `_meta["io.github.bigduu.jiandu/context"]`, outside model arguments. The
   optional `--project-id` and `--session-id` flags are defaults for dedicated
   processes. Sharing a root does not grant cross-Project access, and model

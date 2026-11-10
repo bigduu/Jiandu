@@ -13,14 +13,20 @@ copy an action catalog into the prompt or invent host-specific fields.
 
 - Use Session for temporary workstream continuity. Read it with `session_read`;
   append concise progress or blockers with `session_append`.
-- Use Project for durable knowledge specific to the authorized project.
+- Use Section for durable facts specific to one authorized section of a Project.
+  Use it when the live tool schema supports `section` and the host provides the
+  Section context.
+- Use Project for durable knowledge that applies across the authorized project.
 - Use Global only for stable facts or preferences that genuinely apply across
   projects.
 - Normally omit `project_key`. Project authority comes from the MCP host, and an
-  argument cannot grant or widen access. The host can switch Project/Session
+  argument cannot grant or widen access. The host can switch Project, Section, and Session
   identities per invocation through Jiandu's request metadata extension,
   outside tool arguments. If the needed context is missing, report it to the
   host instead of inventing an id or moving Project knowledge to Global.
+- If Section context is unavailable, continue with the scopes the host offers.
+  Keep Section-only context in Session notes when available and reserve durable
+  Project or Global writes for facts that apply at those levels.
 - Do not use durable `query` as a Session lookup.
 
 ## Recall with the least work
@@ -35,8 +41,8 @@ copy an action catalog into the prompt or invent host-specific fields.
 4. Check truncation signals, then verify recalled claims against current files,
    tools, or services before treating them as true now.
 
-Use Project first for project work. Use Global only when the needed knowledge is
-cross-project or Project recall has no useful result.
+For Section work, query the authorized Section first. Query Project for facts
+shared across the Project and Global for relevant cross-project knowledge.
 
 ## Use Dream only for orientation
 

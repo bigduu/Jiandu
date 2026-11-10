@@ -877,7 +877,7 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
     ] {
         assert_enum(
             &branch(&schema, action)["properties"]["scope"],
-            &["project", "global"],
+            &["project", "global", "section"],
         );
     }
     assert_enum(
