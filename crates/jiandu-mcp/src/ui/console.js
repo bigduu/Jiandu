@@ -16,7 +16,7 @@ function node(tag, className, text) {
 function text(id, value) { $(id).textContent = value; }
 function date(value) { const parsed = new Date(value); return value ? (Number.isNaN(parsed.getTime()) ? value : dateFormat.format(parsed)) : "未记录"; }
 function abort(kind) { controllers.get(kind)?.abort(); controllers.delete(kind); }
-function abortView() { ["list", "status", "detail"].forEach(abort); detailGeneration += 1; }
+function abortView() { ["list", "status", "detail", "revisions", "revision"].forEach(abort); detailGeneration += 1; }
 async function request(kind, path, parameters = {}) {
   abort(kind);
   const controller = new AbortController();
@@ -158,9 +158,78 @@ function facts(entries) {
   return list;
 }
 function actor(value) { return typeof value === "string" ? value : [value?.kind, value?.id, value?.actor].filter(Boolean).join(" · "); }
+function memorySources(memory) {
+  const list = node("ul", "source-list");
+  if (!memory.sources?.length) list.append(node("li", "", "未记录来源"));
+  else memory.sources.forEach((source) => list.append(node("li", "", [source.kind, source.id, source.message_range?.join(" – ")].filter(Boolean).join(" · "))));
+  return list;
+}
+function memoryHistory(params, isCurrent) {
+  const panel = node("details", "memory-history");
+  const entries = node("div", "revision-entries");
+  const status = node("p", "muted");
+  const preview = node("div", "revision-preview");
+  const more = node("button", "refresh-button", "载入更早的修订");
+  more.type = "button";
+  more.hidden = true;
+  status.setAttribute("role", "status");
+  panel.append(node("summary", "", "修订历史"), status, entries, more, preview);
+  let started = false, before, selection = 0;
+  async function open(revisionId, button) {
+    const selected = ++selection;
+    for (const entry of entries.children) entry.setAttribute("aria-pressed", String(entry === button));
+    preview.replaceChildren(node("p", "muted", "正在读取修订…"));
+    try {
+      const revision = await request("revision", "/api/revisions", { ...params, revision_id: revisionId });
+      if (!isCurrent() || selected !== selection) return;
+      const memory = revision.frontmatter;
+      preview.replaceChildren(
+        node("h3", "", `历史版本 · ${memory.title}`),
+        facts([["更新时间", date(memory.updated_at)], ["更新者", actor(memory.updated_by)]]),
+        node("h3", "", "历史版本来源"),
+        memorySources(memory),
+        node("h3", "", "历史版本正文"),
+        node("pre", "plain-content", revision.body),
+      );
+    } catch (error) {
+      if (isCurrent() && selected === selection && error.name !== "AbortError") {
+        preview.replaceChildren(node("p", "muted", `修订读取失败：${error.message}`));
+      }
+    }
+  }
+  async function load() {
+    started = true;
+    more.disabled = true;
+    status.textContent = "正在读取修订历史…";
+    try {
+      const history = await request("revisions", "/api/revisions", { ...params, before });
+      if (!isCurrent()) return;
+      status.textContent = entries.childElementCount || history.revisions.length ? "" : "暂无历史修订。";
+      for (const revision of history.revisions) {
+        const button = node("button", "refresh-button", `${date(revision.updated_at)} · ${actor(revision.updated_by) || "未记录更新者"}`);
+        button.type = "button";
+        button.setAttribute("aria-pressed", "false");
+        button.addEventListener("click", () => open(revision.revision_id, button));
+        entries.append(button);
+      }
+      before = history.next_before || undefined;
+      more.textContent = "载入更早的修订";
+      more.hidden = !before;
+    } catch (error) {
+      if (!isCurrent() || error.name === "AbortError") return;
+      status.textContent = `修订历史读取失败：${error.message}`;
+      more.textContent = "重试读取";
+      more.hidden = false;
+    } finally { if (isCurrent()) more.disabled = false; }
+  }
+  panel.addEventListener("toggle", () => { if (panel.open && !started) load(); });
+  more.addEventListener("click", load);
+  return panel;
+}
 async function openDetail(item, card, parameters, generation, session) {
   if (generation !== viewGeneration) return;
   const token = ++detailGeneration;
+  abort("revisions"); abort("revision");
   document.querySelectorAll(".memory-card").forEach((button) => { button.classList.toggle("selected", button === card); button.setAttribute("aria-pressed", String(button === card)); });
   placeholder($("detail"), "正在读取原文", "正在载入所选条目的完整内容…", "loading");
   $("detail").setAttribute("aria-busy", "true");
@@ -177,16 +246,17 @@ async function openDetail(item, card, parameters, generation, session) {
       (memory.tags || []).forEach((tag) => chips.append(node("span", "chip", `#${tag}`))); detail.append(chips);
       detail.append(facts([["范围", memory.scope === "project" ? `Project · ${parameters.project_id}` : "Global"], ["类型", types[memory.type] || memory.type], ["创建时间", date(memory.created_at)], ["更新时间", date(memory.updated_at)], ["创建者", actor(memory.created_by)], ["更新者", actor(memory.updated_by)]]));
       detail.append(node("h3", "", "来源"));
-      const sources = node("ul", "source-list");
-      if (!memory.sources?.length) sources.append(node("li", "", "未记录来源"));
-      else memory.sources.forEach((source) => sources.append(node("li", "", [source.kind, source.id, source.message_range?.join(" – ")].filter(Boolean).join(" · "))));
-      detail.append(sources);
+      detail.append(memorySources(memory));
       const relations = Object.entries(memory.relations || {}).filter(([, ids]) => ids?.length);
       if (relations.length) {
         detail.append(node("h3", "", "关联记录")); const links = node("ul", "source-list");
         relations.forEach(([kind, ids]) => links.append(node("li", "", `${{ supersedes: "替代", contradicted_by: "冲突", related: "相关" }[kind] || kind} · ${ids.join("、")}`))); detail.append(links);
       }
-      detail.append(node("h3", "", "正文 · Markdown 原文"), node("pre", "plain-content", data.body));
+      detail.append(
+        node("h3", "", "当前正文 · Markdown 原文"),
+        node("pre", "plain-content", data.body),
+        memoryHistory({ ...parameters, id: item.id }, () => generation === viewGeneration && token === detailGeneration),
+      );
     }
     if (window.matchMedia("(max-width: 860px)").matches) detail.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
   } catch (error) {

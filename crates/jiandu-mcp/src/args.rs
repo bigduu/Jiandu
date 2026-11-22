@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The exact action names accepted by Bamboo's unified `memory` tool.
-pub const MEMORY_ACTIONS: [&str; 19] = [
+pub const MEMORY_ACTIONS: [&str; 21] = [
     "session_read",
     "session_append",
     "session_replace",
@@ -22,6 +22,8 @@ pub const MEMORY_ACTIONS: [&str; 19] = [
     "rebuild",
     "scan_blobs",
     "scan_duplicates",
+    "history",
+    "restore_revision",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +96,37 @@ pub enum MemoryArgs {
         project_key: Option<String>,
         #[serde(default)]
         options: Option<MemoryActionOptions>,
+    },
+    /// List prior versions in the exact durable scope, or read one selected version.
+    History {
+        #[schemars(with = "DurableScopeSchema")]
+        scope: String,
+        #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
+        id: String,
+        #[serde(default)]
+        #[schemars(length(max = 64), regex(pattern = "^[A-Za-z0-9_-]+$"))]
+        project_key: Option<String>,
+        #[serde(default)]
+        #[schemars(regex(pattern = "^[0-9]{20}-[a-f0-9]{64}$"))]
+        revision_id: Option<String>,
+        #[serde(default)]
+        #[schemars(regex(pattern = "^[0-9]{20}-[a-f0-9]{64}$"))]
+        before: Option<String>,
+    },
+    /// Restore selected content as a new version. Use `current_revision` from
+    /// history to guard against overwriting a concurrent edit.
+    RestoreRevision {
+        #[schemars(with = "DurableScopeSchema")]
+        scope: String,
+        #[schemars(length(min = 1, max = 128), regex(pattern = "^[A-Za-z0-9_-]+$"))]
+        id: String,
+        #[serde(default)]
+        #[schemars(length(max = 64), regex(pattern = "^[A-Za-z0-9_-]+$"))]
+        project_key: Option<String>,
+        #[schemars(regex(pattern = "^[0-9]{20}-[a-f0-9]{64}$"))]
+        revision_id: String,
+        #[schemars(regex(pattern = "^[a-f0-9]{64}$"))]
+        expected_current_revision: String,
     },
     /// Read lower-trust host-generated orientation for Global or an authorized
     /// Project or Section. A missing snapshot is a normal cold state; use
@@ -379,6 +412,8 @@ impl MemoryArgs {
             Self::Purge { .. } => "purge",
             Self::Inspect { .. } => "inspect",
             Self::Rebuild { .. } => "rebuild",
+            Self::History { .. } => "history",
+            Self::RestoreRevision { .. } => "restore_revision",
         }
     }
 
@@ -389,6 +424,7 @@ impl MemoryArgs {
             | Self::SessionListTopics {}
             | Self::Query { .. }
             | Self::Get { .. }
+            | Self::History { .. }
             | Self::DreamRead { .. }
             | Self::FindDuplicates { .. }
             | Self::ScanBlobs { .. }

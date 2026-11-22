@@ -13,7 +13,7 @@ local files.
 - **Four scopes.** Session holds workstream continuity, Section holds shared
   facts within one project section, Project holds project-wide decisions, and
   Global holds knowledge useful across projects.
-- **One MCP tool, 19 actions:** query, get, write, merge, rebuild, Dream
+- **One MCP tool, 21 actions:** query, get, write, merge, revisions, rebuild, Dream
   orientation snapshots and more, behind a single `memory` tool.
 - **Your data stays in plain files:** one data directory you choose; Jiandu
   never calls a model or a remote service.
@@ -142,7 +142,7 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 
 - `jiandu-memory` provides persistence, maintenance, and lexical/BM25/CJK recall.
 - `jiandu-mcp` exposes the store over stdio as one MCP tool named `memory`.
-  Its `action` argument selects one of 19 memory operations.
+  Its `action` argument selects one of 21 memory operations.
   The same binary also serves the local read-only browser console.
 
 ## Memory scopes
@@ -308,6 +308,20 @@ still permits blank-query browsing; rebuild it through the existing authorized
 memory tool when needed. This version has no edit, rebuild or Dream-generation
 controls, and lists only first-class Projects rather than legacy directories.
 See the [console design](docs/design/local-console.md).
+
+## Durable memory revisions
+
+Jiandu retains previous versions of a durable entry when it changes. In the
+local console, expand **修订历史** below the current entry to compare its text
+and provenance with a previous version. For Global, Project and Section scopes,
+call `history` with the exact `scope` and `id`. Supply a returned `revision_id`
+to read one version or `before: next_before` to list an older page.
+
+To restore a selected version, call `restore_revision` with the same `scope`
+and `id`, that `revision_id`, and the latest `current_revision` as
+`expected_current_revision`. Restoration creates a new version with the
+selected body, retrieval metadata and sources. It preserves the live status
+and relationships. A concurrent edit requires rereading history.
 
 ## Optional agent Skill
 

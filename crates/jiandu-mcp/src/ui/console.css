@@ -100,6 +100,12 @@ h2 { font-size: 13px; font-weight: 500; }
 .plain-content { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: 13px/1.95 ui-monospace, "SFMono-Regular", Menlo, "PingFang SC", monospace; color: #46564a; }
 .dream-content { margin-top: 15px; max-height: 300px; overflow-y: auto; }
 .source-list { margin: 0; padding-left: 17px; font-size: 10px; color: var(--muted); line-height: 1.85; overflow-wrap: anywhere; }
+.memory-history { border-top: 1px solid var(--line); margin-top: 22px; padding-top: 14px; }
+.memory-history > summary { cursor: pointer; font-size: 13px; }
+.revision-entries { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; max-height: 230px; overflow: auto; }
+.revision-entries button { white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.revision-entries button[aria-pressed="true"] { color: var(--jade); text-decoration: underline; }
+.memory-history > button { margin-top: 10px; }
 .placeholder { padding: 62px 20px; text-align: center; color: var(--muted); }
 .placeholder .placeholder-mark { font: 34px Georgia, serif; color: #9eac99; display: block; margin-bottom: 17px; }
 .placeholder h3 { color: #5f7164; font-size: 14px; font-weight: 500; margin: 0 0 10px; }

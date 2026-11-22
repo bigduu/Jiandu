@@ -197,7 +197,7 @@ async fn cancelled_mcp_waiter_keeps_scope_guard_until_owned_mutation_finishes() 
 }
 
 #[tokio::test]
-async fn all_nineteen_actions_parse_classify_and_dispatch_to_the_real_store() {
+async fn all_actions_parse_classify_and_dispatch_to_the_real_store() {
     use MemoryToolClass::{MutatingSerial, ReadOnlyParallel};
 
     let fixture = Fixture::global("session_dispatch");
@@ -209,6 +209,15 @@ async fn all_nineteen_actions_parse_classify_and_dispatch_to_the_real_store() {
     let consolidate_a = write_global(server, "Dispatch consolidate A", "first source body").await;
     let consolidate_b = write_global(server, "Dispatch consolidate B", "second source body").await;
     let purge_id = write_global(server, "Dispatch purge", "purge source body").await;
+    let revision_target = write_global(server, "Dispatch revisions", "original version").await;
+    server
+        .execute(json!({"action":"merge","id":revision_target,"content":"New revision text"}))
+        .await
+        .unwrap();
+    let history = server
+        .execute(json!({"action":"history","scope":"global","id":revision_target}))
+        .await
+        .unwrap();
     let dream_generation = server
         .execute(json!({"action":"dream_read","scope":"global"}))
         .await
@@ -313,9 +322,21 @@ async fn all_nineteen_actions_parse_classify_and_dispatch_to_the_real_store() {
             json!({"action":"scan_duplicates","scope":"global","min_score":0.75,"options":{"limit":10}}),
             ReadOnlyParallel,
         ),
+        (
+            "history",
+            json!({"action":"history","scope":"global","id":revision_target}),
+            ReadOnlyParallel,
+        ),
+        (
+            "restore_revision",
+            json!({"action":"restore_revision","scope":"global","id":revision_target,
+                "revision_id":history["history"]["revisions"][0]["revision_id"],
+                "expected_current_revision":history["history"]["current_revision"]}),
+            MutatingSerial,
+        ),
     ];
 
-    assert_eq!(cases.len(), 19);
+    assert_eq!(cases.len(), MEMORY_ACTIONS.len());
     assert_eq!(
         cases.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
         MEMORY_ACTIONS
@@ -691,9 +712,39 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
     assert_eq!(tool.name, MEMORY_TOOL_NAME);
     let schema = tool.schema_as_json_value();
     let branches = schema["oneOf"].as_array().expect("tagged enum oneOf");
-    assert_eq!(branches.len(), 19);
+    assert_eq!(branches.len(), MEMORY_ACTIONS.len());
 
-    let contracts: [(&str, &[&str], &[&str]); 19] = [
+    let contracts: [(&str, &[&str], &[&str]); 21] = [
+        (
+            "history",
+            &[
+                "action",
+                "before",
+                "id",
+                "project_key",
+                "revision_id",
+                "scope",
+            ],
+            &["action", "id", "scope"],
+        ),
+        (
+            "restore_revision",
+            &[
+                "action",
+                "expected_current_revision",
+                "id",
+                "project_key",
+                "revision_id",
+                "scope",
+            ],
+            &[
+                "action",
+                "expected_current_revision",
+                "id",
+                "revision_id",
+                "scope",
+            ],
+        ),
         ("session_read", &["action", "options", "topic"], &["action"]),
         (
             "session_append",
@@ -866,6 +917,8 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
 
     for action in [
         "query",
+        "history",
+        "restore_revision",
         "dream_read",
         "dream_publish",
         "write",
@@ -913,6 +966,8 @@ fn generated_schema_has_complete_actions_value_domains_and_safe_ids() {
 
     for (action, field) in [
         ("get", "id"),
+        ("history", "id"),
+        ("restore_revision", "id"),
         ("merge", "id"),
         ("split", "id"),
         ("purge", "id"),

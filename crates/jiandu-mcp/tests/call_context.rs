@@ -153,6 +153,91 @@ fn write(scope: &str, title: &str, needle: &str) -> Value {
 }
 
 #[test]
+fn revision_restore_checks_scope_and_current_revision_and_refreshes_recall() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut client = StdioClient::start(directory.path(), &[]);
+    let allowed = json!({"project_id":"alpha","section_id":"section:one","session_id":"operator"});
+    let other = json!({"project_id":"alpha","section_id":"section:two"});
+    let written = success(client.call(
+        write("section", "Schedule decision", "OldReleaseFriday"),
+        Some(allowed.clone()),
+    ));
+    let id = &written["memory"]["id"];
+    let history = json!({"action":"history","scope":"section","id":id});
+    let cold = success(client.call(history.clone(), Some(allowed.clone())));
+    assert_eq!(cold["history"]["revisions"], json!([]));
+    success(client.call(
+        json!({"action":"merge","id":id,"content":"NewReleaseThursday"}),
+        Some(allowed.clone()),
+    ));
+    let first_edit = success(client.call(history.clone(), Some(allowed.clone())));
+    let first_revision = &first_edit["history"]["revisions"][0]["revision_id"];
+    let selected_version =
+        json!({"action":"history","scope":"section","id":id,"revision_id":first_revision});
+    let before = success(client.call(selected_version.clone(), Some(allowed.clone())));
+    assert_eq!(before["memory"]["body"], "OldReleaseFriday");
+    assert_eq!(
+        before["memory"]["frontmatter"]["sources"][0]["id"],
+        "operator"
+    );
+    error(
+        client.call(selected_version, Some(other.clone())),
+        "memory not found",
+    );
+    let missing_context = client.call(history.clone(), None);
+    assert_eq!(
+        missing_context["structuredContent"]["code"],
+        "section_context_unavailable"
+    );
+    error(
+        client.call(
+            json!({"action":"history","scope":"section","id":id,"revision_id":"../x"}),
+            Some(allowed.clone()),
+        ),
+        "invalid memory revision ID",
+    );
+    let mut restore = json!({"action":"restore_revision","scope":"section","id":id,
+        "revision_id":first_revision,"expected_current_revision":first_edit["history"]["current_revision"]});
+    error(
+        client.call(restore.clone(), Some(other)),
+        "memory not found",
+    );
+    success(client.call(
+        json!({"action":"merge","id":id,"content":"LaterEditSaturday"}),
+        Some(allowed.clone()),
+    ));
+    error(
+        client.call(restore.clone(), Some(allowed.clone())),
+        "current memory revision changed",
+    );
+    let latest = success(client.call(history.clone(), Some(allowed.clone())));
+    restore["expected_current_revision"] = latest["history"]["current_revision"].clone();
+    let restored = success(client.call(restore, Some(allowed.clone())));
+    assert_eq!(restored["memory"]["body"], "OldReleaseFriday");
+    assert_eq!(
+        restored["memory"]["frontmatter"]["updated_by"]["id"],
+        *first_revision
+    );
+    assert_eq!(
+        restored["memory"]["frontmatter"]["sources"][0]["id"],
+        "operator"
+    );
+    let final_history = success(client.call(history, Some(allowed.clone())));
+    assert_eq!(
+        final_history["history"]["revisions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let recall = success(client.call(
+        json!({"action":"query","scope":"section","query":"NewReleaseThursday"}),
+        Some(allowed),
+    ));
+    assert_eq!(recall["data"]["returned_count"], 0);
+}
+
+#[test]
 fn stdio_starts_with_only_data_dir_and_global_memory_needs_no_identities() {
     let directory = tempfile::tempdir().expect("tempdir");
     let mut client = StdioClient::start(directory.path(), &[]);

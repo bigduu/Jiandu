@@ -46,6 +46,9 @@ use super::{
     DurableMemoryType, MemoryRetrievalInput, MemoryScope, SessionState, TemporalGranularity,
 };
 
+mod revisions;
+pub use revisions::{MemoryRevisionEntry, MemoryRevisionHistory};
+
 /// Hard structural cap on a durable memory body (characters). Appends that would
 /// push a body past this are refused: the auto-merge path falls back to creating a
 /// new atomic memory, and the explicit `merge` path fails loudly. This makes it
@@ -3384,6 +3387,18 @@ impl MemoryStore {
         project_key: Option<&str>,
         id: &str,
     ) -> io::Result<Option<DurableMemoryDocument>> {
+        Ok(self
+            .read_memory_with_bytes(scope, project_key, id)
+            .await?
+            .map(|(document, _)| document))
+    }
+
+    async fn read_memory_with_bytes(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        id: &str,
+    ) -> io::Result<Option<(DurableMemoryDocument, String)>> {
         let id = validate_memory_id(id)?;
         let project_key = self.require_project_key(scope, project_key)?;
         let expected_project_key = match scope {
@@ -3410,11 +3425,14 @@ impl MemoryStore {
                     ),
                 ));
             }
-            return Ok(Some(DurableMemoryDocument {
-                frontmatter,
-                body,
-                path,
-            }));
+            return Ok(Some((
+                DurableMemoryDocument {
+                    frontmatter,
+                    body,
+                    path,
+                },
+                raw,
+            )));
         }
         Ok(None)
     }
@@ -3425,6 +3443,12 @@ impl MemoryStore {
             fs::create_dir_all(parent).await?;
         }
         let rendered = render_markdown_document(&doc.frontmatter, &doc.body)?;
+        match fs::read_to_string(&doc.path).await {
+            Ok(previous) if previous == rendered => return Ok(()),
+            Ok(previous) => revisions::retain_previous(doc, &previous).await?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         // Atomic write so a crash mid-write can never truncate/corrupt a user
         // memory document (#166, the worst-impact case from #35).
         crate::atomic_fs::atomic_write(&doc.path, rendered.as_bytes()).await

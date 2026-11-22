@@ -142,6 +142,40 @@ async fn write_memory(
         .unwrap()
 }
 
+#[tokio::test]
+async fn console_compares_old_and_current_content_without_writing_the_store() {
+    let root = tempdir().unwrap();
+    let store = MemoryStore::new(root.path());
+    let document = write_memory(&store, None, "Console revision fixture").await;
+    let id = &document.frontmatter.id;
+    store
+        .merge_memory(id, None, "新版本内容", &[], None, "fixture", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    let before = bytes(root.path());
+    let console = Console::start(root.path());
+    let path = format!("/api/revisions?scope=global&id={id}");
+    let list = console.request("GET", &path, "");
+    assert_eq!(list.status, 200);
+    let history = list.json();
+    let revision_id = history["revisions"][0]["revision_id"].as_str().unwrap();
+    let historical = console
+        .request("GET", &format!("{path}&revision_id={revision_id}"), "")
+        .json();
+    assert_eq!(historical["body"], document.body);
+    assert_eq!(
+        historical["frontmatter"]["sources"][0]["id"],
+        "fixture-session"
+    );
+    let current = console
+        .request("GET", &format!("/api/memory?scope=global&id={id}"), "")
+        .json();
+    assert!(current["body"].as_str().unwrap().contains("新版本内容"));
+    assert_eq!(console.request("POST", &path, "").status, 405);
+    assert_eq!(bytes(root.path()), before);
+}
+
 #[test]
 fn cold_console_serves_embedded_assets_without_initializing_the_store() {
     let directory = tempdir().unwrap();
