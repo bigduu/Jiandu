@@ -296,17 +296,19 @@ and port `0` asks the OS for an available port. No Session or Project identity
 is required. Press Ctrl-C to stop; the command serves only IPv4 loopback.
 
 Browse Global knowledge, switch first-class Projects, or select persisted
-Sessions. Search and page memories, filter their status, and read their full
-content, tags, timestamps and provenance. Durable scopes also show lexical-index
-availability and Dream snapshot freshness/content. Sessions show temporary
-notes and are not assigned to a Project by inference.
+Sessions. In **Section**, select both the Project and the Section by their
+stored IDs. Projects with Section memory appear in that picker even before
+they have Project-level memory. Search and page durable memories, filter by
+status, and read their full content, tags, timestamps, provenance and revisions.
+Each durable scope also shows its lexical-index and Dream snapshot status.
+Sessions show temporary notes without an inferred Project.
 
 The console uses the existing MemoryStore and bundled assets, without a
 separate frontend build or agent runtime. It does not write records, access
 signals, indexes, Session state or Dream snapshots. A missing/invalid index
 still permits blank-query browsing; rebuild it through the existing authorized
 memory tool when needed. This version has no edit, rebuild or Dream-generation
-controls, and lists only first-class Projects rather than legacy directories.
+controls. The Project picker lists first-class Projects.
 See the [console design](docs/design/local-console.md).
 
 ## Durable memory revisions

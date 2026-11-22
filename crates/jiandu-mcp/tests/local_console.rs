@@ -9,7 +9,7 @@ use std::{
 };
 
 use jiandu_memory::{
-    ProjectId,
+    ProjectId, SectionId,
     memory_store::{
         DurableMemoryDocument, DurableMemoryStatus, DurableMemoryType, MemoryScope, MemoryStore,
     },
@@ -194,6 +194,7 @@ fn cold_console_serves_embedded_assets_without_initializing_the_store() {
     }
     let catalog = console.get("/api/catalog");
     assert_eq!(catalog["projects"], serde_json::json!([]));
+    assert_eq!(catalog["sections"], serde_json::json!([]));
     assert_eq!(catalog["sessions"], serde_json::json!([]));
     assert_eq!(catalog["read_only"], true);
     assert_eq!(
@@ -203,10 +204,150 @@ fn cold_console_serves_embedded_assets_without_initializing_the_store() {
     let status = console.get("/api/status?scope=global");
     assert_eq!(status["index"]["state"], "empty");
     assert!(status["dream"]["snapshot"].is_null());
+    assert_eq!(
+        console
+            .request(
+                "GET",
+                "/api/status?scope=section&project_id=alpha&section_id=empty",
+                ""
+            )
+            .status,
+        404
+    );
     assert!(
         !root.exists(),
         "no root, lock, index or state is created by browsing"
     );
+}
+
+#[tokio::test]
+async fn console_browses_section_only_projects_with_exact_project_and_section_scope() {
+    let directory = tempdir().unwrap();
+    let store = MemoryStore::new(directory.path());
+    let alpha = ProjectId::parse("alpha").unwrap();
+    let beta = ProjectId::parse("beta").unwrap();
+    let shared = SectionId::parse("section:shared").unwrap();
+    let sibling = SectionId::parse("section:sibling").unwrap();
+    let mut documents = Vec::new();
+    for (project, section, text) in [
+        (&alpha, &shared, "alphacontent"),
+        (&beta, &shared, "betacontent"),
+        (&alpha, &sibling, "siblingcontent"),
+    ] {
+        documents.push(
+            store
+                .for_section(project, section)
+                .write_memory(
+                    MemoryScope::Section,
+                    Some(project.as_str()),
+                    DurableMemoryType::Reference,
+                    text,
+                    text,
+                    &[],
+                    Some("section-console-fixture"),
+                    "console-fixture",
+                    false,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let document = &documents[0];
+    let id = &document.frontmatter.id;
+    store
+        .for_section(&alpha, &shared)
+        .merge_memory(
+            id,
+            Some(alpha.as_str()),
+            "Updated alpha section",
+            &[],
+            None,
+            "console-fixture",
+            &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A topic copied into the wrong Project's Section tree cannot establish
+    // that Project/Section pair in the inventory.
+    let misplaced = store.for_section(&beta, &sibling);
+    let topics = misplaced.resolver().section_root().unwrap().join("topics");
+    std::fs::create_dir_all(&topics).unwrap();
+    std::fs::copy(
+        &documents[2].path,
+        topics.join(format!("{}.md", documents[2].frontmatter.id)),
+    )
+    .unwrap();
+
+    let before = bytes(directory.path());
+    let console = Console::start(directory.path());
+    let catalog = console.get("/api/catalog");
+    assert_eq!(catalog["projects"], serde_json::json!([]));
+    assert_eq!(
+        catalog["sections"],
+        serde_json::json!([
+            {"project_id":"alpha","section_id":"section:shared"},
+            {"project_id":"alpha","section_id":"section:sibling"},
+            {"project_id":"beta","section_id":"section:shared"},
+        ])
+    );
+
+    let selected = "scope=section&project_id=alpha&section_id=section%3Ashared";
+    let results = console.get(&format!(
+        "/api/memories?{selected}&q=alphacontent&status=active"
+    ));
+    assert_eq!(results["matched_count"], 1);
+    assert_eq!(results["items"][0]["id"], *id);
+    let results = console.get(&format!("/api/memories?{selected}&q=betacontent"));
+    assert_eq!(results["matched_count"], 0);
+    let status = console.get(&format!("/api/status?{selected}"));
+    assert_eq!(status["index"]["state"], "ready");
+    assert_eq!(status["inspection"]["total_memories"], 1);
+
+    let current = console.get(&format!("/api/memory?{selected}&id={id}"));
+    assert_eq!(current["frontmatter"]["project_key"], "alpha");
+    assert_eq!(current["frontmatter"]["section_id"], "section:shared");
+    assert!(
+        current["body"]
+            .as_str()
+            .unwrap()
+            .contains("Updated alpha section")
+    );
+    let history = console.get(&format!("/api/revisions?{selected}&id={id}"));
+    let revision = history["revisions"][0]["revision_id"].as_str().unwrap();
+    let prior = console.get(&format!(
+        "/api/revisions?{selected}&id={id}&revision_id={revision}"
+    ));
+    assert_eq!(prior["body"], document.body);
+
+    for (project, section) in [("beta", "shared"), ("alpha", "sibling")] {
+        let other = format!("scope=section&project_id={project}&section_id=section%3A{section}");
+        for route in ["memory", "revisions"] {
+            let path = format!("/api/{route}?{other}&id={id}");
+            assert_eq!(console.request("GET", &path, "").status, 404, "{path}");
+        }
+        let path = format!("/api/revisions?{other}&id={id}&revision_id={revision}");
+        assert_eq!(console.request("GET", &path, "").status, 404, "{path}");
+    }
+    for (scope, code) in [
+        (
+            "scope=section&project_id=beta&section_id=section%3Asibling",
+            404,
+        ),
+        ("scope=section&project_id=alpha", 400),
+        ("scope=section&section_id=section%3Ashared", 400),
+        (
+            "scope=project&project_id=alpha&section_id=section%3Ashared",
+            400,
+        ),
+        ("scope=global&section_id=section%3Ashared", 400),
+    ] {
+        let path = format!("/api/memories?{scope}");
+        assert_eq!(console.request("GET", &path, "").status, code, "{path}");
+    }
+    assert_eq!(bytes(directory.path()), before);
 }
 
 #[tokio::test]

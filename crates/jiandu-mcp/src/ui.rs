@@ -11,7 +11,7 @@ use axum::{
     routing::get,
 };
 use jiandu_memory::{
-    ProjectId,
+    ProjectId, SectionId,
     memory_store::{
         DurableMemoryStatus, MAX_MEMORY_QUERY_CHARS, MemoryQueryOptions, MemoryScope, MemoryStore,
     },
@@ -159,6 +159,7 @@ fn absent(message: &str) -> io::Error {
 struct MemoryParams {
     scope: MemoryScope,
     project_id: Option<String>,
+    section_id: Option<String>,
     q: Option<String>,
     status: Option<DurableMemoryStatus>,
     cursor: Option<String>,
@@ -169,28 +170,47 @@ async fn selected_store(
     console: &Console,
     scope: MemoryScope,
     project_id: Option<&str>,
+    section_id: Option<&str>,
 ) -> io::Result<(MemoryStore, Option<ProjectId>)> {
-    match scope {
-        MemoryScope::Global if project_id.is_none() => Ok((console.store.clone(), None)),
-        MemoryScope::Project => {
-            let id = ProjectId::parse(project_id.ok_or_else(|| invalid("project_id is required"))?)
-                .map_err(|_| invalid("Invalid Project id"))?;
+    match (scope, project_id, section_id) {
+        (MemoryScope::Global, None, None) => Ok((console.store.clone(), None)),
+        (MemoryScope::Project, Some(project_id), None) => {
+            let id = ProjectId::parse(project_id).map_err(|_| invalid("Invalid Project id"))?;
             if !console.store.list_project_ids().await?.contains(&id) {
                 return Err(absent("Project is not in the first-class inventory"));
             }
             Ok((console.store.for_project(&id), Some(id)))
         }
+        (MemoryScope::Section, Some(project_id), Some(section_id)) => {
+            let project =
+                ProjectId::parse(project_id).map_err(|_| invalid("Invalid Project id"))?;
+            let section =
+                SectionId::parse(section_id).map_err(|_| invalid("Invalid Section id"))?;
+            if !console.store.has_section_scope(&project, &section).await? {
+                return Err(absent("Section is not in the selected Project's inventory"));
+            }
+            Ok((console.store.for_section(&project, &section), Some(project)))
+        }
         _ => Err(invalid(
-            "Choose Global without a Project id, or a first-class Project",
+            "Select Global without ids, Project with project_id, or Section with both project_id and section_id",
         )),
     }
 }
 
 async fn catalog(State(console): State<Console>) -> ApiResult {
     let projects = console.store.list_project_ids().await?;
+    let sections = console
+        .store
+        .list_section_scopes()
+        .await?
+        .into_iter()
+        .map(|(project, section)| json!({"project_id":project,"section_id":section}))
+        .collect::<Vec<_>>();
     let sessions = console.store.list_session_ids().await?;
-    Ok(Json(json!({"projects":projects,"sessions":sessions,
-        "data_dir":console.store.resolver().data_dir(),"read_only":true})))
+    Ok(Json(
+        json!({"projects":projects,"sections":sections,"sessions":sessions,
+        "data_dir":console.store.resolver().data_dir(),"read_only":true}),
+    ))
 }
 
 async fn memories(State(console): State<Console>, Query(params): Query<MemoryParams>) -> ApiResult {
@@ -201,7 +221,13 @@ async fn memories(State(console): State<Console>, Query(params): Query<MemoryPar
     {
         return Err(invalid("Search query is too long").into());
     }
-    let (store, id) = selected_store(&console, params.scope, params.project_id.as_deref()).await?;
+    let (store, id) = selected_store(
+        &console,
+        params.scope,
+        params.project_id.as_deref(),
+        params.section_id.as_deref(),
+    )
+    .await?;
     let key = id.as_ref().map(ProjectId::as_str);
     let statuses = params.status.map(|status| HashSet::from([status]));
     let options = MemoryQueryOptions {
@@ -235,16 +261,20 @@ async fn memories(State(console): State<Console>, Query(params): Query<MemoryPar
 }
 
 async fn memory(State(console): State<Console>, Query(params): Query<MemoryParams>) -> ApiResult {
-    let (store, project) =
-        selected_store(&console, params.scope, params.project_id.as_deref()).await?;
+    let (store, project) = selected_store(
+        &console,
+        params.scope,
+        params.project_id.as_deref(),
+        params.section_id.as_deref(),
+    )
+    .await?;
     let id = params
         .id
         .as_deref()
         .ok_or_else(|| invalid("id is required"))?;
     let document = store
-        .get_memory(id, project.as_ref().map(ProjectId::as_str))
+        .get_memory_at_locator(params.scope, project.as_ref().map(ProjectId::as_str), id)
         .await?
-        .filter(|document| document.frontmatter.scope == params.scope)
         .ok_or_else(|| absent("Memory is not in the selected scope"))?;
     Ok(Json(
         json!({"frontmatter":document.frontmatter,"body":document.body}),
@@ -256,6 +286,7 @@ async fn memory(State(console): State<Console>, Query(params): Query<MemoryParam
 struct RevisionParams {
     scope: MemoryScope,
     project_id: Option<String>,
+    section_id: Option<String>,
     id: String,
     before: Option<String>,
     revision_id: Option<String>,
@@ -265,8 +296,13 @@ async fn revisions(
     State(console): State<Console>,
     Query(params): Query<RevisionParams>,
 ) -> ApiResult {
-    let (store, project) =
-        selected_store(&console, params.scope, params.project_id.as_deref()).await?;
+    let (store, project) = selected_store(
+        &console,
+        params.scope,
+        params.project_id.as_deref(),
+        params.section_id.as_deref(),
+    )
+    .await?;
     let key = project.as_ref().map(ProjectId::as_str);
     let absent_memory = || absent("Memory is not in the selected scope");
     if let Some(id) = params.revision_id {
@@ -290,8 +326,13 @@ async fn revisions(
 }
 
 async fn status(State(console): State<Console>, Query(params): Query<MemoryParams>) -> ApiResult {
-    let (store, project) =
-        selected_store(&console, params.scope, params.project_id.as_deref()).await?;
+    let (store, project) = selected_store(
+        &console,
+        params.scope,
+        params.project_id.as_deref(),
+        params.section_id.as_deref(),
+    )
+    .await?;
     let key = project.as_ref().map(ProjectId::as_str);
     let inspection = store.inspect_scope(params.scope, key).await?;
     let index = match store.read_lexical_index(params.scope, key).await {

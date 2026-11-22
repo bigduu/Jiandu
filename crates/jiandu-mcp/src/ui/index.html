@@ -17,9 +17,14 @@
     <nav class="scope-nav" aria-label="选择记忆范围">
       <button type="button" data-scope="global" class="scope-button active" aria-pressed="true"><span class="scope-icon" aria-hidden="true">G</span><span>Global<small>跨项目共享知识</small></span></button>
       <button type="button" data-scope="project" class="scope-button" aria-pressed="false"><span class="scope-icon" aria-hidden="true">P</span><span>Project<small>项目专属记忆</small></span></button>
+      <button type="button" data-scope="section" class="scope-button" aria-pressed="false"><span class="scope-icon" aria-hidden="true">§</span><span>Section<small>项目分区记忆</small></span></button>
       <button type="button" data-scope="session" class="scope-button" aria-pressed="false"><span class="scope-icon" aria-hidden="true">S</span><span>Session<small>会话笔记</small></span></button>
     </nav>
     <div id="project-picker" class="context-picker" hidden><label for="project-select">选择 Project</label><select id="project-select" disabled><option value="">目录载入中…</option></select></div>
+    <div id="section-picker" class="context-picker section-picker" hidden>
+      <div><label for="section-project-select">所属 Project</label><select id="section-project-select" disabled><option value="">目录载入中…</option></select></div>
+      <div><label for="section-select">选择 Section</label><select id="section-select" disabled><option value="">先选择 Project</option></select></div>
+    </div>
     <div id="session-picker" class="context-picker" hidden><label for="session-select">选择 Session</label><select id="session-select" disabled><option value="">目录载入中…</option></select></div>
     <p class="scope-guide" id="scope-guide">所有项目共享的稳定事实、偏好与参考。</p>
     <div class="sidebar-footer">
@@ -37,7 +42,7 @@
     <form id="search-form" class="search-bar" role="search">
       <div class="search-field"><label class="sr-only" for="query">搜索记忆</label><span aria-hidden="true">⌕</span><input id="query" type="search" placeholder="搜索关键词、标题或内容…" autocomplete="off" maxlength="512"></div>
       <div id="status-filter" class="filter-field"><label for="status">状态</label><select id="status"><option value="">全部状态</option><option value="active">有效</option><option value="stale">待更新</option><option value="superseded">已替代</option><option value="contradicted">有冲突</option><option value="archived">已归档</option></select></div>
-      <button type="submit" class="primary-button">搜索</button>
+      <button type="submit" id="search-submit" class="primary-button">搜索</button>
     </form>
     <p id="query-hint" class="query-hint">留空搜索可浏览全部原始记忆；关键词搜索使用本地词法索引。</p>
     <section id="health" class="health" aria-label="索引与 Dream 状态">
