@@ -128,6 +128,7 @@ index; the agent should run `rebuild` for that scope and query again.
 
 | Path | Available workflow |
 | --- | --- |
+| `0.5.0` | Section browsing and revision history in the local console, with durable revision restoration through MCP. |
 | `0.4.0` | Section memory for a host-authorized Project and Section. |
 | `0.3.3` | Shared memory over stdio MCP, Dream snapshots, Bamboo import, read-only console, and per-call Project and Session identity. |
 | `main` | Build from source for changes after the latest release. |
