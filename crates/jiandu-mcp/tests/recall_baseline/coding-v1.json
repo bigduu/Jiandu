@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "facts": [
+    {
+      "name": "sidecar_error",
+      "project": "orchid",
+      "title": "Bamboo sidecar readiness failure",
+      "body": "BAMBOO_E_INIT means the sidecar never reached the readiness probe.",
+      "keywords": ["启动失败", "侧车探针", "BAMBOO_E_INIT"]
+    },
+    {
+      "name": "friday",
+      "project": "orchid",
+      "title": "Orchid release window",
+      "body": "Orchid release window was Friday evening (ORCHID_FRIDAY_OLD).",
+      "keywords": ["Orchid release window", "ORCHID_FRIDAY_OLD"]
+    },
+    {
+      "name": "thursday",
+      "project": "orchid",
+      "title": "Orchid release window",
+      "body": "The current Orchid release window is Thursday morning.",
+      "keywords": ["Orchid release window", "发版时间"],
+      "supersedes": "friday"
+    },
+    {
+      "name": "ember_window",
+      "project": "ember",
+      "title": "Orchid release window",
+      "body": "In the Ember repository, the Orchid release window is Sunday.",
+      "keywords": ["Orchid release window", "EMBER_SUNDAY_PRIVATE"]
+    }
+  ],
+  "cases": [
+    {"name":"bilingual alias", "project":"orchid", "query":"侧车探针启动失败", "expected":["sidecar_error"]},
+    {"name":"exact error code", "project":"orchid", "query":"BAMBOO_E_INIT", "expected":["sidecar_error"]},
+    {"name":"current release decision", "project":"orchid", "query":"Orchid release window", "expected":["thursday"]},
+    {"name":"same title in a different project", "project":"ember", "query":"Orchid release window", "expected":["ember_window"]},
+    {"name":"old evidence only", "project":"orchid", "query":"ORCHID_FRIDAY_OLD", "expected":[], "allowed_weak_hits":["thursday"]},
+    {"name":"foreign evidence only", "project":"orchid", "query":"EMBER_SUNDAY_PRIVATE", "expected":[]},
+    {"name":"absent answer", "project":"orchid", "query":"TUNDRA_934_ZYX", "expected":[]}
+  ]
+}

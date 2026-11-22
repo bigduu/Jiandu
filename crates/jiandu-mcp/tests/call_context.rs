@@ -11,6 +11,9 @@ use std::{
 use jiandu_mcp::MEMORY_CONTEXT_META_KEY;
 use serde_json::{Value, json};
 
+#[path = "recall_baseline/mod.rs"]
+mod recall_baseline;
+
 /// Exercise the actual stdio executable, including rmcp's wire metadata path.
 /// A bounded reader makes handshake/dispatch failures fail instead of hanging.
 struct StdioClient {

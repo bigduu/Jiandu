@@ -413,6 +413,17 @@ without depending on Bamboo runtime types.
 
 ## Verify
 
+Run the fixed coding-fact corpus through the stdio MCP executable and print
+Recall@3 and negative-query results:
+
+```shell
+cargo test --locked -p jiandu-mcp --test call_context stdio_recall_baseline_for_coding_facts -- --nocapture
+```
+
+The fixture uses the existing `active` filter. It records a known weak match
+where the current decision shares a project-name token with an obsolete release
+identifier, while rejecting hits from obsolete or unauthorized records.
+
 ```shell
 cargo fmt --all -- --check
 cargo metadata --locked --all-features --format-version 1
