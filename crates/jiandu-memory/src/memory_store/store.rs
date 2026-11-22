@@ -10,14 +10,16 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::SectionId;
+use crate::{ProjectId, SectionId};
 
 use super::access_log::{
     self, ACCESS_LOG_COMPACT_TRIGGER_BYTES, ACCESS_LOG_FILE, AccessLogEntry, AccessStats,
 };
 use super::freshness;
 use super::lexical_bm25;
-use super::paths::{MEMORY_ROOT_DIR, MEMORY_VERSION_DIR, PROJECTS_DIR, SCOPES_DIR, SESSIONS_DIR};
+use super::paths::{
+    MEMORY_ROOT_DIR, MEMORY_VERSION_DIR, PROJECTS_DIR, SCOPES_DIR, SECTIONS_DIR, SESSIONS_DIR,
+};
 use super::recall::recall_candidates_from_lexical_index_with_status_policy;
 use super::{
     AuditLogEntry, CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT,
@@ -45,6 +47,9 @@ use super::{
     DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource, DurableMemoryStatus,
     DurableMemoryType, MemoryRetrievalInput, MemoryScope, SessionState, TemporalGranularity,
 };
+
+mod revisions;
+pub use revisions::{MemoryRevisionEntry, MemoryRevisionHistory};
 
 /// Hard structural cap on a durable memory body (characters). Appends that would
 /// push a body past this are refused: the auto-merge path falls back to creating a
@@ -2840,6 +2845,125 @@ impl MemoryStore {
             .await
     }
 
+    /// List persisted Section identities for the local console. The canonical
+    /// Section path must agree with a topic's typed Project and Section IDs.
+    /// Discovery is independent of whether the Project itself has memories.
+    pub async fn list_section_scopes(&self) -> io::Result<Vec<(ProjectId, SectionId)>> {
+        let Some(root) = self.section_inventory_root().await? else {
+            return Ok(Vec::new());
+        };
+        let mut scopes = Vec::new();
+        let mut projects = fs::read_dir(root).await?;
+        while let Some(project) = projects.next_entry().await? {
+            if !project.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut sections = fs::read_dir(project.path()).await?;
+            while let Some(section) = sections.next_entry().await? {
+                if section.file_type().await?.is_dir()
+                    && let Some(scope) = self.section_scope_at(&section.path()).await?
+                {
+                    scopes.push(scope);
+                }
+            }
+        }
+        scopes.sort_unstable_by(
+            |(left_project, left_section), (right_project, right_section)| {
+                left_project
+                    .cmp(right_project)
+                    .then_with(|| left_section.as_str().cmp(right_section.as_str()))
+            },
+        );
+        Ok(scopes)
+    }
+
+    /// Check an explicit Section in the local console inventory. This does not
+    /// grant access to an MCP caller.
+    pub async fn has_section_scope(
+        &self,
+        project: &ProjectId,
+        section: &SectionId,
+    ) -> io::Result<bool> {
+        if self.section_inventory_root().await?.is_none() {
+            return Ok(false);
+        }
+        let resolver = self.resolver.for_section(project, section);
+        let root = resolver.section_root().expect("bound Section root");
+        if !Self::is_real_directory(root.parent().expect("Section Project hash directory")).await?
+            || !Self::is_real_directory(root).await?
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .section_scope_at(root)
+            .await?
+            .is_some_and(|(stored_project, stored_section)| {
+                &stored_project == project && &stored_section == section
+            }))
+    }
+
+    async fn section_inventory_root(&self) -> io::Result<Option<PathBuf>> {
+        if self.resolver.project_id().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Section inventory requires an unbound store",
+            ));
+        }
+        let mut root = self.resolver.data_dir();
+        for component in [
+            MEMORY_ROOT_DIR,
+            MEMORY_VERSION_DIR,
+            SCOPES_DIR,
+            SECTIONS_DIR,
+        ] {
+            root.push(component);
+            if !Self::is_real_directory(&root).await? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(root))
+    }
+
+    async fn section_scope_at(&self, root: &Path) -> io::Result<Option<(ProjectId, SectionId)>> {
+        let topics = root.join(super::TOPICS_DIR);
+        if !Self::is_real_directory(&topics).await? {
+            return Ok(None);
+        }
+        let mut entries = fs::read_dir(topics).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "md") || !entry.file_type().await?.is_file()
+            {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let Ok((frontmatter, _)) = parse_markdown_document(&raw) else {
+                continue;
+            };
+            if frontmatter.scope == MemoryScope::Section
+                && path.file_stem().and_then(|id| id.to_str()) == Some(frontmatter.id.as_str())
+                && let (Some(project), Some(section)) =
+                    (frontmatter.project_key, frontmatter.section_id)
+                && let Ok(project) = ProjectId::parse(project)
+                && self.resolver.for_section(&project, &section).section_root() == Some(root)
+            {
+                return Ok(Some((project, section)));
+            }
+        }
+        Ok(None)
+    }
+
     /// List the sorted, deduplicated union of first-class Project ids and
     /// validated legacy `memory/v1/scopes/projects/<id>` directories.
     ///
@@ -3378,12 +3502,26 @@ impl MemoryStore {
         Ok(true)
     }
 
-    pub(super) async fn get_memory_at_locator(
+    /// Read one canonical topic by its exact scope and id. A Section lookup
+    /// requires a Section-bound store and does not fall back to wider scopes.
+    pub async fn get_memory_at_locator(
         &self,
         scope: MemoryScope,
         project_key: Option<&str>,
         id: &str,
     ) -> io::Result<Option<DurableMemoryDocument>> {
+        Ok(self
+            .read_memory_with_bytes(scope, project_key, id)
+            .await?
+            .map(|(document, _)| document))
+    }
+
+    async fn read_memory_with_bytes(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        id: &str,
+    ) -> io::Result<Option<(DurableMemoryDocument, String)>> {
         let id = validate_memory_id(id)?;
         let project_key = self.require_project_key(scope, project_key)?;
         let expected_project_key = match scope {
@@ -3410,11 +3548,14 @@ impl MemoryStore {
                     ),
                 ));
             }
-            return Ok(Some(DurableMemoryDocument {
-                frontmatter,
-                body,
-                path,
-            }));
+            return Ok(Some((
+                DurableMemoryDocument {
+                    frontmatter,
+                    body,
+                    path,
+                },
+                raw,
+            )));
         }
         Ok(None)
     }
@@ -3425,6 +3566,12 @@ impl MemoryStore {
             fs::create_dir_all(parent).await?;
         }
         let rendered = render_markdown_document(&doc.frontmatter, &doc.body)?;
+        match fs::read_to_string(&doc.path).await {
+            Ok(previous) if previous == rendered => return Ok(()),
+            Ok(previous) => revisions::retain_previous(doc, &previous).await?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         // Atomic write so a crash mid-write can never truncate/corrupt a user
         // memory document (#166, the worst-impact case from #35).
         crate::atomic_fs::atomic_write(&doc.path, rendered.as_bytes()).await

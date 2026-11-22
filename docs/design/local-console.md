@@ -12,8 +12,7 @@ context work in PR #68 is independent; the console does not bind a host context.
 Editing, lifecycle operations, rebuild controls, remote serving/accounts,
 MCP-over-HTTP, storage migration, an extra crate/store/index, agent integrations,
 Dream model/scheduling, publication and installed-runtime replacement are out
-of scope. The first console lists first-class Projects only. Legacy directory
-inventory and native access remain unchanged.
+of scope. The Project selector lists first-class Projects.
 
 ## Launch and authority
 
@@ -23,12 +22,10 @@ the command prints its actual URL and runs until Ctrl-C. Missing roots remain
 missing when browsed. Identity and host/bind flags are rejected for this command.
 
 The user launching a local console chooses the root to inspect and may switch
-among its discovered Projects and Sessions. This human-facing scope selection
-does not change the MCP tool schema, host context, or Project authority. Each
-HTTP request chooses its own scope and the adapter creates a typed Project
-view explicitly; no last-selected Project is retained by the server. Detail
-lookup also verifies the returned document's scope, avoiding the native API's
-Project-to-Global fallback in a Project-only view.
+among its discovered Projects, Sections and Sessions. Each HTTP request
+selects its scope explicitly, with both typed IDs required for a Section view.
+These local selections apply only to the console request. Current detail and
+revision reads address the canonical topic directly within the requested scope.
 
 HTTP accepts only the printed Host authority, the matching Origin when present,
 and same-origin/none Fetch Metadata. API calls require the console request
@@ -48,10 +45,12 @@ filters, limits and pagination with `query_scope`. The only difference is that
 it omits access-log writes, so human browsing does not affect agent usage or
 maintenance signals. Ordinary agent query behavior remains unchanged.
 
-Project catalogue entries come from the typed-only inventory API. Session
-inventory accepts validated, real directories with persisted notes/state,
-ignoring incomplete/invalid entries and symlinked components. Inventory APIs
-do not grant an MCP host broader access or introduce new metadata on disk.
+Project catalogue entries come from the first-class inventory API. Section
+entries come from canonical topic frontmatter with a matching Project digest,
+Section directory and topic filename. This discovers Projects that have
+Section records before they have first-class Project records. Session inventory
+accepts validated, real directories with persisted notes/state. The inventory
+is read from the canonical store on demand.
 
 Durable browsing returns twenty compact records per page; details fetch only
 the selected body. Blank queries read canonical records even if the index is
@@ -67,7 +66,9 @@ the routes do not claim a transaction across concurrent agent writes.
 
 ## Browser behavior
 
-Global, Project and Session have separate navigation and explicit selectors.
+Global, Project, Section and Session have separate navigation. Browsing Section
+starts after both IDs are selected. Changing its Project clears its selected
+Section and the previous results.
 Search/filter/scope changes reset paging and clear prior results/details/status.
 Request cancellation and generation checks prevent late list, status or detail
 responses from overwriting the current selection. Status failure is independent

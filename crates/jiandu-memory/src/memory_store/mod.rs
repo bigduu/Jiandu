@@ -24,7 +24,7 @@ pub use recall::{
     MemoryRecallCandidate, MemoryRecallOptions, MemoryRecallSelection, MemoryRecallStrategy,
     recall_candidates_from_lexical_index, select_relevant_memories, shortlist_relevant_memories,
 };
-pub use store::MemoryStore;
+pub use store::{MemoryRevisionEntry, MemoryRevisionHistory, MemoryStore};
 pub use types::{
     BlobScanItem, BlobScanReport, CreatedBy, DreamReadResult, DreamSnapshot, DuplicateCluster,
     DuplicateClusterMember, DuplicateScanReport, DurableContentLocation, DurableMemoryDocument,

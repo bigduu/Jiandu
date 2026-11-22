@@ -13,7 +13,7 @@ local files.
 - **Four scopes.** Session holds workstream continuity, Section holds shared
   facts within one project section, Project holds project-wide decisions, and
   Global holds knowledge useful across projects.
-- **One MCP tool, 19 actions:** query, get, write, merge, rebuild, Dream
+- **One MCP tool, 21 actions:** query, get, write, merge, revisions, rebuild, Dream
   orientation snapshots and more, behind a single `memory` tool.
 - **Your data stays in plain files:** one data directory you choose; Jiandu
   never calls a model or a remote service.
@@ -142,7 +142,7 @@ memory and every MCP client must use that same Jiandu-owned root after cutover;
 
 - `jiandu-memory` provides persistence, maintenance, and lexical/BM25/CJK recall.
 - `jiandu-mcp` exposes the store over stdio as one MCP tool named `memory`.
-  Its `action` argument selects one of 19 memory operations.
+  Its `action` argument selects one of 21 memory operations.
   The same binary also serves the local read-only browser console.
 
 ## Memory scopes
@@ -296,18 +296,35 @@ and port `0` asks the OS for an available port. No Session or Project identity
 is required. Press Ctrl-C to stop; the command serves only IPv4 loopback.
 
 Browse Global knowledge, switch first-class Projects, or select persisted
-Sessions. Search and page memories, filter their status, and read their full
-content, tags, timestamps and provenance. Durable scopes also show lexical-index
-availability and Dream snapshot freshness/content. Sessions show temporary
-notes and are not assigned to a Project by inference.
+Sessions. In **Section**, select both the Project and the Section by their
+stored IDs. Projects with Section memory appear in that picker even before
+they have Project-level memory. Search and page durable memories, filter by
+status, and read their full content, tags, timestamps, provenance and revisions.
+Each durable scope also shows its lexical-index and Dream snapshot status.
+Sessions show temporary notes without an inferred Project.
 
 The console uses the existing MemoryStore and bundled assets, without a
 separate frontend build or agent runtime. It does not write records, access
 signals, indexes, Session state or Dream snapshots. A missing/invalid index
 still permits blank-query browsing; rebuild it through the existing authorized
 memory tool when needed. This version has no edit, rebuild or Dream-generation
-controls, and lists only first-class Projects rather than legacy directories.
+controls. The Project picker lists first-class Projects.
 See the [console design](docs/design/local-console.md).
+
+## Durable memory revisions
+
+Jiandu retains previous versions of a durable entry when it changes. In the
+local console, expand **修订历史** below the current entry to compare its text
+and provenance with a previous version. [View the console example](docs/images/durable-revision-history.png).
+For Global, Project and Section scopes,
+call `history` with the exact `scope` and `id`. Supply a returned `revision_id`
+to read one version or `before: next_before` to list an older page.
+
+To restore a selected version, call `restore_revision` with the same `scope`
+and `id`, that `revision_id`, and the latest `current_revision` as
+`expected_current_revision`. Restoration creates a new version with the
+selected body, retrieval metadata and sources. It preserves the live status
+and relationships. A concurrent edit requires rereading history.
 
 ## Optional agent Skill
 

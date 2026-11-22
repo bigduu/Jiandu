@@ -1,8 +1,9 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { scope: "global", project: "", session: "", query: "", status: "", cursor: "", page: 1 };
+const state = { scope: "global", project: "", sectionProject: "", section: "", session: "", query: "", status: "", cursor: "", page: 1 };
+const sectionsByProject = new Map();
 const controllers = new Map();
-const labels = { global: "Global", project: "Project", session: "Session" };
+const labels = { global: "Global", project: "Project", section: "Section", session: "Session" };
 const statuses = { active: "有效", stale: "待更新", superseded: "已替代", contradicted: "有冲突", archived: "已归档" };
 const types = { user: "用户", feedback: "反馈", project: "项目", reference: "参考" };
 let viewGeneration = 0, detailGeneration = 0, catalogGeneration = 0, nextCursor = "", sessionState = null;
@@ -16,7 +17,7 @@ function node(tag, className, text) {
 function text(id, value) { $(id).textContent = value; }
 function date(value) { const parsed = new Date(value); return value ? (Number.isNaN(parsed.getTime()) ? value : dateFormat.format(parsed)) : "未记录"; }
 function abort(kind) { controllers.get(kind)?.abort(); controllers.delete(kind); }
-function abortView() { ["list", "status", "detail"].forEach(abort); detailGeneration += 1; }
+function abortView() { ["list", "status", "detail", "revisions", "revision"].forEach(abort); detailGeneration += 1; }
 async function request(kind, path, parameters = {}) {
   abort(kind);
   const controller = new AbortController();
@@ -43,7 +44,15 @@ function placeholder(parent, title, description, kind = "empty", retry) {
 function context() {
   if (state.scope === "session") return state.session ? { session_id: state.session } : null;
   if (state.scope === "project") return state.project ? { scope: "project", project_id: state.project } : null;
+  if (state.scope === "section") {
+    if (!state.sectionProject || !state.section) return null;
+    return { scope: "section", project_id: state.sectionProject, section_id: state.section };
+  }
   return { scope: "global" };
+}
+function scopeLabel(parameters) {
+  if (parameters.scope === "section") return `${parameters.project_id} / ${parameters.section_id}`;
+  return parameters.session_id || parameters.project_id || "Global";
 }
 function updateNavigation() {
   const session = state.scope === "session";
@@ -51,13 +60,16 @@ function updateNavigation() {
     const active = button.dataset.scope === state.scope;
     button.classList.toggle("active", active); button.setAttribute("aria-pressed", String(active));
   });
-  $("project-picker").hidden = state.scope !== "project"; $("session-picker").hidden = !session;
+  $("project-picker").hidden = state.scope !== "project";
+  $("section-picker").hidden = state.scope !== "section";
+  $("session-picker").hidden = !session;
   $("status-filter").hidden = session; $("health").hidden = session;
   text("scope-name", labels[state.scope].toUpperCase());
-  text("page-title", { global: "全局记忆", project: "项目记忆", session: "会话笔记" }[state.scope]);
-  const description = { global: "跨项目共享的事实、偏好与参考。", project: "同一个 Project 下，共享一份持久知识。", session: "当前会话保留的笔记，不推断所属 Project。" }[state.scope];
+  text("page-title", { global: "全局记忆", project: "项目记忆", section: "分区记忆", session: "会话笔记" }[state.scope]);
+  const description = { global: "跨项目共享的事实、偏好与参考。", project: "同一个 Project 下，共享一份持久知识。", section: "选择所属 Project 和 Section，浏览该分区的持久记忆。", session: "当前会话保留的笔记，不推断所属 Project。" }[state.scope];
   text("page-description", description); text("scope-guide", description);
-  text("context-id", session ? state.session || "选择 Session" : state.scope === "project" ? state.project || "选择 Project" : "Global");
+  const parameters = context();
+  text("context-id", parameters ? scopeLabel(parameters) : `选择 ${state.scope === "section" && !state.sectionProject ? "Project" : labels[state.scope]}`);
   text("list-heading", session ? "笔记主题" : "记忆列表");
   $("query").placeholder = session ? "搜索主题名称或笔记内容…" : "搜索关键词、标题或内容…";
   text("query-hint", session ? "按主题与笔记原文搜索；空笔记也可以打开查看。" : "留空搜索可浏览全部原始记忆；关键词搜索使用本地词法索引。");
@@ -81,10 +93,13 @@ function loadView(reset = true) {
   updateNavigation();
   const parameters = context();
   const generation = clearView(Boolean(parameters));
+  $("query").disabled = $("status").disabled = $("search-submit").disabled = !parameters;
   if (!parameters) {
-    const session = state.scope === "session";
-    placeholder($("list"), session ? "暂无 Session" : "暂无 Project", "目录中还没有可浏览的记录。新增记录后，点击「刷新目录」。");
-    placeholder($("detail"), session ? "等待会话笔记" : "等待项目记忆", "此处显示所选条目的原始内容。");
+    if (state.scope === "section" && sectionsByProject.size) {
+      placeholder($("list"), "选择 Project 和 Section", "选定分区后可以搜索和查看原始记忆。");
+    } else {
+      placeholder($("list"), `暂无 ${labels[state.scope]}`, "目录中还没有可浏览的记录。新增记录后，点击「刷新目录」。");
+    }
     return;
   }
   placeholder($("list"), "正在读取本地内容", "正在载入当前范围的记录…", "loading");
@@ -158,9 +173,78 @@ function facts(entries) {
   return list;
 }
 function actor(value) { return typeof value === "string" ? value : [value?.kind, value?.id, value?.actor].filter(Boolean).join(" · "); }
+function memorySources(memory) {
+  const list = node("ul", "source-list");
+  if (!memory.sources?.length) list.append(node("li", "", "未记录来源"));
+  else memory.sources.forEach((source) => list.append(node("li", "", [source.kind, source.id, source.message_range?.join(" – ")].filter(Boolean).join(" · "))));
+  return list;
+}
+function memoryHistory(params, isCurrent) {
+  const panel = node("details", "memory-history");
+  const entries = node("div", "revision-entries");
+  const status = node("p", "muted");
+  const preview = node("div", "revision-preview");
+  const more = node("button", "refresh-button", "载入更早的修订");
+  more.type = "button";
+  more.hidden = true;
+  status.setAttribute("role", "status");
+  panel.append(node("summary", "", "修订历史"), status, entries, more, preview);
+  let started = false, before, selection = 0;
+  async function open(revisionId, button) {
+    const selected = ++selection;
+    for (const entry of entries.children) entry.setAttribute("aria-pressed", String(entry === button));
+    preview.replaceChildren(node("p", "muted", "正在读取修订…"));
+    try {
+      const revision = await request("revision", "/api/revisions", { ...params, revision_id: revisionId });
+      if (!isCurrent() || selected !== selection) return;
+      const memory = revision.frontmatter;
+      preview.replaceChildren(
+        node("h3", "", `历史版本 · ${memory.title}`),
+        facts([["更新时间", date(memory.updated_at)], ["更新者", actor(memory.updated_by)]]),
+        node("h3", "", "历史版本来源"),
+        memorySources(memory),
+        node("h3", "", "历史版本正文"),
+        node("pre", "plain-content", revision.body),
+      );
+    } catch (error) {
+      if (isCurrent() && selected === selection && error.name !== "AbortError") {
+        preview.replaceChildren(node("p", "muted", `修订读取失败：${error.message}`));
+      }
+    }
+  }
+  async function load() {
+    started = true;
+    more.disabled = true;
+    status.textContent = "正在读取修订历史…";
+    try {
+      const history = await request("revisions", "/api/revisions", { ...params, before });
+      if (!isCurrent()) return;
+      status.textContent = entries.childElementCount || history.revisions.length ? "" : "暂无历史修订。";
+      for (const revision of history.revisions) {
+        const button = node("button", "refresh-button", `${date(revision.updated_at)} · ${actor(revision.updated_by) || "未记录更新者"}`);
+        button.type = "button";
+        button.setAttribute("aria-pressed", "false");
+        button.addEventListener("click", () => open(revision.revision_id, button));
+        entries.append(button);
+      }
+      before = history.next_before || undefined;
+      more.textContent = "载入更早的修订";
+      more.hidden = !before;
+    } catch (error) {
+      if (!isCurrent() || error.name === "AbortError") return;
+      status.textContent = `修订历史读取失败：${error.message}`;
+      more.textContent = "重试读取";
+      more.hidden = false;
+    } finally { if (isCurrent()) more.disabled = false; }
+  }
+  panel.addEventListener("toggle", () => { if (panel.open && !started) load(); });
+  more.addEventListener("click", load);
+  return panel;
+}
 async function openDetail(item, card, parameters, generation, session) {
   if (generation !== viewGeneration) return;
   const token = ++detailGeneration;
+  abort("revisions"); abort("revision");
   document.querySelectorAll(".memory-card").forEach((button) => { button.classList.toggle("selected", button === card); button.setAttribute("aria-pressed", String(button === card)); });
   placeholder($("detail"), "正在读取原文", "正在载入所选条目的完整内容…", "loading");
   $("detail").setAttribute("aria-busy", "true");
@@ -175,18 +259,20 @@ async function openDetail(item, card, parameters, generation, session) {
       detail.append(node("h2", "", memory.title), node("code", "detail-id", memory.id));
       const chips = node("div", "chips"); chips.append(statusChip(memory.status), node("span", "chip", types[memory.type] || memory.type));
       (memory.tags || []).forEach((tag) => chips.append(node("span", "chip", `#${tag}`))); detail.append(chips);
-      detail.append(facts([["范围", memory.scope === "project" ? `Project · ${parameters.project_id}` : "Global"], ["类型", types[memory.type] || memory.type], ["创建时间", date(memory.created_at)], ["更新时间", date(memory.updated_at)], ["创建者", actor(memory.created_by)], ["更新者", actor(memory.updated_by)]]));
+      const location = memory.scope === "global" ? "Global" : `${labels[memory.scope]} · ${scopeLabel(parameters)}`;
+      detail.append(facts([["范围", location], ["类型", types[memory.type] || memory.type], ["创建时间", date(memory.created_at)], ["更新时间", date(memory.updated_at)], ["创建者", actor(memory.created_by)], ["更新者", actor(memory.updated_by)]]));
       detail.append(node("h3", "", "来源"));
-      const sources = node("ul", "source-list");
-      if (!memory.sources?.length) sources.append(node("li", "", "未记录来源"));
-      else memory.sources.forEach((source) => sources.append(node("li", "", [source.kind, source.id, source.message_range?.join(" – ")].filter(Boolean).join(" · "))));
-      detail.append(sources);
+      detail.append(memorySources(memory));
       const relations = Object.entries(memory.relations || {}).filter(([, ids]) => ids?.length);
       if (relations.length) {
         detail.append(node("h3", "", "关联记录")); const links = node("ul", "source-list");
         relations.forEach(([kind, ids]) => links.append(node("li", "", `${{ supersedes: "替代", contradicted_by: "冲突", related: "相关" }[kind] || kind} · ${ids.join("、")}`))); detail.append(links);
       }
-      detail.append(node("h3", "", "正文 · Markdown 原文"), node("pre", "plain-content", data.body));
+      detail.append(
+        node("h3", "", "当前正文 · Markdown 原文"),
+        node("pre", "plain-content", data.body),
+        memoryHistory({ ...parameters, id: item.id }, () => generation === viewGeneration && token === detailGeneration),
+      );
     }
     if (window.matchMedia("(max-width: 860px)").matches) detail.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
   } catch (error) {
@@ -194,24 +280,37 @@ async function openDetail(item, card, parameters, generation, session) {
     placeholder($("detail"), "暂时无法读取原文", `${error.message} 请重新选择该条目重试。`, "error");
   } finally { if (generation === viewGeneration && token === detailGeneration) $("detail").setAttribute("aria-busy", "false"); }
 }
-function fillSelect(id, values, selected, emptyLabel) {
+function fillSelect(id, values, selected, emptyLabel, prompt) {
   const select = $(id); select.replaceChildren();
-  if (!values.length) { const option = node("option", "", emptyLabel); option.value = ""; select.append(option); }
-  else values.forEach((value) => { const option = node("option", "", value); option.value = value; select.append(option); });
-  select.disabled = !values.length; select.value = values.includes(selected) ? selected : values[0] || "";
+  if (!values.length || prompt) { const option = node("option", "", values.length ? prompt : emptyLabel); option.value = ""; select.append(option); }
+  values.forEach((value) => { const option = node("option", "", value); option.value = value; select.append(option); });
+  select.disabled = !values.length; select.value = values.includes(selected) ? selected : prompt ? "" : values[0] || "";
   return select.value;
+}
+function updateSectionOptions() {
+  const sections = sectionsByProject.get(state.sectionProject) || [];
+  const emptyLabel = state.sectionProject ? "暂无 Section" : "先选择 Project";
+  state.section = fillSelect("section-select", sections, state.section, emptyLabel, "选择 Section");
 }
 async function refreshCatalog() {
   const generation = ++catalogGeneration;
   state.cursor = ""; state.page = 1; clearView();
-  placeholder($("list"), "正在刷新目录", "正在读取本地 Project 与 Session…", "loading");
+  placeholder($("list"), "正在刷新目录", "正在读取本地 Project、Section 与 Session…", "loading");
   $("refresh-catalog").disabled = true; $("catalog-error").hidden = true;
   try {
     const catalog = await request("catalog", "/api/catalog");
     if (generation !== catalogGeneration) return;
     state.project = fillSelect("project-select", catalog.projects, state.project, "暂无 Project");
+    sectionsByProject.clear();
+    for (const { project_id, section_id } of catalog.sections) {
+      if (!sectionsByProject.has(project_id)) sectionsByProject.set(project_id, []);
+      sectionsByProject.get(project_id).push(section_id);
+    }
+    state.sectionProject = fillSelect("section-project-select", [...sectionsByProject.keys()], state.sectionProject, "暂无 Section 所属的 Project", "选择 Project");
+    updateSectionOptions();
     state.session = fillSelect("session-select", catalog.sessions, state.session, "暂无 Session");
-    text("catalog-counts", `${catalog.projects.length} 个项目 · ${catalog.sessions.length} 个会话`); text("data-dir", catalog.data_dir);
+    const projectCount = new Set([...catalog.projects, ...sectionsByProject.keys()]).size;
+    text("catalog-counts", `${projectCount} 个 Project · ${catalog.sections.length} 个 Section · ${catalog.sessions.length} 个 Session`); text("data-dir", catalog.data_dir);
   } catch (error) {
     if (generation !== catalogGeneration || error.name === "AbortError") return;
     text("catalog-error", `目录读取失败：${error.message} Global 仍可尝试浏览；检查本地服务后刷新目录。`); $("catalog-error").hidden = false;
@@ -222,6 +321,13 @@ async function refreshCatalog() {
 }
 document.querySelectorAll("[data-scope]").forEach((button) => button.addEventListener("click", () => { state.scope = button.dataset.scope; loadView(); }));
 $("project-select").addEventListener("change", (event) => { state.project = event.target.value; loadView(); });
+$("section-project-select").addEventListener("change", (event) => {
+  state.sectionProject = event.target.value;
+  state.section = "";
+  updateSectionOptions();
+  loadView();
+});
+$("section-select").addEventListener("change", (event) => { state.section = event.target.value; loadView(); });
 $("session-select").addEventListener("change", (event) => { state.session = event.target.value; loadView(); });
 $("search-form").addEventListener("submit", (event) => { event.preventDefault(); state.query = $("query").value.trim(); loadView(); });
 $("status").addEventListener("change", (event) => { state.status = event.target.value; loadView(); });

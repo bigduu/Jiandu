@@ -255,6 +255,82 @@ impl MemoryServer {
                     retrieval_metadata_truncated,
                 ))
             }
+            MemoryArgs::History {
+                scope,
+                id,
+                project_key,
+                revision_id,
+                before,
+            } => {
+                let scope = parse_durable_scope(&scope, "history")?;
+                let id = validate_memory_id(&id)?;
+                let access = self.resolve_access(project_key.as_deref(), scope)?;
+                if let Some(revision_id) = revision_id {
+                    if before.is_some() {
+                        return Err(MemoryError::InvalidArguments(
+                            "before is only valid when listing history".into(),
+                        ));
+                    }
+                    let Some(mut doc) = access
+                        .store
+                        .get_memory_revision(scope, access.project_key(), id, &revision_id)
+                        .await
+                        .map_err(|error| execution("Failed to read memory revision", error))?
+                    else {
+                        return Err(memory_not_found(id));
+                    };
+                    let (body, truncated) = truncate_chars(&doc.body, MAX_MAX_CHARS);
+                    doc.body = body;
+                    let metadata_truncated = bound_retrieval_metadata(&mut doc);
+                    let mut result = document_result("history", doc, truncated, metadata_truncated);
+                    result["revision_id"] = json!(revision_id);
+                    Ok(result)
+                } else {
+                    let Some(history) = access
+                        .store
+                        .memory_revision_history(scope, access.project_key(), id, before.as_deref())
+                        .await
+                        .map_err(|error| execution("Failed to list memory revisions", error))?
+                    else {
+                        return Err(memory_not_found(id));
+                    };
+                    Ok(json!({"action":"history", "id":id, "history":history}))
+                }
+            }
+            MemoryArgs::RestoreRevision {
+                scope,
+                id,
+                project_key,
+                revision_id,
+                expected_current_revision,
+            } => {
+                let scope = parse_durable_scope(&scope, "restore_revision")?;
+                let id = validate_memory_id(&id)?;
+                let access = self.resolve_access(project_key.as_deref(), scope)?;
+                let Some(mut doc) = access
+                    .store
+                    .restore_memory_revision(
+                        scope,
+                        access.project_key(),
+                        id,
+                        &revision_id,
+                        &expected_current_revision,
+                        self.context.session_id(),
+                        ACTOR,
+                    )
+                    .await
+                    .map_err(|error| execution("Failed to restore memory revision", error))?
+                else {
+                    return Err(memory_not_found(id));
+                };
+                let (body, truncated) = truncate_chars(&doc.body, MAX_MAX_CHARS);
+                doc.body = body;
+                let metadata_truncated = bound_retrieval_metadata(&mut doc);
+                let mut result =
+                    document_result("restore_revision", doc, truncated, metadata_truncated);
+                result["restored_revision_id"] = json!(revision_id);
+                Ok(result)
+            }
             MemoryArgs::DreamRead { scope, project_key } => {
                 let scope = parse_durable_scope(&scope, "dream_read")?;
                 let access = self.resolve_access(project_key.as_deref(), scope)?;
