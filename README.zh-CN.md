@@ -264,7 +264,8 @@ jiandu ui --data-dir /absolute/path/to/.jiandu --port 9123
 ## 持久记忆修订
 
 持久条目变更时，简牍保留旧版本。在本地控制台展开当前条目下方的 **修订历史**，
-可查看所选旧版本的正文和来源。通过 MCP 查询全局、项目或分区的历史时，调用
+可查看所选旧版本的正文和来源。[查看示例](docs/images/durable-revision-history.png)。
+通过 MCP 查询全局、项目或分区的历史时，调用
 `history` 并传入该条目的 `scope`、`id`。追加 `revision_id` 可查看指定版本，
 传入 `before: next_before` 可翻到更早的版本。
 

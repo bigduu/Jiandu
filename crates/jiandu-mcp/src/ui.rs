@@ -140,7 +140,7 @@ impl IntoResponse for ConsoleError {
         let status = match self.0.kind() {
             io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
             io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-            io::ErrorKind::InvalidData => StatusCode::CONFLICT,
+            io::ErrorKind::InvalidData | io::ErrorKind::WouldBlock => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({"error":self.0.to_string()}))).into_response()

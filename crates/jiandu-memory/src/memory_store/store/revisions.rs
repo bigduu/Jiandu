@@ -148,13 +148,16 @@ impl MemoryStore {
         if let Some(before) = before {
             revision_parts(before)?;
         }
-        let Some(document) = self.get_memory_at_locator(scope, project_key, id).await? else {
+        let Some((document, current)) = self.read_memory_with_bytes(scope, project_key, id).await?
+        else {
             return Ok(None);
         };
+        #[cfg(test)]
+        super::pause_after_initial_resolution_for_test(id).await;
+        let current_revision = digest(&current);
         let mut ids = revision_ids(&revision_dir(&document)?).await?;
         // The snapshot is published first. Hide its pending entry if the topic
         // has not advanced yet, including after an interrupted replacement.
-        let current_revision = digest(&fs::read_to_string(&document.path).await?);
         if let Some(latest) = ids.first()
             && revision_parts(latest)?.1 == current_revision
         {
@@ -176,6 +179,12 @@ impl MemoryStore {
             .next()
             .and_then(|_| revisions.last())
             .map(|entry| entry.revision_id.clone());
+        if fs::read_to_string(&document.path).await? != current {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "current memory revision changed while listing history; retry the read",
+            ));
+        }
         Ok(Some(MemoryRevisionHistory {
             current_revision,
             revisions,
@@ -248,5 +257,68 @@ impl MemoryStore {
         }).await?;
         self.refresh_scope_artifacts(scope, project_key).await?;
         Ok(Some(document))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::super::{DurableMemoryType, ResolveThenLockTestHook, resolve_then_lock_test_hooks};
+    use super::*;
+
+    #[tokio::test]
+    async fn history_requires_a_consistent_revision_during_an_overlapping_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(directory.path());
+        let scope = MemoryScope::Global;
+        let target = store
+            .write_memory(
+                scope,
+                None,
+                DurableMemoryType::Reference,
+                "Revision history concurrent edit fixture",
+                "Original version.",
+                &[],
+                None,
+                "fixture",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let id = target.frontmatter.id;
+        let original = fs::read_to_string(target.path).await.unwrap();
+        let hook = Arc::new(ResolveThenLockTestHook {
+            resolved: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        resolve_then_lock_test_hooks().insert(id.clone(), hook.clone());
+        let read = {
+            let store = store.clone();
+            let id = id.clone();
+            tokio::spawn(async move { store.memory_revision_history(scope, None, &id, None).await })
+        };
+        hook.resolved.notified().await;
+        resolve_then_lock_test_hooks().remove(&id);
+        MemoryStore::new(directory.path())
+            .merge_memory(&id, None, "Concurrent version.", &[], None, "other", &[])
+            .await
+            .unwrap()
+            .unwrap();
+        hook.resume.notify_one();
+        let error = read.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let history = store
+            .memory_revision_history(scope, None, &id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.revisions.len(), 1);
+        assert_ne!(history.current_revision, digest(&original));
+        assert_eq!(
+            revision_parts(&history.revisions[0].revision_id).unwrap().1,
+            digest(&original)
+        );
     }
 }

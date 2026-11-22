@@ -313,7 +313,8 @@ See the [console design](docs/design/local-console.md).
 
 Jiandu retains previous versions of a durable entry when it changes. In the
 local console, expand **修订历史** below the current entry to compare its text
-and provenance with a previous version. For Global, Project and Section scopes,
+and provenance with a previous version. [View the console example](docs/images/durable-revision-history.png).
+For Global, Project and Section scopes,
 call `history` with the exact `scope` and `id`. Supply a returned `revision_id`
 to read one version or `before: next_before` to list an older page.
 
