@@ -274,6 +274,16 @@ fn parse_dream_snapshot(raw: &str) -> io::Result<DreamSnapshot> {
 
 /// section separator. Mirrors the real append, which trims trailing whitespace
 /// first, so the structural blob guard estimates exactly, not conservatively.
+fn validate_new_memory_scope(scope: MemoryScope, kind: DurableMemoryType) -> io::Result<()> {
+    if scope == MemoryScope::Global && kind == DurableMemoryType::Project {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Project-typed memory requires Project or Section scope",
+        ));
+    }
+    Ok(())
+}
+
 fn projected_merged_body_chars(body: &str, content: &str) -> usize {
     body.trim_end().chars().count()
         + MEMORY_SECTION_SEPARATOR.chars().count()
@@ -1296,6 +1306,7 @@ impl MemoryStore {
         granularity: Option<TemporalGranularity>,
         message_range: &[String],
     ) -> io::Result<DurableMemoryDocument> {
+        validate_new_memory_scope(scope, r#type)?;
         let session_id = session_id.map(super::validate_session_id).transpose()?;
         if message_range.len() > MAX_DURABLE_MEMORY_SOURCE_ITEMS
             || (!message_range.is_empty() && session_id.is_none())
@@ -1675,6 +1686,9 @@ impl MemoryStore {
         source = fresh;
         let source_id = source.frontmatter.id.clone();
         let source_type = source.frontmatter.r#type;
+        for piece in pieces {
+            validate_new_memory_scope(scope, piece.r#type.unwrap_or(source_type))?;
+        }
         let source_granularity = source.frontmatter.granularity;
         let source_sources = source.frontmatter.sources.clone();
 
@@ -2156,6 +2170,7 @@ impl MemoryStore {
             .collect();
 
         let r#type = merged.r#type.unwrap_or(sources[0].frontmatter.r#type);
+        validate_new_memory_scope(scope, r#type)?;
         let tags = normalize_tags(merged.tags.iter().map(String::as_str));
         let new_id = self.allocate_memory_id(scope, project_key, title).await?;
         let now = now_rfc3339();
@@ -4340,7 +4355,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
             .write_memory(
                 MemoryScope::Global,
                 None,
-                DurableMemoryType::Project,
+                DurableMemoryType::Reference,
                 "Release freeze rule",
                 "Mobile release freeze begins Tuesday for the release cut.",
                 &[],
@@ -4355,7 +4370,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
             .write_memory(
                 MemoryScope::Global,
                 None,
-                DurableMemoryType::Project,
+                DurableMemoryType::Reference,
                 "Unrelated cat fact",
                 "The quiet cat napped under the warm windowsill.",
                 &[],
@@ -4561,7 +4576,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
                 .write_memory(
                     MemoryScope::Global,
                     None,
-                    DurableMemoryType::Project,
+                    DurableMemoryType::Reference,
                     title,
                     content,
                     &[],
@@ -4602,7 +4617,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
             .write_memory(
                 MemoryScope::Global,
                 None,
-                DurableMemoryType::Project,
+                DurableMemoryType::Reference,
                 "freeze v1",
                 "Mobile release freeze begins Tuesday.",
                 &[],
@@ -4617,7 +4632,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
             .write_memory(
                 MemoryScope::Global,
                 None,
-                DurableMemoryType::Project,
+                DurableMemoryType::Reference,
                 "freeze v2",
                 "Release freeze starts Tuesday for the cut.",
                 &[],
@@ -4631,7 +4646,7 @@ source_generation: 913daf1e78e3cc77e6088476ee17ed90578cad185bb8394cd78dcf4e2e11d
 
         let merged = MemorySplitPiece {
             title: "Mobile release freeze is Tuesday".to_string(),
-            r#type: Some(DurableMemoryType::Project),
+            r#type: Some(DurableMemoryType::Reference),
             content: "Mobile release freeze begins Tuesday for the release cut.".to_string(),
             tags: vec!["release".to_string()],
         };
