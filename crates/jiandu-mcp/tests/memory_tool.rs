@@ -7,8 +7,9 @@ use jiandu_mcp::{
 #[cfg(unix)]
 use jiandu_memory::memory_store::WRITE_AUDIT_LOG;
 use jiandu_memory::memory_store::{
-    MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_TAG_CHARS,
-    MAX_MEMORY_TAGS, MAX_RETRIEVAL_TERM_CHARS, MemoryScope, MemoryStore, render_markdown_document,
+    DurableMemoryStatus, DurableMemoryType, MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN,
+    MAX_MEMORY_KEYWORDS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TAGS, MAX_RETRIEVAL_TERM_CHARS,
+    MemoryScope, MemoryStore, render_markdown_document,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -51,6 +52,143 @@ async fn write_global(server: &MemoryServer, title: &str, content: &str) -> Stri
         .as_str()
         .expect("memory id")
         .to_string()
+}
+
+#[tokio::test]
+async fn project_typed_global_creation_is_rejected_without_changing_existing_records() {
+    let fixture = Fixture::global("session_global_type");
+    let a = write_global(
+        &fixture.server,
+        "First global reference",
+        "A reusable convention.",
+    )
+    .await;
+    let b = write_global(
+        &fixture.server,
+        "Second global reference",
+        "A shared reference.",
+    )
+    .await;
+    let store = MemoryStore::new(fixture._directory.path());
+    let records = store
+        .list_memory_documents(MemoryScope::Global, None)
+        .await
+        .unwrap();
+    let generation = store
+        .current_scope_generation(MemoryScope::Global, None)
+        .await
+        .unwrap();
+
+    for arguments in [
+        json!({
+            "action": "write", "scope": "global", "type": "project",
+            "title": "New project fact", "content": "A fact specific to one project."
+        }),
+        json!({
+            "action": "split", "id": a, "pieces": [
+                {"type": "reference", "title": "An allowed fact", "content": "Reusable."},
+                {"type": "project", "title": "A project fact", "content": "Project specific."}
+            ]
+        }),
+        json!({
+            "action": "consolidate", "ids": [a, b], "type": "project",
+            "title": "Consolidated project fact", "content": "Project specific."
+        }),
+    ] {
+        let error = fixture
+            .server
+            .execute(arguments)
+            .await
+            .expect_err("Global project fact");
+        assert!(
+            error
+                .to_string()
+                .contains("Project-typed memory requires Project or Section scope")
+        );
+        assert_eq!(
+            store
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .unwrap(),
+            records
+        );
+        assert_eq!(
+            store
+                .current_scope_generation(MemoryScope::Global, None)
+                .await
+                .unwrap(),
+            generation
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_global_project_fact_can_be_managed_but_not_copied_by_inheritance() {
+    let fixture = Fixture::global("session_legacy_global_type");
+    let store = MemoryStore::new(fixture._directory.path());
+    let id = write_global(
+        &fixture.server,
+        "Legacy project fact",
+        "An old project detail.",
+    )
+    .await;
+    let reference = write_global(&fixture.server, "Global reference", "A reusable fact.").await;
+    let mut legacy = store.get_memory(&id, None).await.unwrap().unwrap();
+    legacy.frontmatter.r#type = DurableMemoryType::Project;
+    tokio::fs::write(
+        &legacy.path,
+        render_markdown_document(&legacy.frontmatter, &legacy.body).unwrap(),
+    )
+    .await
+    .unwrap();
+    let records = store
+        .list_memory_documents(MemoryScope::Global, None)
+        .await
+        .unwrap();
+    assert!(records.contains(&legacy));
+
+    for arguments in [
+        json!({
+            "action": "split", "id": id, "pieces": [
+                {"title": "Inherited project fact", "content": "An old project detail."}
+            ]
+        }),
+        json!({
+            "action": "consolidate", "ids": [id, reference],
+            "title": "Inherited project fact", "content": "An old project detail."
+        }),
+    ] {
+        let error = fixture
+            .server
+            .execute(arguments)
+            .await
+            .expect_err("inherited Global project fact");
+        assert!(
+            error
+                .to_string()
+                .contains("Project-typed memory requires Project or Section scope")
+        );
+        assert_eq!(
+            store
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .unwrap(),
+            records
+        );
+    }
+
+    let archived = store
+        .archive_memory(
+            &id,
+            None,
+            DurableMemoryStatus::Archived,
+            Some("Legacy scope review"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived.frontmatter.status, DurableMemoryStatus::Archived);
+    assert_eq!(archived.body, legacy.body);
 }
 
 /// A cancelled MCP request must detach, not abort, a mutation whose Tokio
@@ -279,7 +417,7 @@ async fn all_actions_parse_classify_and_dispatch_to_the_real_store() {
         ),
         (
             "write",
-            json!({"action":"write","scope":"global","type":"project","title":"Dispatch explicit write","content":"explicit write body","tags":["one"],"keywords":["write-alias"],"entities":["Write API"],"granularity":"week","options":{"allow_merge_if_similar":false}}),
+            json!({"action":"write","scope":"global","type":"reference","title":"Dispatch explicit write","content":"explicit write body","tags":["one"],"keywords":["write-alias"],"entities":["Write API"],"granularity":"week","options":{"allow_merge_if_similar":false}}),
             MutatingSerial,
         ),
         (
@@ -294,7 +432,7 @@ async fn all_actions_parse_classify_and_dispatch_to_the_real_store() {
         ),
         (
             "consolidate",
-            json!({"action":"consolidate","ids":[consolidate_a,consolidate_b],"title":"Dispatch canonical","content":"canonical body","type":"project","tags":["one"],"keywords":["canonical-alias"],"entities":["Canonical API"]}),
+            json!({"action":"consolidate","ids":[consolidate_a,consolidate_b],"title":"Dispatch canonical","content":"canonical body","type":"reference","tags":["one"],"keywords":["canonical-alias"],"entities":["Canonical API"]}),
             MutatingSerial,
         ),
         (
@@ -1431,7 +1569,7 @@ async fn malformed_actions_project_ids_and_all_memory_id_shapes_fail_closed() {
     for arguments in [
         json!({"action":"query","scope":"session"}),
         json!({"action":"write","scope":"global","type":"unknown","title":"x","content":"x"}),
-        json!({"action":"write","scope":"global","type":"project","title":"x","content":"x","granularity":"decade"}),
+        json!({"action":"write","scope":"global","type":"reference","title":"x","content":"x","granularity":"decade"}),
         json!({"action":"query","scope":"global","filters":{"type":["unknown"]}}),
         json!({"action":"query","scope":"global","filters":{"status":["unknown"]}}),
         json!({"action":"query","scope":"global","filters":{"granularity":["decade"]}}),
@@ -1584,7 +1722,7 @@ async fn rmcp_duplex_lists_only_memory_and_runs_real_write_query_get() {
         json!({
             "action": "write",
             "scope": "global",
-            "type": "project",
+            "type": "reference",
             "title": "Protocol persistence",
             "content": "written through the MCP transport",
             "keywords": ["朱雀别名", "transport-alias"],
